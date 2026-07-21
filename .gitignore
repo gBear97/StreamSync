@@ -1,0 +1,11 @@
+# build outputs
+build/
+dist/
+*.spec
+
+# python
+__pycache__/
+*.pyc
+
+# local state
+.streamsync.json
