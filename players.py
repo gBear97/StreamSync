@@ -28,6 +28,13 @@ except Exception as e:  # missing libvlc.dll, bitness mismatch, etc.
     _IMPORT_ERROR = e
 
 EMBED_SEEK_LATENCY = 0.25   # seconds embedded VLC needs to execute a seek
+# libvlc's get_time() reports a position behind the audio it is actually
+# emitting (measured on macOS: 171 ms, spread 155-178, by matching its own
+# output recorded off BlackHole against the file). Seeks are unaffected -
+# they are timed from the capture, not from this clock - but anything
+# comparing the clock to the stream must add this back, or a film that is
+# perfectly in sync looks like it has drifted by this much.
+CLOCK_OUTPUT_LAG = 0.17 if sys.platform == "darwin" else 0.0
 EXT_CMD_LEAD = 0.12         # fire external seeks this early (http + exec time)
 EXT_PORT = 9723
 EXT_PASSWORD = "streamsync"
@@ -49,10 +56,13 @@ class VLCError(RuntimeError):
 
 
 class EmbeddedPlayer:
-    def __init__(self, hwnd=None):
-        """hwnd: Tk window handle to render into (Windows). Pass None on
-        macOS - Tk can't host libvlc there, so libvlc opens its own video
-        window; playback control is identical either way."""
+    def __init__(self, hwnd=None, nsview=None):
+        """hwnd: Tk window handle to render into (Windows).
+        nsview: NSView pointer to render into (macOS - see macvideo.py).
+
+        Exactly one of them carries the drawable for the platform in use.
+        libvlc on macOS will not open a window of its own: with neither
+        set, playback runs but nothing is ever displayed."""
         if vlc is None:
             raise VLCError(
                 "Could not load VLC (libvlc).\n\n"
@@ -62,7 +72,10 @@ class EmbeddedPlayer:
         if self.instance is None:
             raise VLCError("Could not create a VLC instance.")
         self.mp = self.instance.media_player_new()
-        if hwnd is not None:
+        self.nsview = nsview
+        if nsview is not None:
+            self.mp.set_nsobject(int(nsview))
+        elif hwnd is not None:
             self.mp.set_hwnd(int(hwnd))
             # let Tk keep mouse/keyboard events, not the VLC child window
             self.mp.video_set_mouse_input(False)
@@ -124,8 +137,16 @@ class EmbeddedPlayer:
         self.mp.audio_set_mute(bool(mute))
 
     def set_fullscreen(self, flag):
-        """Fullscreen for the libvlc-owned video window (macOS mode)."""
+        """Fullscreen for a libvlc-owned video window.
+
+        Useless once a drawable is set (libvlc accepts the call, reports
+        the new state, and changes nothing) - whoever owns the window has
+        to resize it. mac_app does that on the Tk toplevel.
+        """
+        if self.nsview is not None:
+            return False
         self.mp.set_fullscreen(bool(flag))
+        return True
 
     def is_playing(self):
         return bool(self.mp.is_playing())
@@ -183,10 +204,10 @@ class ExternalPlayer:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
 
-    def _cmd(self, command, val=None):
+    def _cmd(self, command, val=None, key="val"):
         params = {"command": command}
         if val is not None:
-            params["val"] = val
+            params[key] = val
         return self._request(params)
 
     def _alive(self):
@@ -198,16 +219,24 @@ class ExternalPlayer:
 
     def load(self, path):
         if self._alive():
-            self._cmd("in_play", str(path))
+            # in_play takes the MRL as `input=`; `val=` is silently ignored
+            self._cmd("in_play", str(path), key="input")
         else:
-            self.proc = subprocess.Popen([
+            argv = [
                 self.exe, "--extraintf", "http",
                 "--http-host", "127.0.0.1",
                 "--http-port", str(self.port),
                 "--http-password", self.password,
-                "--no-one-instance", "--no-video-title-show",
-                str(path),
-            ])
+                "--no-video-title-show",
+            ]
+            if sys.platform != "darwin":
+                # Cocoa VLC has no one-instance option and treats unknown
+                # options as fatal - it would exit before the HTTP interface
+                # ever came up. (Irrelevant here anyway: we exec the binary
+                # directly, so Launch Services never dedupes it.)
+                argv.append("--no-one-instance")
+            argv.append(str(path))
+            self.proc = subprocess.Popen(argv)
             deadline = time.perf_counter() + 12.0
             while time.perf_counter() < deadline:
                 if self._alive():

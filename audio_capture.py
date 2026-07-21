@@ -61,6 +61,28 @@ def list_microphones():
     return [m.name for m in sc.all_microphones()]
 
 
+PRIME_S = 0.05   # discarded lead-in that drains the device's first buffers
+
+
+def _timed_record(mic, seconds, sr):
+    """Record `seconds` from `mic`, returning (samples, perf_counter_at_start).
+
+    `mic.record()` would open and start the device *inside* the call, so a
+    timestamp taken before it runs is early by the open latency (measured
+    ~140-280 ms on macOS/CoreAudio) - and sync_seek treats that error as
+    elapsed stream time, landing every seek that far ahead. Opening the
+    recorder explicitly, then discarding a short priming read, means t0 is
+    stamped with the stream already flowing and its first buffers drained.
+    """
+    with mic.recorder(samplerate=sr) as rec:
+        rec.record(numframes=int(PRIME_S * sr))
+        t0 = time.perf_counter()
+        data = rec.record(numframes=int(seconds * sr))
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    return data.astype(np.float32), t0
+
+
 def record_mic(seconds, mic_name=None, sr=CAPTURE_SR):
     """Record from a microphone. Returns (mono float32, sr, perf_t0).
 
@@ -76,11 +98,8 @@ def record_mic(seconds, mic_name=None, sr=CAPTURE_SR):
                 break
     if mic is None:
         mic = sc.default_microphone()
-    t0 = time.perf_counter()
-    data = mic.record(samplerate=sr, numframes=int(seconds * sr))
-    if data.ndim > 1:
-        data = data.mean(axis=1)
-    return data.astype(np.float32), sr, t0
+    data, t0 = _timed_record(mic, seconds, sr)
+    return data, sr, t0
 
 
 def record_loopback(seconds, speaker_name=None, sr=CAPTURE_SR):
@@ -111,11 +130,7 @@ def record_loopback(seconds, speaker_name=None, sr=CAPTURE_SR):
             f"Captured only silence from '{spk.name}' - is the stream "
             "audible on that device?")
 
-    t0 = time.perf_counter()
-    data = mic.record(samplerate=sr, numframes=int(seconds * sr))
-    if data.ndim > 1:
-        data = data.mean(axis=1)
-    data = data.astype(np.float32)
+    data, t0 = _timed_record(mic, seconds, sr)
     if float(np.abs(data).max(initial=0.0)) < 1e-4:
         raise RuntimeError(silence_hint)
     return data, sr, t0

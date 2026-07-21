@@ -231,9 +231,12 @@ sh build_app_mac.sh          # optional: build StreamSync.app (run on the Mac)
 
 ### Platform differences
 
-- The "built-in" player is a VLC-drawn video window (Tk can't host VLC
-  on macOS); millisecond sync control is identical. External VLC.app
-  mode works the same as on Windows.
+- The "built-in" player renders into StreamSync's own film window, as on
+  Windows. libvlc opens no window of its own on macOS, so the app gives
+  it an NSView pinned to that window (`macvideo.py`); millisecond sync
+  control is identical. Fullscreen belongs to the window rather than to
+  libvlc - use F11 or the Fullscreen button, Esc to leave. External
+  VLC.app mode works the same as on Windows.
 - The facecam swap works at the app level: the browser app comes forward
   during pauses and hides on resume (pick it under Advanced > Stream App).
 - No global hotkeys (macOS requires root for that) - use the menu

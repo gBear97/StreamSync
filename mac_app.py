@@ -29,8 +29,10 @@ from PIL import Image, ImageTk
 import audio_capture
 import audio_matcher
 import capture
+import macvideo
 import macwindowctl
 import matcher
+import players
 import session
 from players import EmbeddedPlayer, ExternalPlayer, VLCError
 
@@ -39,6 +41,7 @@ BURST_FRAMES = 4
 BURST_SPACING = 1 / 3
 AUDIO_SYNC_SECONDS = 6.0
 AUTO_RECORD_SECONDS = 4.0
+PROBE_MAX_AHEAD = 600.0   # cap the growing resume-search window (see _auto_loop)
 LOW_CONFIDENCE = 0.55
 BROWSERS = ("Safari", "Google Chrome", "Firefox", "Arc", "Brave Browser",
             "Microsoft Edge", "Opera", "Vivaldi")
@@ -108,10 +111,12 @@ class MacApp:
         self.sub_var = tk.StringVar(value="")
 
         self._build_main()
+        self._build_video_window()
         self._build_preview_window()
 
         try:
-            self.player_backend = EmbeddedPlayer(None)  # libvlc's own window
+            self.player_backend = EmbeddedPlayer(
+                nsview=self.video_surface.view)
         except VLCError as e:
             messagebox.showerror("StreamSync - VLC problem", str(e))
             raise SystemExit(1)
@@ -175,6 +180,48 @@ class MacApp:
                                     font=("SF Pro Text", 11))
         self.status_lbl.grid(row=5, column=0, columnspan=6, sticky="w",
                              pady=(2, 0))
+
+    def _build_video_window(self):
+        """A Tk window whose content area libvlc renders into.
+
+        libvlc has no window of its own on macOS, so we supply one. It
+        stays hidden until the first sync - an empty black window before
+        playback would just be confusing.
+        """
+        self.video_win = tk.Toplevel(self.root)
+        self.video_win.title("StreamSync - Film")
+        self.video_win.geometry("960x540")
+        self.video_win.configure(bg="black")
+        self.video_frame = tk.Frame(self.video_win, bg="black")
+        self.video_frame.pack(fill="both", expand=True)
+        self.video_win.protocol("WM_DELETE_WINDOW", self._hide_video_window)
+        self.video_win.bind("<Escape>", lambda e: self._set_fullscreen(False))
+        self.video_win.bind("<F11>", lambda e: self._toggle_fullscreen())
+        self.video_win.bind("<space>", lambda e: self._toggle_pause())
+        # the NSView has to exist before libvlc is told about it, and it
+        # can only be created once Tk has actually mapped the window
+        self.video_win.update_idletasks()
+        self.video_surface = macvideo.VideoSurface(self.video_frame)
+        self.video_win.withdraw()
+
+    def _show_video_window(self):
+        if not self.video_win.winfo_viewable():
+            self.video_win.deiconify()
+            self.video_win.update_idletasks()
+            self.video_surface.sync()
+
+    def _hide_video_window(self):
+        self.video_win.withdraw()
+
+    def _set_fullscreen(self, flag):
+        self.fullscreen = bool(flag)
+        if self.player is self.player_backend:
+            self._show_video_window()
+            self.video_win.attributes("-fullscreen", self.fullscreen)
+            self.video_win.update_idletasks()
+            self.video_surface.sync()
+        else:
+            self.external.fullscreen_toggle()
 
     def _build_preview_window(self):
         self.preview_win = tk.Toplevel(self.root)
@@ -479,6 +526,8 @@ class MacApp:
 
     def _start_search(self, a, b):
         self.busy = True
+        if self.player is self.player_backend:
+            self._show_video_window()  # playback is about to start
         self.sync_btn.state(["disabled"])
         self.resync_btn.state(["disabled"])
         player = self.player
@@ -560,6 +609,11 @@ class MacApp:
                                 else "."))
         self._save_config()
 
+    def _clock_lag(self):
+        """How far the active player's clock trails what it is emitting."""
+        return (players.CLOCK_OUTPUT_LAG
+                if self.active_player is self.player_backend else 0.0)
+
     def _auto_probe(self, lo, hi):
         try:
             samples, sr, t0 = audio_capture.record_loopback(
@@ -577,6 +631,7 @@ class MacApp:
         mode = "normal"
         failures = 0
         pause_point = None
+        paused_at = 0.0
         next_at = 0.0
         while not self._closing:
             time.sleep(1.0)
@@ -597,7 +652,10 @@ class MacApp:
                     if hit:
                         t, score, z, t0 = hit
                         failures = 0
-                        drift = t - t_ref
+                        # compare like with like: `t` is where the stream's
+                        # audio is, so the film's emitted position is the
+                        # one to measure against, not its reported clock
+                        drift = t - (t_ref + self._clock_lag())
                         if abs(drift) > 0.35 and not self.busy:
                             player.sync_seek(t, t0, self.offset)
                             self.q.put(("status",
@@ -609,6 +667,7 @@ class MacApp:
                         if self.auto_follow and failures >= 2:
                             player.pause()
                             pause_point = t_ref
+                            paused_at = time.monotonic()
                             mode = "probe"
                             self.q.put(("swap", True))
                             self.q.put(("status",
@@ -618,7 +677,14 @@ class MacApp:
                         else:
                             next_at = time.monotonic() + 10
                 else:
-                    hit = self._auto_probe(pause_point - 25, pause_point + 40)
+                    # A real pause resumes near pause_point, so look there
+                    # first - but the "pause" may have been a false alarm
+                    # (quiet dialog under loud commentary) and the stream
+                    # kept running. Grow the forward edge with elapsed time
+                    # so it keeps up with a stream that never stopped.
+                    ahead = min(time.monotonic() - paused_at, PROBE_MAX_AHEAD)
+                    hit = self._auto_probe(pause_point - 25,
+                                           pause_point + 40 + ahead)
                     if hit:
                         t, score, z, t0 = hit
                         if not self.busy:
@@ -651,13 +717,19 @@ class MacApp:
 
     def _on_mute_toggle(self):
         self.player.set_mute(self.mute_var.get())
+        if not self.mute_var.get() and self.audio_device \
+                and "blackhole" in self.audio_device.lower():
+            # Local audio goes to the Multi-Output Device, which feeds
+            # BlackHole - the very thing we listen to. Unmuted, a sync
+            # would match the film against its own playback and lock onto
+            # itself instead of the stream.
+            self._set_status(
+                "Warning: local audio is unmuted and reaches BlackHole - "
+                "sync may match your own playback instead of the stream. "
+                "Re-mute before syncing.")
 
     def _toggle_fullscreen(self):
-        if self.player is self.player_backend:
-            self.fullscreen = not self.fullscreen
-            self.player_backend.set_fullscreen(self.fullscreen)
-        else:
-            self.external.fullscreen_toggle()
+        self._set_fullscreen(not self.fullscreen)
 
     # ---------------------------------------------------- hosted sessions
 
@@ -835,17 +907,16 @@ class MacApp:
             if show:
                 self._was_fullscreen = self.fullscreen
                 if self.player is self.player_backend and self.fullscreen:
-                    self.player_backend.set_fullscreen(False)
-                    self.fullscreen = False
+                    self._set_fullscreen(False)
                 macwindowctl.activate_app(app_name)
                 self._swapped = True
             else:
                 macwindowctl.hide_app(app_name)
                 if self.player is self.player_backend:
                     macwindowctl.activate_self()
+                    self._show_video_window()
                     if self._was_fullscreen:
-                        self.player_backend.set_fullscreen(True)
-                        self.fullscreen = True
+                        self._set_fullscreen(True)
                 else:
                     macwindowctl.activate_app("VLC")
                 self._swapped = False

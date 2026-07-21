@@ -87,7 +87,7 @@ If something misbehaves, it's most likely one of these - all fixable:
 - Region selector rectangle offset on Retina/multi-monitor -> report
   your display setup.
 - Widget spacing / fonts looking off in the main window.
-- The libvlc video window not appearing until playback starts (expected:
-  it opens on first sync, not on file load).
+- The film window not appearing until playback starts (expected: it
+  opens on first sync, not on file load).
 - `soundcard` errors naming a device -> send the exact device list from
   Advanced > Listen On.
