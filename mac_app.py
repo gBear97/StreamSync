@@ -652,10 +652,16 @@ class MacApp:
                     if hit:
                         t, score, z, t0 = hit
                         failures = 0
-                        # compare like with like: `t` is where the stream's
-                        # audio is, so the film's emitted position is the
-                        # one to measure against, not its reported clock
-                        drift = t - (t_ref + self._clock_lag())
+                        # `t` is where the stream was when the capture
+                        # STARTED, so measure the film at that same
+                        # instant: t_ref predates it by however long the
+                        # capture device took to open (~0.2 s), and the
+                        # probe itself runs for seconds after that.
+                        # Compare against emitted position, not the clock.
+                        now_pos = player.time()
+                        film_at_t0 = (t_ref if now_pos is None else
+                                      now_pos - (time.perf_counter() - t0))
+                        drift = t - (film_at_t0 + self._clock_lag())
                         if abs(drift) > 0.35 and not self.busy:
                             player.sync_seek(t, t0, self.offset)
                             self.q.put(("status",
