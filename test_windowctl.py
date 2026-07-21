@@ -4,12 +4,16 @@ import subprocess
 import sys
 import time
 
-import windowctl
-
 TITLE = "WinCtlTest-9271"
 
 
 def main():
+    if sys.platform != "win32":
+        print(f"SKIPPED: windowctl is Windows-only, this is {sys.platform} "
+              "(use test_macwindowctl.py on macOS)")
+        return
+    import windowctl  # touches ctypes.windll, so only after the guard
+
     proc = subprocess.Popen([
         sys.executable, "-c",
         f"import tkinter as tk; r = tk.Tk(); r.title('{TITLE}'); "
