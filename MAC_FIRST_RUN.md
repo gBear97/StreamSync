@@ -66,6 +66,14 @@ start VLC playback at the right moment.
 - **Show stream while paused** (Advanced menu): needs *Automation*
   permission (System Events) on first use.
 
+## 6.5 Watch parties (optional)
+
+The **Session** menu hosts or joins watch-party sessions. To try it
+solo: run `python3 relay_server.py` in a second terminal, then Session >
+Host a Session with relay `ws://localhost:8765`. The status line shows
+your room code once the film is fingerprinted. Cross-machine tests need
+the relay on a box both sides can reach.
+
 ## 7. When everything works
 
 ```

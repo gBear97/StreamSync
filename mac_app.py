@@ -31,6 +31,7 @@ import audio_matcher
 import capture
 import macwindowctl
 import matcher
+import session
 from players import EmbeddedPlayer, ExternalPlayer, VLCError
 
 CONFIG_PATH = Path.home() / ".streamsync.json"
@@ -86,6 +87,8 @@ class MacApp:
         self._was_fullscreen = False
         self._preview_photo = None
         self.external = None
+        self.session = None          # active HostSession / ViewerSession
+        self.relay_url = "ws://localhost:8765"
 
         root.title("StreamSync")
         root.resizable(False, False)
@@ -218,6 +221,17 @@ class MacApp:
                                 command=self._on_auto_toggle)
         syncm.add_cascade(label="Check Interval", menu=ivm)
         m.add_cascade(label="Sync", menu=syncm)
+
+        self.session_menu = tk.Menu(m, tearoff=0)
+        self.session_menu.add_command(label="Host a Session...",
+                                      command=self._host_dialog)
+        self.session_menu.add_command(label="Join a Session...",
+                                      command=self._join_dialog)
+        self.session_menu.add_separator()
+        self.session_menu.add_command(label="Leave Session",
+                                      command=self._leave_session,
+                                      state="disabled")
+        m.add_cascade(label="Session", menu=self.session_menu)
 
         playm = tk.Menu(m, tearoff=0)
         playm.add_command(label="Play / Pause", accelerator="Command-P",
@@ -566,7 +580,8 @@ class MacApp:
         next_at = 0.0
         while not self._closing:
             time.sleep(1.0)
-            if not self.auto_enabled or self.busy or not self.video_path:
+            if (not self.auto_enabled or self.busy or not self.video_path
+                    or self._session_running()):  # sessions own the playhead
                 mode, failures = "normal", 0
                 continue
             if time.monotonic() < next_at:
@@ -643,6 +658,147 @@ class MacApp:
             self.player_backend.set_fullscreen(self.fullscreen)
         else:
             self.external.fullscreen_toggle()
+
+    # ---------------------------------------------------- hosted sessions
+
+    def _session_running(self):
+        return self.session is not None and not self.session.stop_flag.is_set()
+
+    def _set_leave_enabled(self, enabled):
+        self.session_menu.entryconfig(3, state="normal" if enabled else "disabled")
+
+    def _host_dialog(self):
+        if self._session_running():
+            messagebox.showinfo("StreamSync", "Leave the current session first.")
+            return
+        if not self.video_path:
+            messagebox.showinfo("StreamSync", "Open the film first (Cmd-O).")
+            return
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Host a Session")
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=14)
+        frm.grid()
+
+        ttk.Label(frm, text="Relay server").grid(row=0, column=0, sticky="w")
+        relay_var = tk.StringVar(value=self.relay_url)
+        ttk.Entry(frm, textvariable=relay_var, width=32).grid(
+            row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(frm, text="Password (optional)").grid(row=1, column=0,
+                                                        sticky="w", pady=(6, 0))
+        pw_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=pw_var, width=16).grid(
+            row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+
+        ttk.Label(frm, text="Film position from").grid(row=2, column=0,
+                                                       sticky="w", pady=(6, 0))
+        src_var = tk.StringVar(value="listen")
+        srcrow = ttk.Frame(frm)
+        srcrow.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        ttk.Radiobutton(srcrow, text="listening to this Mac", value="listen",
+                        variable=src_var).pack(side="left")
+        ttk.Radiobutton(srcrow, text="this app's player", value="player",
+                        variable=src_var).pack(side="left", padx=(10, 0))
+
+        ttk.Label(frm, text="Your microphone").grid(row=3, column=0,
+                                                    sticky="w", pady=(6, 0))
+        mic_var = tk.StringVar()
+        mic_combo = ttk.Combobox(frm, textvariable=mic_var, width=30,
+                                 state="readonly")
+        mic_combo.grid(row=3, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        try:
+            mics = audio_capture.list_microphones()
+            mic_combo["values"] = mics
+            # prefer a real mic over BlackHole for the voice stream
+            real = [n for n in mics if "blackhole" not in n.lower()]
+            if real:
+                mic_var.set(real[0])
+            elif mics:
+                mic_var.set(mics[0])
+        except Exception:
+            pass
+
+        ttk.Label(frm, text="Delay hint for viewers (s)").grid(
+            row=4, column=0, sticky="w", pady=(6, 0))
+        delay_var = tk.IntVar(value=10)
+        ttk.Spinbox(frm, from_=2, to=45, textvariable=delay_var,
+                    width=6).grid(row=4, column=1, sticky="w",
+                                  padx=(8, 0), pady=(6, 0))
+
+        def start():
+            self.relay_url = relay_var.get().strip()
+            src = None
+            if src_var.get() == "player":
+                player = self.player
+                src = lambda: (player.time(), player.is_playing())
+            self.session = session.HostSession(
+                self.relay_url, self.video_path, self.q,
+                password=pw_var.get().strip() or None,
+                position_source=src, mic_name=mic_var.get() or None,
+                speaker_name=self.audio_device,
+                default_delay=float(delay_var.get()),
+                title=Path(self.video_path).stem)
+            self.session.start()
+            self._set_leave_enabled(True)
+            self._save_config()
+            dlg.destroy()
+
+        ttk.Button(frm, text="Start Hosting", command=start).grid(
+            row=5, column=1, sticky="e", pady=(12, 0))
+        dlg.grab_set()
+
+    def _join_dialog(self):
+        if self._session_running():
+            messagebox.showinfo("StreamSync", "Leave the current session first.")
+            return
+        if not self.video_path:
+            messagebox.showinfo("StreamSync", "Open your copy of the film first "
+                                              "(Cmd-O).")
+            return
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Join a Session")
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=14)
+        frm.grid()
+
+        ttk.Label(frm, text="Relay server").grid(row=0, column=0, sticky="w")
+        relay_var = tk.StringVar(value=self.relay_url)
+        ttk.Entry(frm, textvariable=relay_var, width=32).grid(
+            row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(frm, text="Session code").grid(row=1, column=0, sticky="w",
+                                                 pady=(6, 0))
+        code_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=code_var, width=14).grid(
+            row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        ttk.Label(frm, text="Password").grid(row=2, column=0, sticky="w",
+                                             pady=(6, 0))
+        pw_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=pw_var, width=16).grid(
+            row=2, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+
+        def start():
+            self.relay_url = relay_var.get().strip()
+            self.session = session.ViewerSession(
+                self.relay_url, code_var.get().strip().upper(),
+                self.video_path, self.player, self.q,
+                password=pw_var.get().strip() or None,
+                speaker_name=self.audio_device)
+            self.session.start()
+            self.player.set_mute(self.mute_var.get())
+            self._set_leave_enabled(True)
+            self._save_config()
+            dlg.destroy()
+
+        ttk.Button(frm, text="Join", command=start).grid(
+            row=3, column=1, sticky="e", pady=(12, 0))
+        dlg.grab_set()
+
+    def _leave_session(self):
+        if self.session is not None:
+            self.session.stop()
+            self.session = None
+        self._set_leave_enabled(False)
+        self._set_status("Left the session.")
 
     # --------------------------------------------- facecam swap (AppleScript)
 
@@ -733,6 +889,8 @@ class MacApp:
                 kind, *payload = self.q.get_nowait()
                 if kind == "status":
                     self._set_status(payload[0])
+                elif kind == "session":
+                    self._set_status(payload[0])
                 elif kind == "swap":
                     self._stream_swap(payload[0])
                 elif kind == "showroot":
@@ -822,6 +980,7 @@ class MacApp:
                 "auto_follow": self.follow_var.get(),
                 "swap": self.swap_var.get(),
                 "stream_app": self.stream_app,
+                "relay_url": self.relay_url,
             }))
         except OSError:
             pass
@@ -865,9 +1024,16 @@ class MacApp:
         self.stream_app = cfg.get("stream_app", "")
         if self.stream_app:
             self.streamapp_var.set(self.stream_app)
+        if cfg.get("relay_url"):
+            self.relay_url = cfg["relay_url"]
 
     def _on_close(self):
         self._closing = True
+        if self.session is not None:
+            try:
+                self.session.stop()
+            except Exception:
+                pass
         self._save_config()
         try:
             self.player_backend.stop()
