@@ -137,6 +137,13 @@ both sides can reach (a $5 VPS or small AWS instance serves thousands of
 viewers - traffic is a few tiny messages per second per room). Point
 both clients at `ws://your-server:8765`.
 
+Dropped connections are survivable on both sides: clients reconnect with
+a backoff, and a room outlives its host's socket for 90 seconds
+(`--host-grace`) so a host who blips can rejoin the same session code
+rather than restarting the party. Viewers keep playing on the last known
+timeline meanwhile. Only the host can reclaim a room - the relay issues
+a private token at creation, because viewers know the room password.
+
 ## Video sync (experimental fallback)
 
 If a streamer ducks the film audio so low that audio matching reports

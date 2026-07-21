@@ -38,6 +38,20 @@ DRIFT_TOLERANCE = 0.35
 SEEK_LATENCY = 0.25
 FP_CHUNK_WORDS = 16384      # film fingerprint chunk size (32 KB each)
 
+MAX_STREAM_DELAY = 90.0     # longest stream delay we search for
+# Fingerprinting a VOICE_CHUNK-second mic block yields only
+# (VOICE_CHUNK - FP_WIN) seconds of words: the analysis window and the
+# consecutive-frame delta consume the rest. So even a host recording with
+# no gaps at all fills at most this fraction of the voice timeline, and
+# the coverage gate has to sit well under it - device-open latency and
+# fingerprinting time push the real duty cycle lower still.
+VOICE_DUTY = (VOICE_CHUNK - fingerprint.FP_WIN) / VOICE_CHUNK    # 0.875
+MIN_VOICE_COVERAGE = 0.6    # must stay clear of VOICE_DUTY
+# A host block is only broadcast once its whole VOICE_CHUNK is recorded,
+# so voice covering the end of a probe lands this long after the probe does.
+VOICE_SETTLE = VOICE_CHUNK + 2.0
+RECONNECT_BACKOFF = (1.0, 2.0, 5.0, 10.0, 15.0)   # then the last, forever
+
 
 def _b64(words):
     return base64.b64encode(fingerprint.words_to_bytes(words)).decode()
@@ -138,8 +152,20 @@ class VoiceBuffer:
             cutoff = self.blocks[-1][0] - 240.0
             self.blocks = [b for b in self.blocks if b[0] >= cutoff]
 
+    def first_utc(self):
+        """UTC of the oldest block held, or None when empty."""
+        with self.lock:
+            return self.blocks[0][0] if self.blocks else None
+
     def timeline(self, t_from, t_to):
-        """(words, base_utc, coverage 0..1) for the requested span."""
+        """(words, base_utc, coverage 0..1) for the requested span.
+
+        Coverage counts only slots the buffer could plausibly have filled -
+        it is the filled fraction from the oldest block onward. Time before
+        that is voice nobody recorded yet (a viewer 30 s into a session has
+        no host audio from 90 s ago); scoring it as dropout would make
+        coverage unreachable for the first minutes of every session.
+        """
         n = max(0, int(round((t_to - t_from) / FP_HOP)))
         words = np.zeros(n, dtype=np.uint16)
         filled = np.zeros(n, dtype=bool)
@@ -152,7 +178,10 @@ class VoiceBuffer:
                 if 0 <= j < n:
                     words[j] = w[k]
                     filled[j] = True
-        cov = float(filled.mean()) if n else 0.0
+        first = 0 if not blocks else max(
+            0, int(round((blocks[0][0] - t_from) / FP_HOP)))
+        scored = filled[first:]
+        cov = float(scored.mean()) if scored.size else 0.0
         return words, t_from, cov
 
 
@@ -162,30 +191,46 @@ def measure_delay(voice_buf, probe_words, probe_t0):
     probe_words: fingerprints of loopback audio recorded starting at
     probe_t0 (shared-clock UTC). Correlates against the host's voice
     timeline. Returns delay seconds, or None when inconclusive.
+
+    The reference has to extend past the *end* of the probe, not its
+    start: a probe heard with delay D covers host voice up to
+    probe_t0 + MEASURE_SECONDS - D, so a window ending at probe_t0 could
+    only ever align streams already D >= MEASURE_SECONDS behind. Callers
+    must let the voice buffer settle (VOICE_SETTLE) before measuring, or
+    the tail of that window has not been broadcast yet.
     """
-    ref, base, cov = voice_buf.timeline(probe_t0 - 90.0, probe_t0 + 5.0)
-    if cov < 0.8 or len(ref) < len(probe_words) + 20:
+    oldest = voice_buf.first_utc()
+    if oldest is None:
+        return None
+    t_from = max(probe_t0 - MAX_STREAM_DELAY, oldest)
+    ref, base, cov = voice_buf.timeline(
+        t_from, probe_t0 + MEASURE_SECONDS + 1.0)
+    if cov < MIN_VOICE_COVERAGE or len(ref) < len(probe_words) + 20:
         return None
     lag, ber, median = fingerprint.best_align(ref, probe_words)
     if ber > fingerprint.DELAY_BER or median - ber < fingerprint.DELAY_MARGIN:
         return None
     spoken_at = base + lag * FP_HOP
     delay = probe_t0 - spoken_at
-    if not (0.0 <= delay <= 90.0):
+    if not (-1.0 <= delay <= MAX_STREAM_DELAY):   # -1: alignment noise at D~0
         return None
-    return float(delay)
+    return float(max(0.0, delay))
 
 
 # --------------------------------------------------------------------------
 # websocket plumbing (sync client, one thread per direction)
 # --------------------------------------------------------------------------
 
+class SessionGone(Exception):
+    """The relay no longer holds this room - reconnecting cannot help."""
+
+
 class Link:
     """Small wrapper over websockets.sync with a receive queue."""
 
     def __init__(self, url):
         from websockets.sync.client import connect
-        self.ws = connect(url, max_size=None)
+        self.ws = connect(url, max_size=None, open_timeout=15)
         self.inbox = queue.Queue()
         self.alive = True
         threading.Thread(target=self._pump, daemon=True).start()
@@ -241,10 +286,12 @@ class HostSession:
         self.title = title or "session"
         self.clock = SharedClock()
         self.code = None
+        self.token = None         # host secret for resuming the room
         self.viewers = 0
         self.stop_flag = threading.Event()
         self.link = None
         self._anchor = None       # listen mode: (pos, utc, playing)
+        self._workers = False
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -252,66 +299,124 @@ class HostSession:
     def stop(self):
         self.stop_flag.set()
         if self.link:
+            try:                  # tear the room down now, no grace period
+                self.link.send({"type": "end"})
+            except Exception:
+                pass
             self.link.close()
 
     def _say(self, text):
         self.events.put(("session", text))
 
     def _run(self):
+        """Own the relay connection; reconnect until stopped.
+
+        Everything that can only be done once - clock sync, fingerprinting,
+        starting the capture threads - happens outside the reconnect loop,
+        so a dropped socket costs a few seconds rather than the session.
+        """
         try:
             self._say("Syncing clock...")
             self.clock.sync()
             self._say("Fingerprinting your file (one-way hashes only)...")
             words = fingerprint.fingerprint_file(self.video_path)
             duration, _ = audio_matcher.probe(self.video_path)
-
-            self._say("Connecting to relay...")
-            self.link = Link(self.relay_url)
-            self.link.send({"type": "create", "password": self.password,
-                            "meta": {"title": self.title,
-                                     "duration": duration}})
-            msg = self.link.inbox.get(timeout=10)
-            if msg.get("type") != "created":
-                raise RuntimeError(f"Relay refused: {msg}")
-            self.code = msg["code"]
-            self._say(f"Session live - code {self.code}. Waiting for viewers.")
-
-            # publish the film fingerprint for verification (cached by relay)
             chunks = [words[i:i + FP_CHUNK_WORDS]
                       for i in range(0, len(words), FP_CHUNK_WORDS)]
-            self.link.send({"type": "fp_meta", "ck": "fp_meta",
-                            "chunks": len(chunks), "words": len(words),
-                            "duration": duration, "title": self.title})
-            for i, ch in enumerate(chunks):
-                self.link.send({"type": "fp_chunk", "ck": f"fp_chunk_{i}",
-                                "i": i, "data": _b64(ch)})
 
-            threading.Thread(target=self._voice_loop, daemon=True).start()
-            if self.position_source is None:
-                threading.Thread(target=self._listen_loop, daemon=True).start()
-            threading.Thread(target=self._state_loop, daemon=True).start()
-
+            attempt = 0
             while not self.stop_flag.is_set():
                 try:
-                    msg = self.link.inbox.get(timeout=1.0)
-                except queue.Empty:
-                    continue
-                t = msg.get("type")
-                if t == "viewers":
-                    self.viewers = int(msg.get("n", 0))
-                    self._say(f"Session {self.code} - "
-                              f"{self.viewers} viewer(s) connected.")
-                elif t == "verified":
-                    ok = msg.get("ok")
-                    self._say(f"A viewer {'verified their copy' if ok else 'FAILED verification'}"
-                              f" ({msg.get('viewers', '?')} connected).")
-                elif t == "_closed":
-                    if not self.stop_flag.is_set():
-                        self._say("Relay connection lost.")
+                    self._connect(chunks, len(words), duration)
+                    attempt = 0
+                    self._start_workers()
+                    self._serve()
+                except SessionGone as e:
+                    self._say(str(e))
+                    break
+                except Exception as e:
+                    self._say(f"Host session error: {e}")
+                    traceback.print_exc()
+                if self.stop_flag.is_set():
+                    break
+                wait = RECONNECT_BACKOFF[min(attempt,
+                                             len(RECONNECT_BACKOFF) - 1)]
+                attempt += 1
+                self._say(f"Relay connection lost - retrying in {wait:.0f}s.")
+                if self.stop_flag.wait(wait):
                     break
         except Exception as e:
             self._say(f"Host session error: {e}")
             traceback.print_exc()
+        finally:
+            # whatever happened, release the mic and let the UI leave the
+            # session rather than sit in one that no longer exists
+            self.stop_flag.set()
+            if self.link:
+                self.link.close()
+
+    def _connect(self, chunks, n_words, duration):
+        fresh = self.code is None
+        self._say("Connecting to relay..." if fresh
+                  else f"Reconnecting to session {self.code}...")
+        self.link = Link(self.relay_url)
+        if fresh:
+            self.link.send({"type": "create", "password": self.password,
+                            "meta": {"title": self.title,
+                                     "duration": duration}})
+        else:
+            self.link.send({"type": "resume", "code": self.code,
+                            "token": self.token})
+        msg = self.link.inbox.get(timeout=20)
+        if msg.get("type") == "error":
+            raise SessionGone(f"Could not rejoin session {self.code}: "
+                              f"{msg.get('reason')}. The session has ended.")
+        if msg.get("type") not in ("created", "resumed"):
+            raise RuntimeError(f"Relay refused: {msg}")
+
+        if fresh:
+            self.code = msg["code"]
+            self.token = msg.get("token")
+            self._say(f"Session live - code {self.code}. Waiting for viewers.")
+            # publish the film fingerprint for verification (cached by the
+            # relay, so it survives a reconnect and does not need resending)
+            self.link.send({"type": "fp_meta", "ck": "fp_meta",
+                            "chunks": len(chunks), "words": n_words,
+                            "duration": duration, "title": self.title})
+            for i, ch in enumerate(chunks):
+                self.link.send({"type": "fp_chunk", "ck": f"fp_chunk_{i}",
+                                "i": i, "data": _b64(ch)})
+        else:
+            self._say(f"Reconnected - session {self.code} is live again "
+                      f"({msg.get('viewers', '?')} viewer(s)).")
+
+    def _start_workers(self):
+        if self._workers:
+            return
+        self._workers = True
+        threading.Thread(target=self._voice_loop, daemon=True).start()
+        if self.position_source is None:
+            threading.Thread(target=self._listen_loop, daemon=True).start()
+        threading.Thread(target=self._state_loop, daemon=True).start()
+
+    def _serve(self):
+        """Handle relay traffic until the link drops or we are stopped."""
+        while not self.stop_flag.is_set():
+            try:
+                msg = self.link.inbox.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            t = msg.get("type")
+            if t == "viewers":
+                self.viewers = int(msg.get("n", 0))
+                self._say(f"Session {self.code} - "
+                          f"{self.viewers} viewer(s) connected.")
+            elif t == "verified":
+                ok = msg.get("ok")
+                self._say(f"A viewer {'verified their copy' if ok else 'FAILED verification'}"
+                          f" ({msg.get('viewers', '?')} connected).")
+            elif t == "_closed":
+                return
 
     def _current_state(self):
         if self.position_source is not None:
@@ -340,21 +445,31 @@ class HostSession:
                     seq += 1
                 except Exception:
                     pass
-            time.sleep(STATE_INTERVAL)
+            self.stop_flag.wait(STATE_INTERVAL)
 
     def _voice_loop(self):
+        """Fingerprint the host's MIC - their commentary over the film.
+
+        Viewers fingerprint *stream* audio off loopback (BlackHole on
+        macOS); these are two different devices and correlating the delay
+        depends on keeping them that way.
+        """
         while not self.stop_flag.is_set():
             try:
-                utc_start = self.clock.utc()
-                samples, sr, _ = audio_capture.record_mic(
+                utc0, perf0 = self.clock.utc(), time.perf_counter()
+                samples, sr, t0 = audio_capture.record_mic(
                     VOICE_CHUNK, mic_name=self.mic_name)
                 words = fingerprint.fingerprint_samples(samples, sr)
-                self.link.send({"type": "voice", "t0": utc_start,
+                # t0 is stamped with the device already running, so this
+                # dates the block by when audio started flowing rather
+                # than by when we asked - the open latency is not silence
+                # the viewer will ever hear
+                self.link.send({"type": "voice", "t0": utc0 + (t0 - perf0),
                                 "data": _b64(words)})
             except matcher.MatchError:
                 pass
             except Exception:
-                time.sleep(2.0)
+                self.stop_flag.wait(2.0)
 
     def _listen_loop(self):
         """Track the film's position by listening to the host machine."""
@@ -382,7 +497,7 @@ class HostSession:
                     self._anchor = (pos, utc, False)
             except Exception:
                 pass
-            time.sleep(max(0.0, LISTEN_INTERVAL - 4.0))
+            self.stop_flag.wait(max(0.0, LISTEN_INTERVAL - 4.0))
 
 
 # --------------------------------------------------------------------------
@@ -413,6 +528,7 @@ class ViewerSession:
         self.link = None
         self._fp_chunks = {}
         self._fp_meta = None
+        self._workers = False
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -430,55 +546,112 @@ class ViewerSession:
                 else self.timeline.default_delay) + self.nudge
 
     def _run(self):
+        """Own the relay connection; reconnect until stopped.
+
+        Verification is done once - the film fingerprint and the offset it
+        produced stay valid across a dropped socket, so a blip costs a few
+        seconds of drift rather than re-hashing the whole film.
+        """
         try:
             self._say("Syncing clock...")
             self.clock.sync()
-            self._say("Connecting to relay...")
-            self.link = Link(self.relay_url)
-            self.link.send({"type": "join", "code": self.code,
-                            "password": self.password})
             threading.Thread(target=self._recv_loop, daemon=True).start()
 
-            # wait until the film fingerprint has fully arrived
-            self._say("Waiting for session data...")
-            deadline = time.time() + 60
-            while time.time() < deadline and not self.stop_flag.is_set():
-                if (self._fp_meta is not None
-                        and len(self._fp_chunks) == self._fp_meta["chunks"]):
-                    break
-                time.sleep(0.3)
-            else:
-                raise RuntimeError("Session data never arrived - is the "
-                                   "host still fingerprinting?")
-
-            host_words = np.concatenate(
-                [self._fp_chunks[i] for i in range(self._fp_meta["chunks"])])
-            self._say("Verifying your copy against the host's hashes...")
-            self.delta, ber = verify_media(host_words, self.video_path,
-                                           self._fp_meta.get("duration"))
-            self.verified = True
-            self.link.send({"type": "verified", "ok": True,
-                            "offset": self.delta})
-            self._say(f"Verified (bit error {ber:.2f}, file offset "
-                      f"{self.delta:+.2f}s). Following the session.")
-
-            threading.Thread(target=self._measure_loop, daemon=True).start()
-            self._follow_loop()
-        except matcher.MatchError as e:
-            if self.link:
+            attempt = 0
+            while not self.stop_flag.is_set():
                 try:
-                    self.link.send({"type": "verified", "ok": False})
-                except Exception:
-                    pass
-            self._say(str(e))
+                    self._join()
+                    attempt = 0
+                    if not self._await_session_data():
+                        break     # stopped for a reason already reported
+                    if not self.verified:
+                        self._verify()
+                    self._start_workers()
+                    while self.link.alive and not self.stop_flag.is_set():
+                        self.stop_flag.wait(0.5)
+                except matcher.MatchError as e:
+                    self._report_failed_verification(e)
+                    break
+                except Exception as e:
+                    self._say(f"Viewer session error: {e}")
+                    traceback.print_exc()
+                if self.stop_flag.is_set():
+                    break
+                wait = RECONNECT_BACKOFF[min(attempt,
+                                             len(RECONNECT_BACKOFF) - 1)]
+                attempt += 1
+                self._say(f"Relay connection lost - retrying in {wait:.0f}s.")
+                if self.stop_flag.wait(wait):
+                    break
         except Exception as e:
             self._say(f"Viewer session error: {e}")
             traceback.print_exc()
+        finally:
+            self.stop_flag.set()
+            if self.link:
+                self.link.close()
+
+    def _join(self):
+        self._say("Connecting to relay..." if not self.verified
+                  else f"Rejoining session {self.code}...")
+        self.link = Link(self.relay_url)
+        self.link.send({"type": "join", "code": self.code,
+                        "password": self.password})
+
+    def _await_session_data(self):
+        """Block until the host's film fingerprint has fully arrived.
+
+        Returns False when the session was stopped instead - a bad code, a
+        wrong password or a host teardown all set stop_flag after saying
+        exactly what went wrong, and blaming a slow fingerprint on top of
+        that only misleads.
+        """
+        self._say("Waiting for session data...")
+        deadline = time.time() + 60
+        while not self.stop_flag.is_set():
+            meta = self._fp_meta
+            if meta is not None and len(self._fp_chunks) >= meta["chunks"]:
+                return True
+            if time.time() >= deadline:
+                raise RuntimeError("Session data never arrived - is the "
+                                   "host still fingerprinting?")
+            time.sleep(0.3)
+        return False
+
+    def _verify(self):
+        host_words = np.concatenate(
+            [self._fp_chunks[i] for i in range(self._fp_meta["chunks"])])
+        self._say("Verifying your copy against the host's hashes...")
+        self.delta, ber = verify_media(host_words, self.video_path,
+                                       self._fp_meta.get("duration"))
+        self.verified = True
+        self.link.send({"type": "verified", "ok": True, "offset": self.delta})
+        self._say(f"Verified (bit error {ber:.2f}, file offset "
+                  f"{self.delta:+.2f}s). Following the session.")
+
+    def _report_failed_verification(self, err):
+        if self.link:
+            try:
+                self.link.send({"type": "verified", "ok": False})
+            except Exception:
+                pass
+        self._say(str(err))
+
+    def _start_workers(self):
+        if self._workers:
+            return
+        self._workers = True
+        threading.Thread(target=self._measure_loop, daemon=True).start()
+        threading.Thread(target=self._follow_loop, daemon=True).start()
 
     def _recv_loop(self):
         while not self.stop_flag.is_set():
+            link = self.link
+            if link is None:
+                time.sleep(0.2)
+                continue
             try:
-                msg = self.link.inbox.get(timeout=1.0)
+                msg = link.inbox.get(timeout=1.0)
             except queue.Empty:
                 continue
             t = msg.get("type")
@@ -496,10 +669,13 @@ class ViewerSession:
             elif t == "ended":
                 self._say("The host ended the session.")
                 self.stop_flag.set()
+            elif t == "host_gone":
+                self._say("The host dropped off - holding your place. "
+                          "Playback keeps going on the last known timeline.")
+            elif t == "host_back":
+                self._say("The host is back.")
             elif t == "_closed":
-                if not self.stop_flag.is_set():
-                    self._say("Relay connection lost.")
-                self.stop_flag.set()
+                pass          # _run owns reconnecting; not a session end
 
     def _follow_loop(self):
         was_playing = None
@@ -523,16 +699,26 @@ class ViewerSession:
                         was_playing = False
                 except Exception:
                     pass
-            time.sleep(1.0)
+            self.stop_flag.wait(1.0)
 
     def _measure_loop(self):
+        """Measure this viewer's own stream delay off loopback audio.
+
+        This records the *stream* (BlackHole on macOS), never a mic - it is
+        the host's voice arriving late through the stream that the
+        correlation looks for.
+        """
         while not self.stop_flag.is_set():
             try:
-                utc_start = self.clock.utc()
-                samples, sr, _ = audio_capture.record_loopback(
+                utc0, perf0 = self.clock.utc(), time.perf_counter()
+                samples, sr, t0 = audio_capture.record_loopback(
                     MEASURE_SECONDS, speaker_name=self.speaker_name)
                 probe = fingerprint.fingerprint_samples(samples, sr)
-                d = measure_delay(self.voice, probe, utc_start)
+                # the host cannot have broadcast voice covering the end of
+                # this probe yet - its block is still being recorded
+                if self.stop_flag.wait(VOICE_SETTLE):
+                    break
+                d = measure_delay(self.voice, probe, utc0 + (t0 - perf0))
                 if d is not None:
                     first = self.delay is None
                     self.delay = d if first else 0.7 * self.delay + 0.3 * d
@@ -544,4 +730,5 @@ class ViewerSession:
                 pass
             except Exception:
                 pass
-            time.sleep(MEASURE_INTERVAL - MEASURE_SECONDS)
+            self.stop_flag.wait(
+                max(1.0, MEASURE_INTERVAL - MEASURE_SECONDS - VOICE_SETTLE))

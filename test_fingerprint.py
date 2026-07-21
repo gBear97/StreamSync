@@ -87,23 +87,78 @@ def main():
         words = fingerprint.fingerprint_samples(voice[i:i + chunk], SR)
         buf.add(base_utc + i / SR, words)
 
-    true_delay = 7.25
-    # late enough that the 90 s correlation window is inside the buffer
-    # (in production the voice buffer runs continuously, so this is the
-    # normal situation after ~90 s of session)
-    probe_start_media = 95.0
-    seg = voice[int(probe_start_media * SR):
-                int((probe_start_media + session.MEASURE_SECONDS) * SR)]
     rng = np.random.default_rng(5)
-    degraded = np.clip(seg * 0.9 + 0.15 * np.convolve(
-        rng.standard_normal(seg.size), np.hamming(33), "same").astype(np.float32),
-        -1, 1)
-    probe = fingerprint.fingerprint_samples(degraded, SR)
-    probe_t0 = base_utc + probe_start_media + true_delay  # heard this late
+
+    def probe_at(media_t, delay):
+        """Fingerprint the host's voice as a viewer hears it `delay` late."""
+        seg = voice[int(media_t * SR):
+                    int((media_t + session.MEASURE_SECONDS) * SR)]
+        degraded = np.clip(seg * 0.9 + 0.15 * np.convolve(
+            rng.standard_normal(seg.size), np.hamming(33),
+            "same").astype(np.float32), -1, 1)
+        return (fingerprint.fingerprint_samples(degraded, SR),
+                base_utc + media_t + delay)
+
+    true_delay = 7.25
+    probe, probe_t0 = probe_at(95.0, true_delay)
     d = session.measure_delay(buf, probe, probe_t0)
     assert d is not None, "delay measurement was inconclusive"
     print(f"delay measurement: true {true_delay}s, measured {d:.2f}s")
     assert abs(d - true_delay) < 0.3, d
+
+    # 3a. short delays must be measurable too. The reference window has to
+    # run past the *end* of the probe: a window stopping 5 s after the
+    # probe starts can only ever align streams >= MEASURE_SECONDS - 5 s
+    # behind, so every viewer nearer than that silently fell back to the
+    # host's guess.
+    for short in (0.0, 0.75, 2.0, 4.0):
+        probe, probe_t0 = probe_at(95.0, short)
+        d = session.measure_delay(buf, probe, probe_t0)
+        assert d is not None, f"delay of {short}s was unmeasurable"
+        assert abs(d - short) < 0.3, (short, d)
+    print("delay measurement: 0.0-4.0s delays measure correctly too")
+
+    # 3b. coverage gate. Fingerprinting a VOICE_CHUNK block yields only
+    # VOICE_CHUNK - FP_WIN seconds of words, so a gap-free host tops out at
+    # VOICE_DUTY; the gate has to clear real per-block overhead while still
+    # catching an actual dropout.
+    assert session.MIN_VOICE_COVERAGE < session.VOICE_DUTY, "gate unreachable"
+
+    def build_buffer(period, upto):
+        b = session.VoiceBuffer()
+        t = 0.0
+        while t + session.VOICE_CHUNK < upto:
+            seg = voice[int(t * SR):int((t + session.VOICE_CHUNK) * SR)]
+            b.add(base_utc + t, fingerprint.fingerprint_samples(seg, SR))
+            t += period
+        return b
+
+    def coverage(b, probe_t0):
+        t_from = max(probe_t0 - session.MAX_STREAM_DELAY, b.first_utc())
+        return b.timeline(t_from,
+                          probe_t0 + session.MEASURE_SECONDS + 1.0)[2]
+
+    for overhead in (0.0, 0.5, 1.0):     # device open + fingerprint + send
+        cov = coverage(build_buffer(session.VOICE_CHUNK + overhead, 118),
+                       base_utc + 105.0)
+        assert cov >= session.MIN_VOICE_COVERAGE, (overhead, cov)
+    holed = build_buffer(session.VOICE_CHUNK, 118)
+    with holed.lock:                     # host mic died for 40 s
+        holed.blocks = [b for b in holed.blocks
+                        if not (base_utc + 55 <= b[0] < base_utc + 95)]
+    cov = coverage(holed, base_utc + 105.0)
+    assert cov < session.MIN_VOICE_COVERAGE, cov
+    probe, probe_t0 = probe_at(95.0, true_delay)
+    assert session.measure_delay(holed, probe, probe_t0) is None
+    print("coverage gate: passes with loop overhead, rejects a real dropout")
+
+    # 3c. a viewer joining mid-session can measure without waiting for the
+    # full correlation window to fill with history that does not exist yet
+    young = build_buffer(session.VOICE_CHUNK, 30.0)
+    probe, probe_t0 = probe_at(16.0, 2.0)
+    d = session.measure_delay(young, probe, probe_t0)
+    assert d is not None and abs(d - 2.0) < 0.3, d
+    print(f"early session: measured {d:.2f}s from only 30 s of host voice")
 
     # 4. timeline math: delayed rendering delays pauses too
     tl = session.StateTimeline()
