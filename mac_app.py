@@ -8,8 +8,9 @@ menu bar (Sync, Playback, Advanced menus).
 Platform notes:
 - Audio capture comes from the BlackHole virtual device (no loopback API
   on macOS); audio_capture handles the routing details.
-- The "embedded" player is a libvlc-owned video window (Tk cannot host
-  libvlc on macOS); control is identical, VLC just draws its own window.
+- The "embedded" player draws into our own film window: libvlc opens no
+  window of its own on macOS, so macvideo gives it an NSView to render
+  into. Fullscreen belongs to that window, not to libvlc.
 - The facecam swap activates/hides the browser app via AppleScript.
 """
 
