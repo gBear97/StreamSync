@@ -951,13 +951,16 @@ class MacApp:
             return
         self._swap_target = show
         self._swap_seq += 1
-        if show:
+        if show and self.player is self.player_backend and self.fullscreen:
             # Leave fullscreen before the browser is raised: a fullscreen Tk
             # window owns its own Space and the browser would come forward
-            # behind it.
-            self._was_fullscreen = self.fullscreen
-            if self.player is self.player_backend and self.fullscreen:
-                self._set_fullscreen(False)
+            # behind it. The flag means "we owe the user fullscreen back",
+            # so it is only ever set when we actually take it away - reading
+            # self.fullscreen here would record False for a second pause
+            # that arrives before the first one's restore has run, and the
+            # debt would be forgotten.
+            self._was_fullscreen = True
+            self._set_fullscreen(False)
         self._swap_q.put((self._swap_seq, show,
                           self.player is self.player_backend))
 
@@ -1026,12 +1029,14 @@ class MacApp:
                     # We left fullscreen to make way for a browser that
                     # never came up. Nothing raised it, so put the film
                     # back the way the user had it.
+                    self._was_fullscreen = False
                     self._set_fullscreen(True)
             return
         self._swapped = show
         if not show and self.player is self.player_backend:
             self._show_video_window()
             if self._was_fullscreen:
+                self._was_fullscreen = False   # debt paid
                 self._set_fullscreen(True)
 
     # ------------------------------------------------------------ subtitles
