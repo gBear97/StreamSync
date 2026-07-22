@@ -88,6 +88,10 @@ class MacApp:
         self._closing = False
         self._swapped = False
         self._was_fullscreen = False
+        self._swap_target = False    # state the last dispatched swap aims at
+        self._swap_seq = 0
+        self._swap_app = ""          # resolved browser, cached across swaps
+        self._swap_q = queue.Queue()
         self._preview_photo = None
         self.external = None
         self.session = None          # active HostSession / ViewerSession
@@ -127,6 +131,7 @@ class MacApp:
         self._populate_audio_devices()
 
         threading.Thread(target=self._auto_loop, daemon=True).start()
+        threading.Thread(target=self._swap_worker, daemon=True).start()
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         root.after(80, self._poll_queue)
@@ -886,43 +891,98 @@ class MacApp:
 
     def _on_streamapp_pick(self):
         self.stream_app = self.streamapp_var.get()
+        self._swap_app = ""          # resolve again against the new choice
         self._save_config()
 
     def _stream_swap(self, show):
-        if not self.swap_var.get() or show == self._swapped or not self.video_path:
+        """Ask for the stream app to be shown (paused) or hidden (playing).
+
+        Only the Tk half runs here - the osascript round-trips would block
+        the main thread for seconds, so they happen on _swap_worker and come
+        back through self.q as a "swapdone" event.
+        """
+        show = bool(show)
+        if not self.swap_var.get() or not self.video_path \
+                or show == self._swap_target:
             return
-        app_name = self.stream_app
-        if not app_name:
+        self._swap_target = show
+        self._swap_seq += 1
+        if show:
+            # Leave fullscreen before the browser is raised: a fullscreen Tk
+            # window owns its own Space and the browser would come forward
+            # behind it.
+            self._was_fullscreen = self.fullscreen
+            if self.player is self.player_backend and self.fullscreen:
+                self._set_fullscreen(False)
+        self._swap_q.put((self._swap_seq, show,
+                          self.player is self.player_backend))
+
+    def _resolve_stream_app(self):
+        """Worker thread: name of the app to swap with, "" if there is none."""
+        if self.stream_app:
+            return self.stream_app
+        if self._swap_app:
+            return self._swap_app
+        # "every application process" costs 0.5-1.5s, so hold on to the
+        # answer. A miss is not cached, in case a browser opens later.
+        running = macwindowctl.list_gui_apps()
+        self._swap_app = next((b for b in BROWSERS if b in running), "")
+        return self._swap_app
+
+    def _swap_worker(self):
+        while True:
+            item = self._swap_q.get()
+            # A rapid pause/resume only needs the state it settled on; drop
+            # the swaps it passed through rather than play them back.
+            while True:
+                try:
+                    item = self._swap_q.get_nowait()
+                except queue.Empty:
+                    break
+            if item is None:
+                return
+            seq, show, embedded = item
             try:
-                running = macwindowctl.list_gui_apps()
-                app_name = next((b for b in BROWSERS if b in running), "")
+                app_name = self._resolve_stream_app()
             except Exception:
                 app_name = ""
-        if not app_name:
-            if show:
-                self._set_status("Pick the stream's browser under Advanced > "
-                                 "Stream App first.")
-            return
-        try:
-            if show:
-                self._was_fullscreen = self.fullscreen
-                if self.player is self.player_backend and self.fullscreen:
-                    self._set_fullscreen(False)
-                macwindowctl.activate_app(app_name)
-                self._swapped = True
-            else:
-                macwindowctl.hide_app(app_name)
-                if self.player is self.player_backend:
+            if not app_name:
+                if show:
+                    self.q.put(("status", "Pick the stream's browser under "
+                                          "Advanced > Stream App first."))
+                self.q.put(("swapdone", seq, show, False))
+                continue
+            try:
+                if show:
+                    macwindowctl.activate_app(app_name)
+                elif embedded:
+                    macwindowctl.hide_app(app_name)
                     macwindowctl.activate_self()
-                    self._show_video_window()
-                    if self._was_fullscreen:
-                        self._set_fullscreen(True)
                 else:
+                    macwindowctl.hide_app(app_name)
                     macwindowctl.activate_app("VLC")
-                self._swapped = False
-        except Exception as e:
-            self._set_status(f"App swap failed: {e} (grant Automation "
-                             "permission in System Settings > Privacy).")
+            except Exception as e:
+                self._swap_app = ""  # that app may have quit - resolve again
+                self.q.put(("status", f"App swap failed: {e} (grant Automation "
+                                      "permission in System Settings > "
+                                      "Privacy)."))
+                self.q.put(("swapdone", seq, show, False))
+                continue
+            self.q.put(("swapdone", seq, show, True))
+
+    def _swap_done(self, seq, show, ok):
+        """Main thread: finish a swap the worker has applied."""
+        if not ok:
+            # Let the next pause try again instead of latching on a failure,
+            # unless a newer swap is already on its way.
+            if seq == self._swap_seq:
+                self._swap_target = self._swapped
+            return
+        self._swapped = show
+        if not show and self.player is self.player_backend:
+            self._show_video_window()
+            if self._was_fullscreen:
+                self._set_fullscreen(True)
 
     # ------------------------------------------------------------ subtitles
 
@@ -964,6 +1024,8 @@ class MacApp:
                     self._set_status(payload[0])
                 elif kind == "swap":
                     self._stream_swap(payload[0])
+                elif kind == "swapdone":
+                    self._swap_done(*payload)
                 elif kind == "showroot":
                     self.root.deiconify()
                 elif kind == "devices":
@@ -1100,6 +1162,7 @@ class MacApp:
 
     def _on_close(self):
         self._closing = True
+        self._swap_q.put(None)
         if self.session is not None:
             try:
                 self.session.stop()
