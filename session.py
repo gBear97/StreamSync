@@ -476,9 +476,14 @@ class HostSession:
         last_pos = None
         while not self.stop_flag.is_set():
             try:
-                utc_start = self.clock.utc()
-                samples, sr, _ = audio_capture.record_loopback(
+                utc0, perf0 = self.clock.utc(), time.perf_counter()
+                samples, sr, t0 = audio_capture.record_loopback(
                     4.0, speaker_name=self.speaker_name)
+                # The match belongs to the instant the capture began, ~0.2 s
+                # after we asked for it (the device has to open first).
+                # Dating it from the request would put every viewer that far
+                # ahead of the host, permanently and invisibly.
+                utc_start = utc0 + (t0 - perf0)
                 feats = audio_matcher.prep_capture(samples, sr)
                 lo = None if last_pos is None else last_pos - 60
                 hi = None if last_pos is None else last_pos + 90

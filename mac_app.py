@@ -532,19 +532,23 @@ class MacApp:
 
     def _start_search(self, a, b):
         self.busy = True
-        if self.player is self.player_backend:
-            self._show_video_window()  # playback is about to start
         self.sync_btn.state(["disabled"])
         self.resync_btn.state(["disabled"])
         player = self.player
         offset = self.offset
         mute = self.mute_var.get()
         if self.method_var.get() == "audio":
+            if self.player is self.player_backend:
+                self._show_video_window()  # playback is about to start
             device = self.audio_device
             threading.Thread(
                 target=self._audio_search_worker,
                 args=(a, b, player, offset, mute, device), daemon=True).start()
         else:
+            # The film window must NOT be revealed here: this method
+            # screenshots the stream, and our own picture inside the
+            # capture region would be matched instead of it. The worker
+            # shows the window once the frames are grabbed.
             self._set_status("Capturing stream frames...")
             self.root.withdraw()  # our window must not cover the stream
             self.root.update()
@@ -583,6 +587,7 @@ class MacApp:
             burst_raw, t0 = capture.grab_burst(self.region, BURST_FRAMES,
                                                BURST_SPACING)
             self.q.put(("showroot", None))
+            self.q.put(("showvideo", None))  # safe now: frames are captured
             self.q.put(("preview", burst_raw[0][0]))
             burst = []
             for img, dt in burst_raw:
@@ -651,6 +656,7 @@ class MacApp:
             try:
                 if mode == "normal":
                     t_ref = player.time() if player.is_playing() else None
+                    t_ref_at = time.perf_counter()
                     if t_ref is None:
                         next_at = time.monotonic() + 5
                         continue
@@ -663,12 +669,28 @@ class MacApp:
                         # instant: t_ref predates it by however long the
                         # capture device took to open (~0.2 s), and the
                         # probe itself runs for seconds after that.
-                        # Compare against emitted position, not the clock.
                         now_pos = player.time()
-                        film_at_t0 = (t_ref if now_pos is None else
-                                      now_pos - (time.perf_counter() - t0))
-                        drift = t - (film_at_t0 + self._clock_lag())
-                        if abs(drift) > 0.35 and not self.busy:
+                        moved = None if now_pos is None else now_pos - t_ref
+                        if (now_pos is None or not player.is_playing()
+                                or abs(moved - (time.perf_counter() - t_ref_at))
+                                > 0.5):
+                            # Paused, seeked or stalled while we listened -
+                            # winding the clock back from now would invent a
+                            # position. Say nothing and look again shortly.
+                            next_at = time.monotonic() + 5
+                            continue
+                        film_at_t0 = now_pos - (time.perf_counter() - t0)
+                        # Where the film SHOULD be: the stream's position
+                        # plus the offset the user nudged in, which every
+                        # sync_seek applies. Ignoring it would read a
+                        # deliberate offset as drift and undo it on a loop.
+                        # Compare against emitted position, not the clock.
+                        drift = ((t + self.offset)
+                                 - (film_at_t0 + self._clock_lag()))
+                        # a session may have taken the playhead while we
+                        # were listening - its timeline wins
+                        if (abs(drift) > 0.35 and not self.busy
+                                and not self._session_running()):
                             player.sync_seek(t, t0, self.offset)
                             self.q.put(("status",
                                         f"Auto: corrected {drift:+.2f}s drift "
@@ -699,11 +721,18 @@ class MacApp:
                                            pause_point + 40 + ahead)
                     if hit:
                         t, score, z, t0 = hit
-                        if not self.busy:
-                            player.sync_seek(t, t0, self.offset)
-                            self.q.put(("swap", False))
-                            self.q.put(("status",
-                                        "Auto: stream resumed - resynced."))
+                        if self.busy or self._session_running():
+                            # Someone else is driving the playhead. Stay in
+                            # probe mode and try again shortly: dropping to
+                            # normal now would leave the film paused, and
+                            # normal mode ignores a film that is not
+                            # playing - the loop would idle for good.
+                            next_at = time.monotonic() + 5
+                            continue
+                        player.sync_seek(t, t0, self.offset)
+                        self.q.put(("swap", False))
+                        self.q.put(("status",
+                                    "Auto: stream resumed - resynced."))
                         mode, failures = "normal", 0
                         next_at = time.monotonic() + self.auto_interval
                     else:
@@ -823,6 +852,8 @@ class MacApp:
                 default_delay=float(delay_var.get()),
                 title=Path(self.video_path).stem)
             self.session.start()
+            if self.player is self.player_backend:
+                self._show_video_window()   # the session drives playback
             self._set_leave_enabled(True)
             self._save_config()
             dlg.destroy()
@@ -869,6 +900,8 @@ class MacApp:
                 speaker_name=self.audio_device)
             self.session.start()
             self.player.set_mute(self.mute_var.get())
+            if self.player is self.player_backend:
+                self._show_video_window()   # the session drives playback
             self._set_leave_enabled(True)
             self._save_config()
             dlg.destroy()
@@ -879,8 +912,12 @@ class MacApp:
 
     def _leave_session(self):
         if self.session is not None:
-            self.session.stop()
-            self.session = None
+            # Closing the websocket runs a handshake that can sit for
+            # seconds when the relay is unreachable - which is exactly when
+            # someone reaches for Leave Session. The main thread also drives
+            # libvlc's video output, so it cannot wait for that.
+            sess, self.session = self.session, None
+            threading.Thread(target=sess.stop, daemon=True).start()
         self._set_leave_enabled(False)
         self._set_status("Left the session.")
 
@@ -984,6 +1021,12 @@ class MacApp:
             # unless a newer swap is already on its way.
             if seq == self._swap_seq:
                 self._swap_target = self._swapped
+                if show and self._was_fullscreen \
+                        and self.player is self.player_backend:
+                    # We left fullscreen to make way for a browser that
+                    # never came up. Nothing raised it, so put the film
+                    # back the way the user had it.
+                    self._set_fullscreen(True)
             return
         self._swapped = show
         if not show and self.player is self.player_backend:
@@ -1035,6 +1078,9 @@ class MacApp:
                     self._swap_done(*payload)
                 elif kind == "showroot":
                     self.root.deiconify()
+                elif kind == "showvideo":
+                    if self.player is self.player_backend:
+                        self._show_video_window()
                 elif kind == "devices":
                     self._rebuild_device_menu(payload[0])
                     if not self.device_var.get() and payload[0]:
@@ -1171,10 +1217,12 @@ class MacApp:
         self._closing = True
         self._swap_q.put(None)
         if self.session is not None:
-            try:
-                self.session.stop()
-            except Exception:
-                pass
+            # Give the room teardown a moment to go out, but do not let a
+            # dead relay hold the window on screen for its full close
+            # timeout - quitting should feel immediate.
+            closer = threading.Thread(target=self.session.stop, daemon=True)
+            closer.start()
+            closer.join(1.5)
         self._save_config()
         try:
             self.player_backend.stop()
