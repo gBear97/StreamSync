@@ -218,6 +218,12 @@ class ExternalPlayer:
             return False
 
     def load(self, path):
+        # Native separators: VLC on Windows silently ignores a forward-slash
+        # path - empty playlist, state "stopped", no error - on both the
+        # command line and in_play, and Tk's file dialog hands paths back
+        # with forward slashes. The identical backslash path plays fine.
+        # No-op on macOS.
+        path = str(Path(path))
         if self._alive():
             # in_play takes the MRL as `input=`; `val=` is silently ignored
             self._cmd("in_play", str(path), key="input")
