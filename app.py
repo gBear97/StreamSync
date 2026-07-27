@@ -28,6 +28,7 @@ import audio_capture
 import audio_matcher
 import capture
 import matcher
+import players
 import session
 import windowctl
 from players import EmbeddedPlayer, ExternalPlayer, VLCError
@@ -37,6 +38,7 @@ BURST_FRAMES = 4
 BURST_SPACING = 1 / 3      # seconds between captured frames (aligns with 12 fps scan)
 AUDIO_SYNC_SECONDS = 6.0   # manual sync recording length
 AUTO_RECORD_SECONDS = 4.0  # auto-mode recording length
+PROBE_MAX_AHEAD = 600.0    # cap the growing resume-search window (_auto_loop)
 LOW_CONFIDENCE = 0.55      # video-match warning threshold
 
 
@@ -606,6 +608,16 @@ class App:
                              + (", following pauses." if self.auto_follow else "."))
         self._save_config()
 
+    def _clock_lag(self):
+        """How far the active player's clock trails what it is emitting.
+
+        Zero on this platform until someone measures it: the constant was
+        established on macOS (see players.CLOCK_OUTPUT_LAG). If it turns
+        out to be non-zero here too, setting it there is the whole fix.
+        """
+        return (players.CLOCK_OUTPUT_LAG
+                if self.active_player is self.embedded else 0.0)
+
     def _auto_probe(self, lo, hi):
         """One auto-mode listen+match attempt.
 
@@ -629,6 +641,7 @@ class App:
         mode = "normal"
         failures = 0
         pause_point = None
+        paused_at = 0.0
         next_at = 0.0
         while not self._closing:
             time.sleep(1.0)
@@ -642,6 +655,7 @@ class App:
             try:
                 if mode == "normal":
                     t_ref = player.time() if player.is_playing() else None
+                    t_ref_at = time.perf_counter()
                     if t_ref is None:
                         next_at = time.monotonic() + 5
                         continue
@@ -649,8 +663,30 @@ class App:
                     if hit:
                         t, score, z, t0 = hit
                         failures = 0
-                        drift = t - t_ref
-                        if abs(drift) > 0.35 and not self.busy:
+                        # `t` is where the stream was when the capture
+                        # STARTED, so measure the film at that same
+                        # instant: t_ref predates it by however long the
+                        # capture device took to open, and the probe runs
+                        # for seconds after that.
+                        now_pos = player.time()
+                        moved = None if now_pos is None else now_pos - t_ref
+                        if (now_pos is None or not player.is_playing()
+                                or abs(moved - (time.perf_counter() - t_ref_at))
+                                > 0.5):
+                            # Paused, seeked or stalled while we listened -
+                            # winding the clock back from now would invent a
+                            # position. Say nothing and look again shortly.
+                            next_at = time.monotonic() + 5
+                            continue
+                        film_at_t0 = now_pos - (time.perf_counter() - t0)
+                        # Where the film SHOULD be: the stream's position
+                        # plus the offset the user nudged in, which every
+                        # sync_seek applies. Ignoring it would read a
+                        # deliberate offset as drift and undo it on a loop.
+                        drift = ((t + self.offset)
+                                 - (film_at_t0 + self._clock_lag()))
+                        if abs(drift) > 0.35 and not self.busy \
+                                and not self._session_running():
                             player.sync_seek(t, t0, self.offset)
                             self.q.put(("status",
                                         f"Auto: corrected {drift:+.2f}s drift "
@@ -661,6 +697,7 @@ class App:
                         if self.auto_follow and failures >= 2:
                             player.pause()
                             pause_point = t_ref
+                            paused_at = time.monotonic()
                             mode = "probe"
                             self.q.put(("swap", True))
                             self.q.put(("status",
@@ -670,13 +707,27 @@ class App:
                         else:
                             next_at = time.monotonic() + 10
                 else:  # probe: paused, waiting for the stream to resume
-                    hit = self._auto_probe(pause_point - 25, pause_point + 40)
+                    # A real pause resumes near pause_point, so look there
+                    # first - but the "pause" may have been a false alarm
+                    # (quiet dialog under loud commentary) and the stream
+                    # kept running. Grow the forward edge with elapsed time
+                    # so it keeps up with a stream that never stopped.
+                    ahead = min(time.monotonic() - paused_at, PROBE_MAX_AHEAD)
+                    hit = self._auto_probe(pause_point - 25,
+                                           pause_point + 40 + ahead)
                     if hit:
                         t, score, z, t0 = hit
-                        if not self.busy:
-                            player.sync_seek(t, t0, self.offset)
-                            self.q.put(("swap", False))
-                            self.q.put(("status", "Auto: stream resumed - resynced."))
+                        if self.busy or self._session_running():
+                            # Someone else is driving the playhead. Stay in
+                            # probe mode and try again shortly: dropping to
+                            # normal now would leave the film paused, and
+                            # normal mode ignores a film that is not
+                            # playing - the loop would idle for good.
+                            next_at = time.monotonic() + 5
+                            continue
+                        player.sync_seek(t, t0, self.offset)
+                        self.q.put(("swap", False))
+                        self.q.put(("status", "Auto: stream resumed - resynced."))
                         mode, failures = "normal", 0
                         next_at = time.monotonic() + self.auto_interval
                     else:
@@ -832,8 +883,12 @@ class App:
 
     def _leave_session(self):
         if self.session is not None:
-            self.session.stop()
-            self.session = None
+            # Closing the websocket runs a handshake that can sit for
+            # seconds when the relay is unreachable - which is exactly when
+            # someone reaches for Leave. The main thread drives the UI, so
+            # it cannot wait for that.
+            sess, self.session = self.session, None
+            threading.Thread(target=sess.stop, daemon=True).start()
         self.leave_btn.state(["disabled"])
         self.session_lbl.config(text="Left the session.")
 
@@ -1142,10 +1197,12 @@ class App:
     def _on_close(self):
         self._closing = True
         if self.session is not None:
-            try:
-                self.session.stop()
-            except Exception:
-                pass
+            # Give the room teardown a moment to go out, but do not let a
+            # dead relay hold the window on screen for its full close
+            # timeout - quitting should feel immediate.
+            closer = threading.Thread(target=self.session.stop, daemon=True)
+            closer.start()
+            closer.join(1.5)
         self._save_config()
         try:
             import keyboard
