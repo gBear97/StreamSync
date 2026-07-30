@@ -13,6 +13,7 @@ streamer's pauses.
 
 import ctypes
 import json
+import logging
 import queue
 import sys
 import threading
@@ -35,6 +36,7 @@ import windowctl
 from players import EmbeddedPlayer, ExternalPlayer, VLCError
 
 CONFIG_PATH = Path.home() / ".streamsync.json"
+log = logging.getLogger("streamsync.app")
 BURST_FRAMES = 4
 BURST_SPACING = 1 / 3      # seconds between captured frames (aligns with 12 fps scan)
 AUDIO_SYNC_SECONDS = 6.0   # manual sync recording length
@@ -119,8 +121,13 @@ class App:
         threading.Thread(target=self._auto_loop, daemon=True).start()
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # frozen builds have no console: Tk callback errors would vanish
+        root.report_callback_exception = \
+            lambda *exc: log.error("Tk callback error", exc_info=exc)
         root.after(80, self._poll_queue)
         root.after(700, self._tick_time)
+        log.info("app up: video=%r method=%s auto=%s",
+                 self.video_path, self.method_var.get(), self.auto_enabled)
 
     # ------------------------------------------------------------- UI setup
 
@@ -367,6 +374,7 @@ class App:
 
     def _apply_player_choice(self):
         kind = self.player_var.get()
+        log.info("player choice -> %s", kind)
         if kind == "external":
             try:
                 if self.external is None:
@@ -417,6 +425,8 @@ class App:
         if not path:
             return
         self.video_path = path
+        log.info("file chosen: %r (player=%s)", path,
+                 "embedded" if self.player is self.embedded else "external")
         self.file_lbl.config(text=Path(path).name)
         if self.player is self.embedded:
             try:
@@ -936,6 +946,8 @@ class App:
         """Show the stream's browser window during pauses; hide it again after."""
         if not self.swap_var.get() or show == self._swapped or not self.video_path:
             return
+        log.debug("stream_swap: show_stream=%s (film window %s)", show,
+                  "hides" if show else "returns")
         try:
             if show:
                 hwnd = windowctl.find_stream_window(self.stream_hwnd,
@@ -1092,17 +1104,21 @@ class App:
         try:
             GWL_EXSTYLE, WS_EX_TRANSPARENT = -20, 0x00000020
             u32 = ctypes.windll.user32
+            fresh = []
 
             def cb(hwnd, _lp):
                 st = u32.GetWindowLongW(hwnd, GWL_EXSTYLE)
                 if not st & WS_EX_TRANSPARENT:
                     u32.SetWindowLongW(hwnd, GWL_EXSTYLE,
                                        st | WS_EX_TRANSPARENT)
+                    fresh.append(hex(hwnd or 0))
                 return True
 
             proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p,
                                       ctypes.c_void_p)(cb)
             u32.EnumChildWindows(self.video_frame.winfo_id(), proc, 0)
+            if fresh:
+                log.debug("shielded new vout children: %s", fresh)
         except Exception:
             pass
         self.video_win.after(1000, self._shield_video_input)
@@ -1150,6 +1166,10 @@ class App:
         try:
             while True:
                 kind, *payload = self.q.get_nowait()
+                if kind in ("preview", "devices", "show"):
+                    log.debug("queue: %s", kind)      # payloads too bulky
+                else:
+                    log.debug("queue: %s %r", kind, payload)
                 if kind == "status":
                     self._set_status(payload[0])
                 elif kind == "session":
@@ -1298,6 +1318,8 @@ class App:
         path = cfg.get("video_path")
         if path and Path(path).is_file():
             self.video_path = path
+            log.info("config auto-load into embedded (window hidden): %r",
+                     path)
             self.embedded.load(path)
             self.file_lbl.config(text=Path(path).name)
         region = cfg.get("region")

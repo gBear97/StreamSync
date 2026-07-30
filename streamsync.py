@@ -7,7 +7,10 @@ UI shells on top of the same sync engine.
 
 import sys
 
+import applog
 import depcheck
+
+applog.setup()
 
 if depcheck.ensure_ready():
     if sys.platform == "darwin":

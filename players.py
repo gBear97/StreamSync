@@ -10,6 +10,7 @@ inaudible since the local copy is muted).
 
 import base64
 import json
+import logging
 import math
 import os
 import subprocess
@@ -19,6 +20,8 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+log = logging.getLogger("streamsync.players")
 
 try:
     import vlc
@@ -83,6 +86,7 @@ class EmbeddedPlayer:
         self.has_media = False
 
     def load(self, path):
+        log.info("embedded load: %r", path)
         self.mp.set_media(self.instance.media_new(path))
         self.has_media = True
 
@@ -90,10 +94,17 @@ class EmbeddedPlayer:
         if not self.has_media:
             raise VLCError("No video file loaded.")
         if not self.mp.is_playing():
+            log.debug("embedded play()")
             self.mp.play()
         deadline = time.perf_counter() + timeout
         while time.perf_counter() < deadline:
             if self.mp.is_playing() and self.mp.get_time() >= 0:
+                try:
+                    log.debug("embedded playing: t=%.1fs vouts=%s size=%s",
+                              self.mp.get_time() / 1000.0,
+                              self.mp.has_vout(), self.mp.video_get_size(0))
+                except Exception:
+                    pass
                 return
             time.sleep(0.05)
         raise VLCError("VLC did not start playback in time.")
@@ -244,6 +255,7 @@ class ExternalPlayer:
         # No-op on macOS.
         path = str(Path(path))
         if self._alive():
+            log.info("external in_play: %r", path)
             # in_play takes the MRL as `input=`; `val=` is silently ignored
             self._cmd("in_play", str(path), key="input")
         else:
@@ -261,6 +273,7 @@ class ExternalPlayer:
                 # directly, so Launch Services never dedupes it.)
                 argv.append("--no-one-instance")
             argv.append(str(path))
+            log.info("external spawn: %s", argv)
             self.proc = subprocess.Popen(argv)
             deadline = time.perf_counter() + 12.0
             while time.perf_counter() < deadline:
