@@ -136,6 +136,19 @@ class EmbeddedPlayer:
     def set_mute(self, mute):
         self.mp.audio_set_mute(bool(mute))
 
+    def volume(self):
+        """Player volume 0-125, or None before audio output exists."""
+        v = self.mp.audio_get_volume()
+        return int(v) if v >= 0 else None
+
+    def set_volume(self, v):
+        self.mp.audio_set_volume(max(0, min(125, int(v))))
+
+    # NOTE: do not add a marquee/OSD helper here. libvlc's marquee calls
+    # block until the vout window makes progress; when that window is
+    # hosted by the caller's own UI thread (set_hwnd from Tk), the call
+    # deadlocks the whole UI. Draw overlays with the toolkit instead.
+
     def set_fullscreen(self, flag):
         """Fullscreen for a libvlc-owned video window.
 
@@ -170,6 +183,12 @@ class EmbeddedPlayer:
 
     def set_subtitle(self, track_id):
         self.mp.video_set_spu(int(track_id))
+
+    def current_subtitle(self):
+        try:
+            return int(self.mp.video_get_spu())
+        except Exception:
+            return -1
 
     def add_subtitle_file(self, path):
         uri = Path(path).absolute().as_uri()

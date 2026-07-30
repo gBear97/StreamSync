@@ -11,6 +11,7 @@ re-checks sync in the background, corrects drift, and can follow the
 streamer's pauses.
 """
 
+import ctypes
 import json
 import queue
 import sys
@@ -91,12 +92,15 @@ class App:
         self._ext_hwnd = None
         self.session = None          # active HostSession / ViewerSession
         self.relay_url = "ws://localhost:8765"
+        self._osd_win = None         # Tk-drawn volume OSD over the video
+        self._osd_after = None
 
         root.title("StreamSync")
         root.resizable(False, False)
 
         self._build_video_window()
         self._build_controls()
+        self._build_video_menu()  # after controls: shares their variables
 
         try:
             self.embedded = EmbeddedPlayer(self.video_frame.winfo_id())
@@ -104,6 +108,7 @@ class App:
             messagebox.showerror("StreamSync - VLC problem", str(e))
             raise SystemExit(1)
         self.active_player = self.embedded
+        self._shield_video_input()
 
         self._load_config()
         self._apply_method_visibility()
@@ -129,6 +134,20 @@ class App:
         self.video_win.bind("<Escape>", lambda e: self._set_fullscreen(False))
         self.video_win.bind("<F11>", lambda e: self._set_fullscreen(not self.fullscreen))
         self.video_win.bind("<space>", lambda e: self._toggle_pause())
+        # libvlc's vout child forwards mouse messages to us synchronously -
+        # its window thread blocks until the handler returns. Touching the
+        # window (fullscreen) or the vout (volume OSD) from inside that
+        # context deadlocks against the blocked sender, so every mouse
+        # handler defers its work to the next event-loop pass.
+        self.video_win.bind("<Double-Button-1>",
+                            lambda e: self.video_win.after(
+                                1, self._fullscreen_clicked))
+        self.video_win.bind("<MouseWheel>", self._on_video_wheel)
+        self.video_win.bind("<Button-3>", self._show_video_menu)
+        # a click on the video focuses the vlc child, which would eat the
+        # wheel and the space/F11 bindings from then on - reclaim focus for
+        # the toplevel whenever the pointer enters
+        self.video_win.bind("<Enter>", lambda e: self.video_win.focus_set())
         self.video_win.protocol("WM_DELETE_WINDOW", self.video_win.withdraw)
         self.video_win.withdraw()
         self.video_win.update_idletasks()
@@ -965,6 +984,128 @@ class App:
         self.fullscreen = flag
         self.video_win.deiconify()
         self.video_win.attributes("-fullscreen", flag)
+
+    # ------------------------------------------- video window mouse controls
+
+    def _build_video_menu(self):
+        m = tk.Menu(self.video_win, tearoff=0)
+        m.add_command(label="Play/Pause", accelerator="Space",
+                      command=self._toggle_pause)
+        m.add_command(label="Fullscreen", accelerator="F11",
+                      command=self._fullscreen_clicked)
+        m.add_separator()
+        m.add_checkbutton(label="Mute local audio", variable=self.mute_var,
+                          command=self._on_mute_toggle)
+        m.add_command(label="Volume up", accelerator="Wheel",
+                      command=lambda: self._step_volume(+5))
+        m.add_command(label="Volume down",
+                      command=lambda: self._step_volume(-5))
+        m.add_separator()
+        self._sub_menu = tk.Menu(m, tearoff=0)
+        m.add_cascade(label="Subtitles", menu=self._sub_menu)
+        m.add_separator()
+        m.add_command(label="Hide video window",
+                      command=self.video_win.withdraw)
+        self.video_menu = m
+
+    def _show_video_menu(self, event):
+        if self.player is not self.embedded:
+            return
+        x, y = event.x_root, event.y_root
+        self.video_win.after(1, self._popup_video_menu, x, y)
+
+    def _popup_video_menu(self, x, y):
+        if self._closing:
+            return          # a right-click can race the app closing
+        self._rebuild_sub_menu()
+        try:
+            self.video_menu.tk_popup(x, y)
+        finally:
+            self.video_menu.grab_release()
+
+    def _rebuild_sub_menu(self):
+        m = self._sub_menu
+        m.delete(0, "end")
+        current = self.embedded.current_subtitle()
+        tracks = self.embedded.subtitle_tracks()
+        self._sub_pick = tk.IntVar(value=current)
+        if not tracks:
+            m.add_command(label="(none listed - start playback first)",
+                          state="disabled")
+        for tid, name in tracks:
+            m.add_radiobutton(label=name, value=tid, variable=self._sub_pick,
+                              command=lambda t=tid: self.embedded.set_subtitle(t))
+        m.add_separator()
+        m.add_command(label="Load subtitle file...",
+                      command=self._load_sub_file)
+
+    def _step_volume(self, step):
+        v = self.embedded.volume()
+        v = 100 if v is None else v
+        v = max(0, min(125, v + step))
+        self.embedded.set_volume(v)
+        # never unmutes: "Mute local audio" is load-bearing while streaming
+        # (loopback must not hear the film), so an accidental scroll must
+        # not defeat it the way stock VLC's wheel would.
+        self._flash_osd(f"Volume {v}%" + (" (muted)" if self.mute_var.get()
+                                          else ""))
+
+    def _flash_osd(self, text, ms=900):
+        """VLC-style OSD drawn by Tk, floated over the video's top-right.
+        (libvlc's own marquee cannot be driven from the thread hosting the
+        video window - see the note in players.py.)"""
+        if self._osd_win is None:
+            self._osd_win = tk.Toplevel(self.video_win)
+            self._osd_win.overrideredirect(True)
+            self._osd_win.attributes("-topmost", True)
+            self._osd_lbl = tk.Label(self._osd_win, bg="#111111",
+                                     fg="#e6e6e6", padx=12, pady=5,
+                                     font=("Segoe UI", 13, "bold"))
+            self._osd_lbl.pack()
+            self._osd_win.withdraw()
+        self._osd_lbl.config(text=text)
+        self._osd_win.update_idletasks()
+        x = (self.video_win.winfo_rootx() + self.video_win.winfo_width()
+             - self._osd_win.winfo_reqwidth() - 18)
+        y = self.video_win.winfo_rooty() + 18
+        self._osd_win.geometry(f"+{x}+{y}")
+        self._osd_win.deiconify()
+        if self._osd_after is not None:
+            self.video_win.after_cancel(self._osd_after)
+        self._osd_after = self.video_win.after(ms, self._osd_win.withdraw)
+
+    def _on_video_wheel(self, event):
+        if self.player is not self.embedded:
+            return
+        self.video_win.after(1, self._step_volume,
+                             5 if event.delta > 0 else -5)
+
+    def _shield_video_input(self):
+        """Make libvlc's vout child transparent to mouse hit-testing.
+
+        The vout swallows every mouse event over the video - they are
+        neither handled (mouse input is disabled) nor forwarded - which
+        would leave the wheel/double-click/menu bindings dead exactly
+        where the user aims. WS_EX_TRANSPARENT drops hits through to our
+        frame. The vout is recreated on every load, so sweep once a
+        second rather than trying to catch each creation."""
+        try:
+            GWL_EXSTYLE, WS_EX_TRANSPARENT = -20, 0x00000020
+            u32 = ctypes.windll.user32
+
+            def cb(hwnd, _lp):
+                st = u32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                if not st & WS_EX_TRANSPARENT:
+                    u32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                       st | WS_EX_TRANSPARENT)
+                return True
+
+            proc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p,
+                                      ctypes.c_void_p)(cb)
+            u32.EnumChildWindows(self.video_frame.winfo_id(), proc, 0)
+        except Exception:
+            pass
+        self.video_win.after(1000, self._shield_video_input)
 
     # ------------------------------------------------------------- subtitles
 
