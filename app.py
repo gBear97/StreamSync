@@ -96,6 +96,7 @@ class App:
         self.relay_url = "ws://localhost:8765"
         self._osd_win = None         # Tk-drawn volume OSD over the video
         self._osd_after = None
+        self._fs_saved = None        # frame style + rect to restore from
 
         root.title("StreamSync")
         root.resizable(False, False)
@@ -959,9 +960,9 @@ class App:
                 self.stream_hwnd = hwnd
                 if self.player is self.embedded:
                     self._was_fullscreen = self.fullscreen
-                    if self.fullscreen:
-                        self.video_win.attributes("-fullscreen", False)
-                        self.fullscreen = False
+                    # drop the borderless frame before hiding, or the window
+                    # comes back still stretched over the monitor
+                    self._set_fullscreen(False, show=False)
                     self.video_win.withdraw()
                 elif self.external is not None and self.external.proc:
                     self._ext_hwnd = windowctl.find_by_pid(self.external.proc.pid)
@@ -992,10 +993,30 @@ class App:
         else:
             self.external.fullscreen_toggle()
 
-    def _set_fullscreen(self, flag):
+    def _set_fullscreen(self, flag, show=True):
+        if show:
+            self.video_win.deiconify()
+        if flag == self.fullscreen:
+            return
+        # Own the OS frame rather than using Tk's -fullscreen, which always
+        # picks the primary display no matter which monitor the film is on.
+        hwnd = self._video_hwnd()
+        try:
+            if flag:
+                self._fs_saved = windowctl.borderless_fullscreen(hwnd)
+                log.debug("fullscreen on monitor %s",
+                          windowctl.monitor_rect(hwnd))
+            elif self._fs_saved is not None:
+                windowctl.unfullscreen(hwnd, self._fs_saved)
+                self._fs_saved = None
+        except Exception as e:
+            log.warning("fullscreen switch failed, falling back to Tk: %s", e)
+            self.video_win.attributes("-fullscreen", flag)
         self.fullscreen = flag
-        self.video_win.deiconify()
-        self.video_win.attributes("-fullscreen", flag)
+
+    def _video_hwnd(self):
+        """The video window's real OS frame (winfo_id is Tk's inner child)."""
+        return int(self.video_win.frame(), 16)
 
     # ------------------------------------------- video window mouse controls
 
