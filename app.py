@@ -171,6 +171,13 @@ class App:
         row.pack(fill="x")
         ttk.Button(row, text="Video file...", width=16,
                    command=self._choose_file).pack(side="left")
+        # up here next to the file, not buried among the playback controls:
+        # a film restored from config leaves the video window hidden, and
+        # the only other thing that revealed it was re-picking the already
+        # selected Player radio - which reads as "nothing happened".
+        self.open_player_btn = ttk.Button(row, text="Open player",
+                                          command=self._open_player)
+        self.open_player_btn.pack(side="right")
         self.file_lbl = ttk.Label(row, text="no file selected")
         self.file_lbl.pack(side="left", padx=(8, 0))
 
@@ -321,7 +328,7 @@ class App:
         ttk.Button(row, text="Fullscreen",
                    command=self._fullscreen_clicked).pack(side="left", padx=(10, 0))
         self.show_video_btn = ttk.Button(row, text="Show video window",
-                                         command=self.video_win.deiconify)
+                                         command=self._open_player)
         self.show_video_btn.pack(side="left", padx=(10, 0))
 
         row = ttk.Frame(play)
@@ -447,6 +454,73 @@ class App:
             self._set_status("Opening in external VLC...")
             threading.Thread(target=spawn, daemon=True).start()
         self._save_config()
+
+    def _open_player(self):
+        """Put the current player on screen with a picture in it.
+
+        Deiconifying alone leaves a black rectangle: a film loaded from
+        config has media but has never played, so libvlc has no video
+        output at all. Start it and settle on a frame - muted by default,
+        so nothing is audible and nothing runs away.
+        """
+        if not self.video_path:
+            messagebox.showinfo("StreamSync", "Choose the film file first.")
+            return
+        if self.player is not self.embedded:
+            hwnd = (windowctl.find_by_pid(self.external.proc.pid)
+                    if self.external is not None and self.external.proc
+                    else None)
+            if hwnd:
+                windowctl.restore(hwnd)
+            else:
+                self._apply_player_choice()     # spawn it
+            return
+        self.video_win.deiconify()
+        self.video_win.lift()
+        self.video_win.focus_set()
+        # Only prime a film that has never been on screen. has_vout() is the
+        # honest test: a film paused at a position the user already synced
+        # has one, and seeking that back to a preview frame would throw
+        # their sync away.
+        if (self.embedded.mp.has_vout() or self.busy
+                or self._session_running()):
+            return
+        log.info("open player: priming a preview frame")
+        self.embedded.mp.play()
+        self.root.after(120, self._prime_preview, 0, None)
+
+    def _prime_preview(self, tries, target_ms):
+        """Show a frame with something in it, then pause. Never blocks the UI.
+
+        Films open on black - studio idents fade up from it - so pausing on
+        frame one looks exactly like the failure this button exists to fix.
+        Settle a little way in instead; the playhead is meaningless until a
+        sync anyway.
+        """
+        if self._closing or self.busy or self._session_running():
+            return
+        mp = self.embedded.mp
+        if tries >= 60:                          # ~6s, then give up quietly
+            log.warning("open player: no preview frame (vouts=%s t=%s)",
+                        mp.has_vout(), mp.get_time())
+            return
+        if not (mp.has_vout() and (mp.get_time() or 0) > 0):
+            self.root.after(100, self._prime_preview, tries + 1, target_ms)
+            return
+        if target_ms is None:                    # decoding has begun: aim
+            length = mp.get_length() or 0
+            target_ms = int(min(max(length * 0.08, 30_000), 600_000)
+                            if length > 0 else 60_000)
+            mp.set_time(target_ms)
+            self.root.after(150, self._prime_preview, tries + 1, target_ms)
+            return
+        if (mp.get_time() or 0) >= target_ms - 2_000:
+            mp.set_pause(1)
+            self._set_status(f"{Path(self.video_path).name} ready - paused at "
+                             f"{fmt_time(target_ms / 1000.0)}. Sync or Resync "
+                             "to line it up with the stream.")
+            return
+        self.root.after(100, self._prime_preview, tries + 1, target_ms)
 
     def _select_region(self):
         region = capture.RegionSelector(self.root).select()
