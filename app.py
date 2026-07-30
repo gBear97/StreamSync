@@ -1121,7 +1121,10 @@ class App:
                 log.debug("shielded new vout children: %s", fresh)
         except Exception:
             pass
-        self.video_win.after(1000, self._shield_video_input)
+        # 250ms, not 1s: a fresh vout must not be double-clickable before
+        # it is marked - VLC's own dblclick-fullscreen detaches the video
+        # into a top-level window the embed never recovers from.
+        self.video_win.after(250, self._shield_video_input)
 
     # ------------------------------------------------------------- subtitles
 

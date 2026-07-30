@@ -76,6 +76,7 @@ class EmbeddedPlayer:
             raise VLCError("Could not create a VLC instance.")
         self.mp = self.instance.media_player_new()
         self.nsview = nsview
+        self.hwnd = hwnd
         if nsview is not None:
             self.mp.set_nsobject(int(nsview))
         elif hwnd is not None:
@@ -88,6 +89,15 @@ class EmbeddedPlayer:
     def load(self, path):
         log.info("embedded load: %r", path)
         self.mp.set_media(self.instance.media_new(path))
+        if self.hwnd is not None:
+            # Each media creates a fresh vout, and VLC's D3D output can
+            # come up DETACHED - its own top-level "VLC (Direct3D11
+            # output)" window - via its leaky double-click-fullscreen or a
+            # hidden-window fallback, leaving 1x1 husks in our frame and a
+            # black embed it never recovers from. Re-anchoring the
+            # drawable and forcing libvlc fullscreen off is free.
+            self.mp.set_hwnd(int(self.hwnd))
+            self.mp.set_fullscreen(False)
         self.has_media = True
 
     def ensure_playing(self, timeout=6.0):
