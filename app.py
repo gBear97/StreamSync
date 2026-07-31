@@ -1420,6 +1420,10 @@ class App:
                      path)
             self.embedded.load(path)
             self.file_lbl.config(text=Path(path).name)
+            # picking a file says so; restoring the same file said nothing,
+            # so "Pick a video file to begin." sat there under a named film
+            self._set_status(f"{Path(path).name} loaded from last session. "
+                             "Open player to see it, then Sync to the stream.")
         region = cfg.get("region")
         if region and len(region) == 4:
             self.region = tuple(int(v) for v in region)
