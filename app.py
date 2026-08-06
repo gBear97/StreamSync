@@ -81,8 +81,9 @@ class App:
         self.facecam_rect = None     # normalized (x0, y0, x1, y1) ignore zone
         self.audio_device = ""       # substring of speaker name; "" = default
         self.auto_enabled = False
-        self.auto_follow = True
+        self.auto_follow = False     # experimental; Alex wants default off
         self.auto_interval = 30
+        self._last_sync = None       # context for the verdict buttons
         self._closing = False
         self._preview_photo = None
         self.external = None         # created on demand
@@ -274,7 +275,7 @@ class App:
                          textvariable=self.interval_var, command=self._on_auto_toggle)
         sp.pack(side="left", padx=(4, 0))
         ttk.Label(row, text="s").pack(side="left", padx=(2, 0))
-        self.follow_var = tk.BooleanVar(value=True)
+        self.follow_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row, text="follow stream pauses",
                         variable=self.follow_var,
                         command=self._on_auto_toggle).pack(side="left", padx=(12, 0))
@@ -349,6 +350,57 @@ class App:
         self.status_lbl.grid(row=5, column=0, sticky="w", pady=(4, 0))
         self.hotkey_lbl = ttk.Label(outer, text="", foreground="#666")
         self.hotkey_lbl.grid(row=6, column=0, sticky="w", pady=(4, 0))
+
+        # ---------------- Experimental (right-side partition)
+        ttk.Separator(outer, orient="vertical").grid(
+            row=0, column=1, rowspan=7, sticky="ns", padx=10)
+        exp = ttk.LabelFrame(outer, text="Experimental", padding=8)
+        exp.grid(row=0, column=2, rowspan=7, sticky="new")
+        ttk.Label(exp, text="Longer listens\n(more signal under\n"
+                            "the commentary):",
+                  justify="left").pack(anchor="w")
+        self._exp_sync_btns = []
+        for secs in (6, 15, 30):
+            b = ttk.Button(exp, text=f"Sync ({secs} s listen)", width=18,
+                           command=lambda s=secs: self._sync(listen_s=s))
+            b.pack(anchor="w", pady=(4, 0))
+            self._exp_sync_btns.append(b)
+        ttk.Separator(exp, orient="horizontal").pack(fill="x", pady=10)
+        ttk.Label(exp, text="Did that sync land\nwhere it should?",
+                  justify="left").pack(anchor="w")
+        vrow = ttk.Frame(exp)
+        vrow.pack(anchor="w", pady=(4, 0))
+        # plain tk.Buttons: ttk's vista theme ignores button colors
+        self.good_btn = tk.Button(vrow, text="✓ Worked", width=8,
+                                  bg="#2e7d32", fg="white",
+                                  activebackground="#1b5e20",
+                                  activeforeground="white", state="disabled",
+                                  command=lambda: self._sync_verdict(True))
+        self.good_btn.pack(side="left")
+        self.bad_btn = tk.Button(vrow, text="✗ Off", width=8,
+                                 bg="#c62828", fg="white",
+                                 activebackground="#8e0000",
+                                 activeforeground="white", state="disabled",
+                                 command=lambda: self._sync_verdict(False))
+        self.bad_btn.pack(side="left", padx=(6, 0))
+        ttk.Label(exp, text="Every verdict is logged\nwith the match's score,\n"
+                            "and tunes the confidence\nbar the matcher uses.",
+                  foreground="#666", justify="left").pack(anchor="w",
+                                                          pady=(6, 0))
+
+    def _sync_verdict(self, ok):
+        """Ground truth from the person watching: label the last sync so the
+        log accumulates (score, z, listen length) -> worked/failed pairs.
+        The app's own 'Matched' message is not evidence - it seeks to the
+        best peak even when the peak is noise."""
+        if self._last_sync is None:
+            return
+        log.info("SYNC VERDICT %s: %s", "WORKED" if ok else "FAILED",
+                 self._last_sync)
+        # both buttons stay pressable on purpose: pressing again corrects
+        # the label ("worked"... then the drift shows). Per sync, the LAST
+        # verdict line in the log wins; starting a new search disarms both.
+        self._set_status("Logged: sync " + ("worked." if ok else "was off."))
 
     def _build_advanced_menu(self):
         menu = tk.Menu(self.adv_btn, tearoff=0)
@@ -576,7 +628,7 @@ class App:
             return False
         return True
 
-    def _sync(self):
+    def _sync(self, listen_s=None):
         if self.busy:
             return
         method = self.method_var.get()
@@ -589,9 +641,9 @@ class App:
             messagebox.showerror("StreamSync", str(e))
             return
         if center is None:
-            self._start_search(None, None)
+            self._start_search(None, None, listen_s)
         else:
-            self._start_search(center - window, center + window)
+            self._start_search(center - window, center + window, listen_s)
 
     def _resync(self):
         if self.busy:
@@ -610,18 +662,32 @@ class App:
         # a paused stream leaves the local copy ahead, so look mostly backwards
         self._start_search(t - window, t + 30.0)
 
-    def _start_search(self, a, b):
+    def _start_search(self, a, b, listen_s=None):
         self.busy = True
         self.sync_btn.state(["disabled"])
         self.resync_btn.state(["disabled"])
+        for btn in self._exp_sync_btns:
+            btn.state(["disabled"])
+        # a new search invalidates the previous verdict context: without
+        # this, a failed attempt leaves the buttons armed with the LAST
+        # sync's numbers, and a "that failed" press would mislabel a sync
+        # that actually worked - poisoning the dataset these exist for
+        self.good_btn.config(state="disabled")
+        self.bad_btn.config(state="disabled")
+        self._last_sync = None
         player = self.player
-        offset = self.offset
+        pname = type(player).__name__   # the player the worker will seek -
+        offset = self.offset            # active_player may change mid-listen
         mute = self.mute_var.get()
         if self.method_var.get() == "audio":
+            listen = float(listen_s or AUDIO_SYNC_SECONDS)
+            log.info("sync search: window=%s..%s listen=%.0fs player=%s",
+                     a, b, listen, pname)
             device = self.audio_device
             threading.Thread(
                 target=self._audio_search_worker,
-                args=(a, b, player, offset, mute, device), daemon=True).start()
+                args=(a, b, player, offset, mute, device, listen, pname),
+                daemon=True).start()
         else:
             self._set_status("Capturing stream frames...")
             hidden = self._hide_overlapping_windows()
@@ -629,17 +695,18 @@ class App:
             mirror = self.mirror_var.get()
             threading.Thread(
                 target=self._video_search_worker,
-                args=(a, b, player, offset, mute, hidden, mask, mirror),
+                args=(a, b, player, offset, mute, hidden, mask, mirror, pname),
                 daemon=True).start()
 
     # ------------------------------------------------------------- workers
 
-    def _audio_search_worker(self, a, b, player, offset, mute, device):
+    def _audio_search_worker(self, a, b, player, offset, mute, device, listen,
+                             pname):
         try:
             self.q.put(("status",
-                        f"Recording stream audio ({AUDIO_SYNC_SECONDS:.0f} s)..."))
+                        f"Recording stream audio ({listen:.0f} s)..."))
             samples, sr, t0 = audio_capture.record_loopback(
-                AUDIO_SYNC_SECONDS, speaker_name=device)
+                listen, speaker_name=device)
             feats = audio_matcher.prep_capture(samples, sr)
             match_t, score, z = audio_matcher.find_match_audio(
                 self.video_path, feats, a, b,
@@ -648,14 +715,14 @@ class App:
             player.sync_seek(match_t, t0, offset)
             player.set_mute(mute)
             self.q.put(("swap", False))
-            self.q.put(("adone", match_t, score, z))
+            self.q.put(("adone", match_t, score, z, listen, pname))
         except Exception as e:
             self.q.put(("error", str(e)))
         finally:
             self.q.put(("busy_off", None))
 
     def _video_search_worker(self, a, b, player, offset, mute, hidden,
-                             mask, mirror):
+                             mask, mirror, pname):
         try:
             if hidden:
                 time.sleep(0.3)  # let withdrawn windows actually leave the screen
@@ -675,7 +742,7 @@ class App:
             player.sync_seek(match_t, t0, offset)
             player.set_mute(mute)
             self.q.put(("swap", False))
-            self.q.put(("vdone", match_t, score))
+            self.q.put(("vdone", match_t, score, pname))
         except Exception as e:
             self.q.put(("show", hidden))
             self.q.put(("error", str(e)))
@@ -1282,9 +1349,16 @@ class App:
                     for win in payload[0]:
                         win.deiconify()
                 elif kind == "adone":
-                    match_t, score, z = payload
+                    match_t, score, z, listen, pname = payload
+                    self._last_sync = {
+                        "kind": "audio", "t": round(match_t, 3),
+                        "score": round(score, 4), "z": round(z, 2),
+                        "listen_s": listen, "player": pname}
+                    self.good_btn.config(state="normal")
+                    self.bad_btn.config(state="normal")
                     msg = (f"Matched stream audio at {fmt_time(match_t)} "
-                           f"(score {score:.2f}, peak z {z:.0f}).")
+                           f"(score {score:.2f}, peak z {z:.0f}, "
+                           f"{listen:.0f}s listen).")
                     if score < audio_matcher.SCORE_OK or z < audio_matcher.Z_OK:
                         msg += (" Weak match - the commentary may be drowning "
                                 "the film audio; try again in a louder scene "
@@ -1293,7 +1367,12 @@ class App:
                         msg += " Nudge if the picture leads/lags the voice track."
                     self._set_status(msg)
                 elif kind == "vdone":
-                    match_t, score = payload
+                    match_t, score, pname = payload
+                    self._last_sync = {
+                        "kind": "video", "t": round(match_t, 3),
+                        "score": round(score, 4), "player": pname}
+                    self.good_btn.config(state="normal")
+                    self.bad_btn.config(state="normal")
                     msg = (f"Matched stream video at {fmt_time(match_t)} "
                            f"(confidence {score:.2f}).")
                     if score < LOW_CONFIDENCE:
@@ -1306,6 +1385,8 @@ class App:
                     self.busy = False
                     self.sync_btn.state(["!disabled"])
                     self.resync_btn.state(["!disabled"])
+                    for btn in self._exp_sync_btns:
+                        btn.state(["!disabled"])
                 elif kind == "hotkey":
                     self._hotkey(payload[0])
         except queue.Empty:
@@ -1400,7 +1481,7 @@ class App:
                 "facecam_rect": self.facecam_rect,
                 "mirror": self.mirror_var.get(),
                 "auto_interval": self.auto_interval,
-                "auto_follow": self.follow_var.get(),
+                "follow_pauses": self.follow_var.get(),
                 "swap": self.swap_var.get(),
                 "stream_title": self.stream_title,
                 "relay_url": self.relay_url,
@@ -1448,7 +1529,11 @@ class App:
         except (TypeError, ValueError):
             self.auto_interval = 30
         self.interval_var.set(self.auto_interval)
-        self.follow_var.set(bool(cfg.get("auto_follow", True)))
+        # renamed from "auto_follow": the old default force-wrote true on
+        # every close, so an existing true can't be told apart from a
+        # choice. New key = everyone starts from the new default (off)
+        # exactly once; re-enabling sticks from then on.
+        self.follow_var.set(bool(cfg.get("follow_pauses", False)))
         self.auto_follow = self.follow_var.get()
         self.swap_var.set(bool(cfg.get("swap", True)))
         self.stream_title = cfg.get("stream_title", "")
