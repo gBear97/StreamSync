@@ -824,7 +824,7 @@ class App:
         return (players.CLOCK_OUTPUT_LAG
                 if self.active_player is self.embedded else 0.0)
 
-    def _auto_probe(self, ring, lo, hi):
+    def _auto_probe(self, ring, lo, hi, near):
         """Match `ring` (list of (block, t0) pairs) inside [lo, hi].
 
         Returns (t, score, z, ring_t0) on a gate-passing hit, else None.
@@ -836,12 +836,12 @@ class App:
         try:
             samples = np.concatenate([b for b, _ in ring])
             feats = audio_matcher.prep_capture(samples, audio_capture.CAPTURE_SR)
-            # `near` is the middle of the window we are asking about: when
-            # a self-similar film offers two equally good answers, take the
-            # one nearest where the stream is expected to be rather than
-            # teleporting the film to its twin
+            # `near` must be a position we actually believe in, passed by
+            # the caller. Deriving it from the window would drift with the
+            # window: probe mode's forward edge grows for minutes, and its
+            # midpoint slides away from where a resume really happens.
             m = audio_matcher.find_match_audio_ex(
-                self.video_path, feats, lo, hi, near=0.5 * (lo + hi))
+                self.video_path, feats, lo, hi, near=near)
         except (RuntimeError, ValueError, matcher.MatchError):
             return None
         if (m.z >= audio_matcher.Z_OK and m.score >= audio_matcher.SCORE_OK
@@ -937,7 +937,7 @@ class App:
                         last_confirm = time.monotonic()
                         continue
                     c = t_ref - self.offset   # expected STREAM position
-                    hit = self._auto_probe(ring, c - 30.0, c + 30.0)
+                    hit = self._auto_probe(ring, c - 30.0, c + 30.0, near=c)
                     last_confirm = time.monotonic()
                     if hit:
                         t, score, z, t0 = hit
@@ -1001,8 +1001,12 @@ class App:
                     # grows with elapsed time to keep up with it - that is
                     # also what makes a wrong pause heal itself
                     ahead = min(time.monotonic() - paused_at, PROBE_MAX_AHEAD)
+                    # near is pause_point, NOT the window's middle: the
+                    # window grows forward to catch a stream that never
+                    # stopped, but a real resume happens where it paused
                     hit = self._auto_probe(ring, pause_point - 25.0,
-                                           pause_point + 40.0 + ahead)
+                                           pause_point + 40.0 + ahead,
+                                           near=pause_point)
                     last_confirm = time.monotonic()
                     if hit:
                         t, score, z, t0 = hit

@@ -42,6 +42,9 @@ RIVAL_RATIO = 0.85    # rival/best above this = the answer is a guess
 # before a closer twin could be reported. Keep the wide value; splitting
 # one peak's lobe into false rivals is the worse failure.
 PEAK_SEP_S = 20.0
+# a proximity hint resolves a tie only if it puts one candidate this much
+# nearer than the next one; otherwise the hint is not evidence
+NEAR_MARGIN_S = 10.0
 
 Match = collections.namedtuple(
     "Match", "t score z rival_score rival_t ambiguous candidates")
@@ -186,22 +189,26 @@ def find_match_audio_ex(path, capture_feats, t0=None, t1=None, progress=None,
             merged.append((t, sc))
 
     top_t, top_score = merged[0]
-    rival_t, rival_score = (merged[1] if len(merged) > 1 else (None, 0.0))
-    ambiguous = bool(rival_t is not None
-                     and rival_score >= RIVAL_RATIO * top_score)
+    # the winner plus everyone arguably as good as it
+    tied = [(t, sc) for t, sc in merged if sc >= RIVAL_RATIO * top_score]
+    ambiguous = len(tied) > 1
 
     t_best, score_best = top_t, top_score
-    if ambiguous and near is not None:
-        # every rival that is arguably as good as the winner, plus the
-        # winner itself - then let proximity decide among them
-        tied = [(t, sc) for t, sc in merged
-                if sc >= RIVAL_RATIO * top_score]
-        t_best, score_best = min(tied, key=lambda c: abs(c[0] - near))
-        # Resolved on evidence rather than guessed - including when
-        # proximity agrees with the highest score, which is the strongest
-        # case of all. Leaving the flag up there would make callers that
-        # refuse ambiguous matches (the auto loop) reject their best ones.
-        ambiguous = False
+    if ambiguous and near is not None and len(tied) > 1:
+        by_near = sorted(tied, key=lambda c: abs(c[0] - near))
+        # Proximity only settles anything when it actually separates the
+        # candidates. Clearing the flag merely because a hint was supplied
+        # would disable the gate for every caller that supplies one - and
+        # both of ours do.
+        if abs(by_near[1][0] - near) - abs(by_near[0][0] - near) \
+                >= NEAR_MARGIN_S:
+            t_best, score_best = by_near[0]
+            ambiguous = False
+
+    # describe the rival to whatever we actually chose, not to the global
+    # winner - otherwise the diagnostics discuss a different answer
+    others = [(t, sc) for t, sc in merged if t != t_best]
+    rival_t, rival_score = (others[0] if others else (None, 0.0))
 
     return Match(t=t_best, score=score_best, z=z_of.get(t_best, 0.0),
                  rival_score=rival_score, rival_t=rival_t,
