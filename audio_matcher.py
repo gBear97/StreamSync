@@ -155,6 +155,17 @@ def find_match_audio_ex(path, capture_feats, t0=None, t1=None, progress=None,
     if t1 - t0 < 8.0:
         t0, t1 = max(0.0, t0 - 8.0), min(duration, t1 + 8.0)
 
+    # A capture is only findable where it fits ENTIRELY inside one chunk,
+    # so a chunk covers starts up to its end minus the capture length,
+    # while the next chunk begins one overlap earlier. Any capture longer
+    # than the overlap therefore leaves a band at every boundary that no
+    # chunk can match - and the scan answers from somewhere else entirely
+    # rather than reporting that it looked nowhere. A fixed 8s overlap was
+    # safe only while every capture was 6s: measured on a 30s listen, a
+    # truth at 883s came back as 295s.
+    cap_s = capture_feats.shape[0] * HOP_S
+    overlap = min(max(OVERLAP_S, cap_s + 1.0), 0.5 * CHUNK_S)
+
     cands = []       # [(t, score)] across every chunk
     z_of = {}        # peak time -> z within its own chunk
     seg0 = t0
@@ -177,7 +188,7 @@ def find_match_audio_ex(path, capture_feats, t0=None, t1=None, progress=None,
                 z_of[t_peak] = float((sc - mean) / (std + 1e-9))
         if seg1 >= t1:
             break
-        seg0 = seg1 - OVERLAP_S
+        seg0 = seg1 - overlap
     if not cands:
         raise MatchError("Audio scan produced no candidates.")
 
