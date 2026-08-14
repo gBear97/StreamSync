@@ -671,10 +671,12 @@ class App:
             self._sync()
             return
         # a paused stream leaves the local copy ahead, so look mostly
-        # backwards; ten minutes covers any realistic drift or pause
-        self._start_search(t - 600.0, t + 30.0)
+        # backwards; ten minutes covers any realistic drift or pause.
+        # `near` breaks ties by proximity: ten minutes of a self-similar
+        # film can easily hold a twin of where we actually are.
+        self._start_search(t - 600.0, t + 30.0, near=t)
 
-    def _start_search(self, a, b, listen_s=None):
+    def _start_search(self, a, b, listen_s=None, near=None):
         self.busy = True
         self._search_cancel = threading.Event()
         # Sync morphs into Stop; Resync stays live so a press mid-search
@@ -701,7 +703,7 @@ class App:
             threading.Thread(
                 target=self._audio_search_worker,
                 args=(a, b, player, offset, mute, device, listen, pname,
-                      self._search_cancel),
+                      self._search_cancel, near),
                 daemon=True).start()
         else:
             self._set_status("Capturing stream frames...")
@@ -717,24 +719,25 @@ class App:
     # ------------------------------------------------------------- workers
 
     def _audio_search_worker(self, a, b, player, offset, mute, device, listen,
-                             pname, cancel):
+                             pname, cancel, near):
         try:
             self.q.put(("status",
                         f"Recording stream audio ({listen:.0f} s)..."))
             samples, sr, t0 = audio_capture.record_loopback(
                 listen, speaker_name=device, cancel=cancel.is_set)
             feats = audio_matcher.prep_capture(samples, sr)
-            match_t, score, z = audio_matcher.find_match_audio(
+            m = audio_matcher.find_match_audio_ex(
                 self.video_path, feats, a, b,
-                progress=lambda m: self.q.put(("status", m)),
-                cancel=cancel.is_set)
+                progress=lambda msg: self.q.put(("status", msg)),
+                cancel=cancel.is_set, near=near)
             if cancel.is_set():
                 raise RuntimeError("stopped")
             self.q.put(("status", "Seeking..."))
-            player.sync_seek(match_t, t0, offset)
+            player.sync_seek(m.t, t0, offset)
             player.set_mute(mute)
             self.q.put(("swap", False))
-            self.q.put(("adone", match_t, score, z, listen, pname))
+            self.q.put(("adone", m.t, m.score, m.z, listen, pname,
+                        m.ambiguous, m.rival_t, m.rival_score))
         except Exception as e:
             # a stop is not a failure - report it as what it was
             if cancel.is_set():
@@ -833,12 +836,17 @@ class App:
         try:
             samples = np.concatenate([b for b, _ in ring])
             feats = audio_matcher.prep_capture(samples, audio_capture.CAPTURE_SR)
-            t, score, z = audio_matcher.find_match_audio(
-                self.video_path, feats, lo, hi)
+            # `near` is the middle of the window we are asking about: when
+            # a self-similar film offers two equally good answers, take the
+            # one nearest where the stream is expected to be rather than
+            # teleporting the film to its twin
+            m = audio_matcher.find_match_audio_ex(
+                self.video_path, feats, lo, hi, near=0.5 * (lo + hi))
         except (RuntimeError, ValueError, matcher.MatchError):
             return None
-        if z >= audio_matcher.Z_OK and score >= audio_matcher.SCORE_OK:
-            return t, score, z, ring[0][1]
+        if (m.z >= audio_matcher.Z_OK and m.score >= audio_matcher.SCORE_OK
+                and not m.ambiguous):
+            return m.t, m.score, m.z, ring[0][1]
         return None
 
     def _auto_loop(self):
@@ -1186,18 +1194,43 @@ class App:
 
     # ------------------------------------------- stream window swap (facecam)
 
+    BROWSER_SUFFIXES = (" - brave", " - google chrome", " - chromium",
+                        " - microsoft edge", " - mozilla firefox", " - opera")
+
     def _refresh_windows(self):
         wins = [(h, t) for h, t in windowctl.list_windows()
                 if t.strip() and not t.startswith("StreamSync")]
         self._win_map = {t[:70]: h for h, t in wins}
         items = list(self._win_map.keys())
         self.streamwin_combo["values"] = items
-        if not self.streamwin_var.get():
-            for t in items:
-                if "twitch" in t.lower() or "kick.com" in t.lower():
-                    self.streamwin_var.set(t)
-                    self._on_streamwin_pick()
-                    break
+
+        current = self.streamwin_var.get()
+        if current in self._win_map:
+            self.stream_hwnd = self._win_map[current]  # re-resolve each refresh
+            return
+        if current:
+            # A title saved last session whose window is gone would sit in
+            # the box forever: it blocks the auto-pick below and reads as
+            # "a window is selected" when nothing is.
+            log.info("saved stream window %r is gone - re-picking", current)
+            self.streamwin_var.set("")
+            self.stream_hwnd = None
+
+        # A live stream's tab is titled "... - Twitch", but a VOD's tab is
+        # titled after the VOD, so name matching alone finds nothing. Fall
+        # back to the browser window itself when there is only one.
+        for t in items:
+            low = t.lower()
+            if "twitch" in low or "kick.com" in low:
+                self.streamwin_var.set(t)
+                self._on_streamwin_pick()
+                return
+        browsers = [t for t in items
+                    if any(t.lower().endswith(s)
+                           for s in self.BROWSER_SUFFIXES)]
+        if len(browsers) == 1:
+            self.streamwin_var.set(browsers[0])
+            self._on_streamwin_pick()
 
     def _on_streamwin_pick(self, _event=None):
         title = self.streamwin_var.get()
@@ -1503,18 +1536,30 @@ class App:
                     for win in payload[0]:
                         win.deiconify()
                 elif kind == "adone":
-                    match_t, score, z, listen, pname = payload
+                    (match_t, score, z, listen, pname,
+                     ambiguous, rival_t, rival_score) = payload
                     self._last_sync = {
                         "kind": "audio", "t": round(match_t, 3),
                         "score": round(score, 4), "z": round(z, 2),
-                        "listen_s": listen, "player": pname}
+                        "listen_s": listen, "player": pname,
+                        "ambiguous": ambiguous,
+                        "rival_t": None if rival_t is None else round(rival_t, 1),
+                        "rival_score": round(rival_score, 4)}
                     self.good_btn.config(state="normal")
                     self.bad_btn.config(state="normal")
                     self._reveal_player(pname)
                     msg = (f"Matched stream audio at {fmt_time(match_t)} "
                            f"(score {score:.2f}, peak z {z:.0f}, "
                            f"{listen:.0f}s listen).")
-                    if score < audio_matcher.SCORE_OK or z < audio_matcher.Z_OK:
+                    if ambiguous:
+                        # z cannot see this: it measures the peak against the
+                        # curve's average, not against an equally good rival
+                        msg += (f" AMBIGUOUS - {fmt_time(rival_t)} sounds "
+                                f"almost the same ({rival_score:.2f} vs "
+                                f"{score:.2f}). If this landed wrong, scrub "
+                                "near the right moment and hit Resync, which "
+                                "prefers the nearest match.")
+                    elif score < audio_matcher.SCORE_OK or z < audio_matcher.Z_OK:
                         msg += (" Weak match - the commentary may be drowning "
                                 "the film audio; try again in a louder scene "
                                 "or use video sync.")

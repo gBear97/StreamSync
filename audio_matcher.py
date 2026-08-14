@@ -7,6 +7,7 @@ is audible under the voice - correlation only needs a fraction of the
 spectrum to line up.
 """
 
+import collections
 import subprocess
 
 import numpy as np
@@ -25,6 +26,25 @@ OVERLAP_S = 8.0
 # gates used by callers to decide whether a peak is trustworthy
 Z_OK = 6.0            # peak must stand this many sigmas above the score curve
 SCORE_OK = 0.10       # and reach this normalized correlation
+
+# ...and a gate for the failure those two cannot see. z measures the peak
+# against the MEAN of the score curve, so when a film repeats itself - a
+# recurring musical theme, a returning location - several positions score
+# nearly the same, the winner still towers over the average, and a coin
+# flip is reported as a confident match. Measured on In the Mood for
+# Love: audio taken from the film itself at 25:00 lost to 43:36, 0.81 vs
+# 0.76, at z 16.4. Compare the winner with its best well-separated rival
+# instead: that ratio is what says "I know where this is".
+RIVAL_RATIO = 0.85    # rival/best above this = the answer is a guess
+# Two peaks closer than this are the same place, not rivals. Swept 2-20s
+# on a self-similar film: identical results throughout, because the
+# per-chunk peak budget fills with the winner's own neighbourhood long
+# before a closer twin could be reported. Keep the wide value; splitting
+# one peak's lobe into false rivals is the worse failure.
+PEAK_SEP_S = 20.0
+
+Match = collections.namedtuple(
+    "Match", "t score z rival_score rival_t ambiguous candidates")
 
 
 def decode_audio(path, t0_abs, dur, sr=SR):
@@ -88,13 +108,42 @@ def _corr_scores(W, C):
     return num / denom
 
 
-def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None,
-                     cancel=None):
-    """Locate the recording inside `path`'s audio track.
+def _chunk_peaks(scores, seg0, max_n=6):
+    """The top few well-separated peaks in one chunk's score curve.
 
-    Returns (time_on_player_timeline, score, peak_z). Callers should treat
-    the result as unreliable when score < SCORE_OK or peak_z < Z_OK.
-    `cancel` (callable -> bool) aborts between decode chunks.
+    Sub-hop timing comes from parabolic interpolation around each peak.
+    """
+    out = []
+    order = np.argsort(scores)[::-1]
+    for j in order:
+        i = int(j)
+        t = seg0 + i * HOP_S
+        if any(abs(t - p[0]) < PEAK_SEP_S for p in out):
+            continue
+        d = 0.0
+        if 0 < i < len(scores) - 1:
+            a, b, c = scores[i - 1], scores[i], scores[i + 1]
+            denom = a - 2 * b + c
+            if abs(denom) > 1e-12:
+                d = float(np.clip(0.5 * (a - c) / denom, -1.0, 1.0))
+        out.append((seg0 + (i + d) * HOP_S, float(scores[i])))
+        if len(out) >= max_n:
+            break
+    return out
+
+
+def find_match_audio_ex(path, capture_feats, t0=None, t1=None, progress=None,
+                        cancel=None, near=None):
+    """Locate the recording inside `path`'s audio track, honestly.
+
+    Returns a Match. `ambiguous` is set when the best peak has a rival
+    that scores nearly as well somewhere else entirely - the film sounds
+    the same in both places and this recording cannot tell them apart.
+
+    `near` (seconds on the player timeline) breaks such ties by
+    proximity: when several places match equally well, the one closest to
+    where the film already is wins. That is the difference between a
+    re-sync nudging a few seconds and a re-sync teleporting 18 minutes.
     """
     progress = progress or (lambda msg: None)
     duration, start = probe(path)
@@ -103,7 +152,8 @@ def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None,
     if t1 - t0 < 8.0:
         t0, t1 = max(0.0, t0 - 8.0), min(duration, t1 + 8.0)
 
-    best = None  # (time, score, z)
+    cands = []       # [(t, score)] across every chunk
+    z_of = {}        # peak time -> z within its own chunk
     seg0 = t0
     while seg0 < t1:
         if cancel is not None and cancel():
@@ -118,21 +168,55 @@ def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None,
                 scores = _corr_scores(W, capture_feats)
             except MatchError:
                 break
-            i = int(np.argmax(scores))
-            z = float((scores[i] - scores.mean()) / (scores.std() + 1e-9))
-            # parabolic interpolation for sub-hop timing
-            d = 0.0
-            if 0 < i < len(scores) - 1:
-                a, b, c = scores[i - 1], scores[i], scores[i + 1]
-                denom = a - 2 * b + c
-                if abs(denom) > 1e-12:
-                    d = float(np.clip(0.5 * (a - c) / denom, -1.0, 1.0))
-            t_match = seg0 + (i + d) * HOP_S
-            if best is None or scores[i] > best[1]:
-                best = (t_match, float(scores[i]), z)
+            mean, std = scores.mean(), scores.std()
+            for t_peak, sc in _chunk_peaks(scores, seg0):
+                cands.append((t_peak, sc))
+                z_of[t_peak] = float((sc - mean) / (std + 1e-9))
         if seg1 >= t1:
             break
         seg0 = seg1 - OVERLAP_S
-    if best is None:
+    if not cands:
         raise MatchError("Audio scan produced no candidates.")
-    return best
+
+    # merge across the chunk overlap, best first
+    cands.sort(key=lambda c: -c[1])
+    merged = []
+    for t, sc in cands:
+        if all(abs(t - m[0]) >= PEAK_SEP_S for m in merged):
+            merged.append((t, sc))
+
+    top_t, top_score = merged[0]
+    rival_t, rival_score = (merged[1] if len(merged) > 1 else (None, 0.0))
+    ambiguous = bool(rival_t is not None
+                     and rival_score >= RIVAL_RATIO * top_score)
+
+    t_best, score_best = top_t, top_score
+    if ambiguous and near is not None:
+        # every rival that is arguably as good as the winner, plus the
+        # winner itself - then let proximity decide among them
+        tied = [(t, sc) for t, sc in merged
+                if sc >= RIVAL_RATIO * top_score]
+        t_best, score_best = min(tied, key=lambda c: abs(c[0] - near))
+        # Resolved on evidence rather than guessed - including when
+        # proximity agrees with the highest score, which is the strongest
+        # case of all. Leaving the flag up there would make callers that
+        # refuse ambiguous matches (the auto loop) reject their best ones.
+        ambiguous = False
+
+    return Match(t=t_best, score=score_best, z=z_of.get(t_best, 0.0),
+                 rival_score=rival_score, rival_t=rival_t,
+                 ambiguous=ambiguous, candidates=merged[:5])
+
+
+def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None,
+                     cancel=None, near=None):
+    """Locate the recording inside `path`'s audio track.
+
+    Returns (time_on_player_timeline, score, peak_z). Callers should treat
+    the result as unreliable when score < SCORE_OK or peak_z < Z_OK - and
+    see find_match_audio_ex for the ambiguity those two cannot detect.
+    `cancel` (callable -> bool) aborts between decode chunks.
+    """
+    m = find_match_audio_ex(path, capture_feats, t0, t1, progress, cancel,
+                            near)
+    return m.t, m.score, m.z
