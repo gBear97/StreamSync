@@ -88,11 +88,13 @@ def _corr_scores(W, C):
     return num / denom
 
 
-def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None):
+def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None,
+                     cancel=None):
     """Locate the recording inside `path`'s audio track.
 
     Returns (time_on_player_timeline, score, peak_z). Callers should treat
     the result as unreliable when score < SCORE_OK or peak_z < Z_OK.
+    `cancel` (callable -> bool) aborts between decode chunks.
     """
     progress = progress or (lambda msg: None)
     duration, start = probe(path)
@@ -104,6 +106,8 @@ def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None):
     best = None  # (time, score, z)
     seg0 = t0
     while seg0 < t1:
+        if cancel is not None and cancel():
+            raise MatchError("search stopped")
         seg1 = min(seg0 + CHUNK_S, t1)
         if seg1 - seg0 >= 4.0:
             progress(f"Listening through {int(seg0) // 60}:{int(seg0) % 60:02d}"

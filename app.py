@@ -58,18 +58,6 @@ def fmt_time(s):
     return f"{m}:{sec:02d}.{frac}"
 
 
-def parse_time(text):
-    """'1:23:45', '23:45', '95' -> seconds; empty -> None."""
-    text = text.strip()
-    if not text:
-        return None
-    parts = text.split(":")
-    if len(parts) > 3 or not all(p.strip() for p in parts):
-        raise ValueError(f"Cannot parse time '{text}' (use h:mm:ss, m:ss or seconds)")
-    total = 0.0
-    for p in parts:
-        total = total * 60 + float(p)
-    return total
 
 
 class App:
@@ -94,8 +82,9 @@ class App:
         self.stream_title = ""
         self._win_map = {}
         self._swapped = False        # stream window currently shown?
-        self._was_fullscreen = False
-        self._ext_hwnd = None
+        self._stream_placement = None  # where the stream window belongs
+        self._search_cancel = None   # Event; Stop sets it
+        self._pending_search = None  # "resync" queued behind a cancel
         self.session = None          # active HostSession / ViewerSession
         self.relay_url = "ws://localhost:8765"
         self._osd_win = None         # Tk-drawn volume OSD over the video
@@ -254,20 +243,11 @@ class App:
         sync.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         row = ttk.Frame(sync)
         row.pack(fill="x")
-        ttk.Label(row, text="Position hint").pack(side="left")
-        self.hint_var = tk.StringVar()
-        ttk.Entry(row, textvariable=self.hint_var, width=10).pack(side="left", padx=(6, 0))
-        ttk.Label(row, text="(h:mm:ss, blank = whole file)   Search +/-").pack(
-            side="left", padx=(6, 0))
-        self.window_var = tk.StringVar(value="2:00")
-        ttk.Entry(row, textvariable=self.window_var, width=8).pack(side="left", padx=(6, 0))
-
-        row = ttk.Frame(sync)
-        row.pack(fill="x", pady=(8, 0))
-        self.sync_btn = ttk.Button(row, text="Sync to stream", command=self._sync)
+        self.sync_btn = ttk.Button(row, text="Sync to stream",
+                                   command=self._sync_clicked)
         self.sync_btn.pack(side="left")
         self.resync_btn = ttk.Button(row, text="Resync (around current position)",
-                                     command=self._resync)
+                                     command=self._resync_clicked)
         self.resync_btn.pack(side="left", padx=(8, 0))
 
         row = ttk.Frame(sync)
@@ -645,16 +625,33 @@ class App:
         method = self.method_var.get()
         if not self._ready(need_region=(method == "video")):
             return
-        try:
-            center = parse_time(self.hint_var.get())
-            window = parse_time(self.window_var.get()) or 120.0
-        except ValueError as e:
-            messagebox.showerror("StreamSync", str(e))
-            return
-        if center is None:
-            self._start_search(None, None, listen_s)
+        # whole-file, always: the hint field is gone - field data showed
+        # unhinted search finding the spot better than expected
+        self._start_search(None, None, listen_s)
+
+    def _sync_clicked(self):
+        """The Sync button doubles as Stop while a search is running."""
+        if self.busy:
+            self._stop_search()
         else:
-            self._start_search(center - window, center + window, listen_s)
+            self._sync()
+
+    def _resync_clicked(self):
+        """Resync during a search cancels it and starts over."""
+        if self.busy:
+            self._stop_search()
+            self._pending_search = "resync"
+        else:
+            self._resync()
+
+    def _stop_search(self):
+        if self.busy and self._search_cancel is not None:
+            # Stop means stop: a Resync queued behind the cancel must not
+            # auto-start a new search against an explicit abort. (Resync's
+            # own click re-queues AFTER calling this, so restart survives.)
+            self._pending_search = None
+            self._search_cancel.set()
+            self._set_status("Stopping...")
 
     def _resync(self):
         if self.busy:
@@ -666,17 +663,16 @@ class App:
         if t is None:
             self._sync()
             return
-        try:
-            window = parse_time(self.window_var.get()) or 120.0
-        except ValueError:
-            window = 120.0
-        # a paused stream leaves the local copy ahead, so look mostly backwards
-        self._start_search(t - window, t + 30.0)
+        # a paused stream leaves the local copy ahead, so look mostly
+        # backwards; ten minutes covers any realistic drift or pause
+        self._start_search(t - 600.0, t + 30.0)
 
     def _start_search(self, a, b, listen_s=None):
         self.busy = True
-        self.sync_btn.state(["disabled"])
-        self.resync_btn.state(["disabled"])
+        self._search_cancel = threading.Event()
+        # Sync morphs into Stop; Resync stays live so a press mid-search
+        # cancels and starts over. Only the experimental buttons lock.
+        self.sync_btn.config(text="Stop")
         for btn in self._exp_sync_btns:
             btn.state(["disabled"])
         # a new search invalidates the previous verdict context: without
@@ -697,7 +693,8 @@ class App:
             device = self.audio_device
             threading.Thread(
                 target=self._audio_search_worker,
-                args=(a, b, player, offset, mute, device, listen, pname),
+                args=(a, b, player, offset, mute, device, listen, pname,
+                      self._search_cancel),
                 daemon=True).start()
         else:
             self._set_status("Capturing stream frames...")
@@ -706,34 +703,42 @@ class App:
             mirror = self.mirror_var.get()
             threading.Thread(
                 target=self._video_search_worker,
-                args=(a, b, player, offset, mute, hidden, mask, mirror, pname),
+                args=(a, b, player, offset, mute, hidden, mask, mirror, pname,
+                      self._search_cancel),
                 daemon=True).start()
 
     # ------------------------------------------------------------- workers
 
     def _audio_search_worker(self, a, b, player, offset, mute, device, listen,
-                             pname):
+                             pname, cancel):
         try:
             self.q.put(("status",
                         f"Recording stream audio ({listen:.0f} s)..."))
             samples, sr, t0 = audio_capture.record_loopback(
-                listen, speaker_name=device)
+                listen, speaker_name=device, cancel=cancel.is_set)
             feats = audio_matcher.prep_capture(samples, sr)
             match_t, score, z = audio_matcher.find_match_audio(
                 self.video_path, feats, a, b,
-                progress=lambda m: self.q.put(("status", m)))
+                progress=lambda m: self.q.put(("status", m)),
+                cancel=cancel.is_set)
+            if cancel.is_set():
+                raise RuntimeError("stopped")
             self.q.put(("status", "Seeking..."))
             player.sync_seek(match_t, t0, offset)
             player.set_mute(mute)
             self.q.put(("swap", False))
             self.q.put(("adone", match_t, score, z, listen, pname))
         except Exception as e:
-            self.q.put(("error", str(e)))
+            # a stop is not a failure - report it as what it was
+            if cancel.is_set():
+                self.q.put(("cancelled", None))
+            else:
+                self.q.put(("error", str(e)))
         finally:
             self.q.put(("busy_off", None))
 
     def _video_search_worker(self, a, b, player, offset, mute, hidden,
-                             mask, mirror, pname):
+                             mask, mirror, pname, cancel):
         try:
             if hidden:
                 time.sleep(0.3)  # let withdrawn windows actually leave the screen
@@ -746,9 +751,15 @@ class App:
                 if mirror:
                     img = np.fliplr(img)
                 burst.append((matcher.prep_gray(img, mask), dt))
+            if cancel.is_set():
+                raise RuntimeError("stopped")
+            # NOTE: the frame scan itself is not yet interruptible - Stop
+            # takes effect before it starts and before the seek lands
             match_t, score = matcher.find_match(
                 self.video_path, burst, a, b,
                 progress=lambda m: self.q.put(("status", m)), mask=mask)
+            if cancel.is_set():
+                raise RuntimeError("stopped")
             self.q.put(("status", "Seeking..."))
             player.sync_seek(match_t, t0, offset)
             player.set_mute(mute)
@@ -756,7 +767,10 @@ class App:
             self.q.put(("vdone", match_t, score, pname))
         except Exception as e:
             self.q.put(("show", hidden))
-            self.q.put(("error", str(e)))
+            if cancel.is_set():
+                self.q.put(("cancelled", None))
+            else:
+                self.q.put(("error", str(e)))
         finally:
             self.q.put(("busy_off", None))
 
@@ -1097,13 +1111,26 @@ class App:
         self._save_config()
 
     def _stream_swap(self, show):
-        """Show the stream's browser window during pauses; hide it again after."""
+        """Fullscreen handoff during stream pauses.
+
+        Only when the film is FULLSCREEN does the stream take its place -
+        same monitor - and on resume the film takes the spot back while
+        the stream window returns to exactly where it was. A windowed film
+        means both windows are already arranged the way the user wants
+        them (two monitors, both visible): touch nothing, and never, ever
+        minimize the stream. External VLC manages its own windows.
+        """
         if not self.swap_var.get() or show == self._swapped or not self.video_path:
             return
-        log.debug("stream_swap: show_stream=%s (film window %s)", show,
-                  "hides" if show else "returns")
+        log.debug("stream_swap: show_stream=%s fullscreen=%s", show,
+                  self.fullscreen)
         try:
             if show:
+                # only a FULLSCREEN EMBEDDED film swaps; the release path
+                # below must stay reachable for other players, or a swap
+                # engaged before switching to external wedges forever
+                if self.player is not self.embedded or not self.fullscreen:
+                    return
                 hwnd = windowctl.find_stream_window(self.stream_hwnd,
                                                     self.stream_title)
                 if hwnd is None:
@@ -1111,31 +1138,47 @@ class App:
                                      "under 'Stream window' (hit Refresh).")
                     return
                 self.stream_hwnd = hwnd
-                if self.player is self.embedded:
-                    self._was_fullscreen = self.fullscreen
-                    # drop the borderless frame before hiding, or the window
-                    # comes back still stretched over the monitor
-                    self._set_fullscreen(False, show=False)
-                    self.video_win.withdraw()
-                elif self.external is not None and self.external.proc:
-                    self._ext_hwnd = windowctl.find_by_pid(self.external.proc.pid)
-                    if self._ext_hwnd:
-                        windowctl.minimize(self._ext_hwnd)
-                windowctl.restore(hwnd)
+                monitor = windowctl.monitor_rect(self._video_hwnd())
+                self._stream_placement = windowctl.get_placement(hwnd)
+                # drop the borderless frame before hiding, or the window
+                # comes back still stretched over the monitor
+                self._set_fullscreen(False, show=False)
+                self.video_win.withdraw()
+                windowctl.fill_monitor(hwnd, monitor)
                 self._swapped = True
             else:
-                if self.stream_hwnd and windowctl.is_valid(self.stream_hwnd):
-                    windowctl.minimize(self.stream_hwnd)
+                if (self.stream_hwnd and windowctl.is_valid(self.stream_hwnd)
+                        and self._stream_placement is not None):
+                    windowctl.set_placement(self.stream_hwnd,
+                                            self._stream_placement)
+                self._stream_placement = None
                 if self.player is self.embedded:
-                    if self._was_fullscreen:
-                        self._set_fullscreen(True)
-                    else:
-                        self.video_win.deiconify()
-                elif self._ext_hwnd and windowctl.is_valid(self._ext_hwnd):
-                    windowctl.restore(self._ext_hwnd)
+                    self._set_fullscreen(True)   # swap only engages fullscreen
+                # else: the user switched to external mid-swap - give the
+                # stream window back but leave the embedded window hidden
                 self._swapped = False
         except Exception as e:
             self._set_status(f"Window swap failed: {e}")
+
+    def _reveal_player(self, pname):
+        """A manual sync just landed - put the synced player on screen.
+
+        Restores what the user had (a withdrawn-while-fullscreen window
+        keeps its borderless frame, so deiconify alone brings fullscreen
+        back) and never steals keyboard focus - they may be typing in
+        chat. Auto re-sync corrections never come through here.
+        """
+        try:
+            if pname == "EmbeddedPlayer":
+                if not self.video_win.winfo_viewable():
+                    self.video_win.deiconify()
+                self.video_win.lift()
+            elif self.external is not None and self.external.proc:
+                hwnd = windowctl.find_by_pid(self.external.proc.pid)
+                if hwnd and windowctl.is_minimized(hwnd):
+                    windowctl.show_noactivate(hwnd)
+        except Exception as e:
+            log.warning("reveal after sync failed: %s", e)
 
     def _on_mute_toggle(self):
         self.player.set_mute(self.mute_var.get())
@@ -1372,6 +1415,7 @@ class App:
                         "listen_s": listen, "player": pname}
                     self.good_btn.config(state="normal")
                     self.bad_btn.config(state="normal")
+                    self._reveal_player(pname)
                     msg = (f"Matched stream audio at {fmt_time(match_t)} "
                            f"(score {score:.2f}, peak z {z:.0f}, "
                            f"{listen:.0f}s listen).")
@@ -1389,6 +1433,7 @@ class App:
                         "score": round(score, 4), "player": pname}
                     self.good_btn.config(state="normal")
                     self.bad_btn.config(state="normal")
+                    self._reveal_player(pname)
                     msg = (f"Matched stream video at {fmt_time(match_t)} "
                            f"(confidence {score:.2f}).")
                     if score < LOW_CONFIDENCE:
@@ -1397,12 +1442,17 @@ class App:
                     self._set_status(msg)
                 elif kind == "error":
                     self._set_status(f"Sync failed: {payload[0]}")
+                elif kind == "cancelled":
+                    self._set_status("Sync stopped.")
                 elif kind == "busy_off":
                     self.busy = False
-                    self.sync_btn.state(["!disabled"])
-                    self.resync_btn.state(["!disabled"])
+                    self._search_cancel = None
+                    self.sync_btn.config(text="Sync to stream")
                     for btn in self._exp_sync_btns:
                         btn.state(["!disabled"])
+                    pending, self._pending_search = self._pending_search, None
+                    if pending == "resync" and not self._closing:
+                        self.root.after(50, self._resync)
                 elif kind == "hotkey":
                     self._hotkey(payload[0])
         except queue.Empty:
@@ -1411,9 +1461,9 @@ class App:
 
     def _hotkey(self, name):
         if name == "sync":
-            self._sync()
+            self._sync_clicked()
         elif name == "resync":
-            self._resync()
+            self._resync_clicked()
         elif name == "pause":
             self._toggle_pause()
         elif name == "back":
@@ -1547,8 +1597,6 @@ class App:
             CONFIG_PATH.write_text(json.dumps({
                 "video_path": self.video_path,
                 "region": self.region,
-                "window": self.window_var.get(),
-                "hint": self.hint_var.get(),
                 "method": self.method_var.get(),
                 "player": self.player_var.get(),
                 "audio_device": self.audio_device,
@@ -1586,10 +1634,6 @@ class App:
             self.region_lbl.config(
                 text=f"{self.region[2]}x{self.region[3]} at "
                      f"({self.region[0]}, {self.region[1]}) (from last session)")
-        if cfg.get("window"):
-            self.window_var.set(cfg["window"])
-        if cfg.get("hint"):
-            self.hint_var.set(cfg["hint"])
         if cfg.get("method") in ("audio", "video"):
             self.method_var.set(cfg["method"])
         self.audio_device = cfg.get("audio_device", "")

@@ -64,7 +64,7 @@ def list_microphones():
 PRIME_S = 0.05   # discarded lead-in that drains the device's first buffers
 
 
-def _timed_record(mic, seconds, sr):
+def _timed_record(mic, seconds, sr, cancel=None):
     """Record `seconds` from `mic`, returning (samples, perf_counter_at_start).
 
     `mic.record()` would open and start the device *inside* the call, so a
@@ -73,11 +73,23 @@ def _timed_record(mic, seconds, sr):
     elapsed stream time, landing every seek that far ahead. Opening the
     recorder explicitly, then discarding a short priming read, means t0 is
     stamped with the stream already flowing and its first buffers drained.
+
+    Reads in quarter-second blocks so a 30 s listen can be abandoned:
+    `cancel` (a callable -> bool) is checked between blocks and raises.
     """
     with mic.recorder(samplerate=sr) as rec:
         rec.record(numframes=int(PRIME_S * sr))
         t0 = time.perf_counter()
-        data = rec.record(numframes=int(seconds * sr))
+        chunks = []
+        remaining = int(seconds * sr)
+        block = int(0.25 * sr)
+        while remaining > 0:
+            if cancel is not None and cancel():
+                raise RuntimeError("capture stopped")
+            n = min(block, remaining)
+            chunks.append(rec.record(numframes=n))
+            remaining -= n
+        data = np.concatenate(chunks)
     if data.ndim > 1:
         data = data.mean(axis=1)
     return data.astype(np.float32), t0
@@ -102,10 +114,11 @@ def record_mic(seconds, mic_name=None, sr=CAPTURE_SR):
     return data, sr, t0
 
 
-def record_loopback(seconds, speaker_name=None, sr=CAPTURE_SR):
+def record_loopback(seconds, speaker_name=None, sr=CAPTURE_SR, cancel=None):
     """Record `seconds` of the stream's audio.
 
     Returns (mono float32 samples, sample_rate, perf_counter_at_start).
+    `cancel` (callable -> bool) aborts between blocks with a RuntimeError.
     """
     import soundcard as sc
     if IS_MAC:
@@ -130,7 +143,7 @@ def record_loopback(seconds, speaker_name=None, sr=CAPTURE_SR):
             f"Captured only silence from '{spk.name}' - is the stream "
             "audible on that device?")
 
-    data, t0 = _timed_record(mic, seconds, sr)
+    data, t0 = _timed_record(mic, seconds, sr, cancel=cancel)
     if float(np.abs(data).max(initial=0.0)) < 1e-4:
         raise RuntimeError(silence_hint)
     return data, sr, t0

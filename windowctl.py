@@ -12,6 +12,9 @@ user32 = ctypes.windll.user32
 
 SW_MINIMIZE = 6
 SW_RESTORE = 9
+SW_SHOWNOACTIVATE = 4
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
 
 GWL_STYLE = -16
 WS_OVERLAPPEDWINDOW = 0x00CF0000
@@ -101,6 +104,51 @@ def restore(hwnd):
     user32.ShowWindow(h, SW_RESTORE)
     user32.BringWindowToTop(h)
     user32.SetForegroundWindow(h)
+
+
+def show_noactivate(hwnd):
+    """Show/un-minimize WITHOUT giving the window keyboard focus - for
+    revealing a player while the user may be typing somewhere else."""
+    user32.ShowWindow(wintypes.HWND(hwnd), SW_SHOWNOACTIVATE)
+
+
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [("length", wintypes.UINT), ("flags", wintypes.UINT),
+                ("showCmd", wintypes.UINT),
+                ("ptMinPosition", wintypes.POINT),
+                ("ptMaxPosition", wintypes.POINT),
+                ("rcNormalPosition", wintypes.RECT)]
+
+
+def get_placement(hwnd):
+    """Opaque snapshot of where a window is, including maximized state.
+    Feed it back to set_placement() to put the window back exactly."""
+    wp = WINDOWPLACEMENT(length=ctypes.sizeof(WINDOWPLACEMENT))
+    user32.GetWindowPlacement(wintypes.HWND(hwnd), ctypes.byref(wp))
+    return wp
+
+
+def set_placement(hwnd, wp):
+    user32.SetWindowPlacement(wintypes.HWND(hwnd), ctypes.byref(wp))
+
+
+def fill_monitor(hwnd, rect):
+    """Cover the given monitor rect with this window, raised but NOT
+    activated - the user may be typing in another app. Capture
+    get_placement() first; set_placement() undoes everything.
+
+    A maximized window must be un-maximized first: SetWindowPos cannot
+    move one (Windows re-maximizes it on the target monitor), and
+    restoring a placement onto a still-maximized window is a positional
+    no-op - measured: a browser maximized on monitor B ended up stranded
+    on monitor A. Normal-first, the placement round-trips, maximized
+    state included."""
+    x, y, w, h = rect
+    hw = wintypes.HWND(hwnd)
+    if user32.IsIconic(hw) or user32.IsZoomed(hw):
+        user32.ShowWindow(hw, SW_SHOWNOACTIVATE)
+    user32.SetWindowPos(hw, None, x, y, w, h,
+                        SWP_NOACTIVATE | SWP_SHOWWINDOW)
 
 
 def minimize(hwnd):
