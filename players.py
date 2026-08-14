@@ -154,6 +154,14 @@ class EmbeddedPlayer:
         if t is not None:
             self.seek(t + delta)
 
+    def snapshot(self):
+        """(time_s or None, length_s or None, playing) in one read."""
+        t = self.mp.get_time()
+        n = self.mp.get_length()
+        return (None if t is None or t < 0 else t / 1000.0,
+                None if n is None or n <= 0 else n / 1000.0,
+                bool(self.mp.is_playing()))
+
     def set_mute(self, mute):
         self.mp.audio_set_mute(bool(mute))
 
@@ -380,6 +388,25 @@ class ExternalPlayer:
             t = self.time()
             if t is not None:
                 self.seek(t + delta)
+
+    def snapshot(self):
+        """(time_s or None, length_s or None, playing) from ONE status
+        request - time()/length()/is_playing() cost an HTTP round trip
+        each, which is three separate UI stalls when polled for a clock."""
+        st = self._status()
+        if not st:
+            return (None, None, False)
+        length = st.get("length") or 0
+        pos = st.get("position")
+        t = None
+        if length > 0 and isinstance(pos, (int, float)) and pos > 0:
+            t = float(pos) * float(length)   # sub-second-ish precision
+        else:
+            raw = st.get("time")
+            if isinstance(raw, (int, float)) and raw >= 0:
+                t = float(raw)
+        return (t, float(length) if length > 0 else None,
+                st.get("state") == "playing")
 
     def _rate_pulse(self, delta):
         """Shift playback by `delta` seconds smoothly: run at 1.5x (or 0.5x)

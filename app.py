@@ -46,13 +46,16 @@ LOW_CONFIDENCE = 0.55      # video-match warning threshold
 
 
 def fmt_time(s):
-    s = max(0.0, float(s))
-    h, rem = divmod(int(s), 3600)
+    # integer tenths, so rounding carries: formatting 119.96 by splitting
+    # int(s) from a rounded fraction yields the impossible "1:60.0", and a
+    # smooth 10 fps clock sweeps through that window at most minute marks
+    tenths = int(round(max(0.0, float(s)) * 10))
+    whole, frac = divmod(tenths, 10)
+    h, rem = divmod(whole, 3600)
     m, sec = divmod(rem, 60)
-    frac = s - int(s)
     if h:
-        return f"{h}:{m:02d}:{sec + frac:04.1f}"
-    return f"{m}:{sec + frac:04.1f}"
+        return f"{h}:{m:02d}:{sec:02d}.{frac}"
+    return f"{m}:{sec:02d}.{frac}"
 
 
 def parse_time(text):
@@ -97,6 +100,8 @@ class App:
         self.relay_url = "ws://localhost:8765"
         self._osd_win = None         # Tk-drawn volume OSD over the video
         self._osd_after = None
+        self._clock = None           # last player sample the clock shows
+        self._clock_shown = None     # (player id, seconds) last painted
         self._fs_saved = None        # frame style + rect to restore from
 
         root.title("StreamSync")
@@ -121,13 +126,14 @@ class App:
         self._install_hotkeys()
 
         threading.Thread(target=self._auto_loop, daemon=True).start()
+        threading.Thread(target=self._clock_sampler, daemon=True).start()
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         # frozen builds have no console: Tk callback errors would vanish
         root.report_callback_exception = \
             lambda *exc: log.error("Tk callback error", exc_info=exc)
         root.after(80, self._poll_queue)
-        root.after(700, self._tick_time)
+        root.after(100, self._render_time)
         log.info("app up: video=%r method=%s auto=%s",
                  self.video_path, self.method_var.get(), self.auto_enabled)
 
@@ -343,7 +349,10 @@ class App:
         ttk.Button(row, text="Reset", width=6,
                    command=self._reset_offset).pack(side="left", padx=(4, 0))
 
-        self.time_lbl = ttk.Label(outer, text="-:-- / -:--")
+        # monospace: with a proportional font the line shifts sideways as
+        # digit widths change, which reads as jitter even at perfect cadence
+        self.time_lbl = ttk.Label(outer, text="-:-- / -:--",
+                                  font=("Consolas", 10))
         self.time_lbl.grid(row=4, column=0, sticky="w", pady=(8, 0))
         self.status_lbl = ttk.Label(outer, text="Pick a video file to begin.",
                                     wraplength=620, foreground="#245")
@@ -444,6 +453,7 @@ class App:
                 self.player_var.set("embedded")
                 return
             self.embedded.pause()
+            self._clock_set_playing(False)
             self.video_win.withdraw()
             self.active_player = self.external
             if self.video_path:
@@ -568,6 +578,7 @@ class App:
             return
         if (mp.get_time() or 0) >= target_ms - 2_000:
             mp.set_pause(1)
+            self._clock_set_playing(False)
             self._set_status(f"{Path(self.video_path).name} ready - paused at "
                              f"{fmt_time(target_ms / 1000.0)}. Sync or Resync "
                              "to line it up with the stream.")
@@ -924,6 +935,7 @@ class App:
         except Exception:
             was_playing = False
         self.player.toggle_pause()
+        self._clock_set_playing(not was_playing)
         # pausing brings the streamer's window up; resuming brings the film back
         self._stream_swap(was_playing)
 
@@ -1331,11 +1343,15 @@ class App:
         try:
             while True:
                 kind, *payload = self.q.get_nowait()
-                if kind in ("preview", "devices", "show"):
+                if kind == "clock":
+                    pass          # one per second forever; not worth logging
+                elif kind in ("preview", "devices", "show"):
                     log.debug("queue: %s", kind)      # payloads too bulky
                 else:
                     log.debug("queue: %s %r", kind, payload)
-                if kind == "status":
+                if kind == "clock":
+                    self._update_clock(*payload)
+                elif kind == "status":
                     self._set_status(payload[0])
                 elif kind == "session":
                     self.session_lbl.config(text=payload[0])
@@ -1456,16 +1472,75 @@ class App:
     def _set_status(self, text):
         self.status_lbl.config(text=text)
 
-    def _tick_time(self):
-        try:
-            t, n = self.player.time(), self.player.length()
-            state = "playing" if self.player.is_playing() else "paused"
-            if t is not None:
-                total = f" / {fmt_time(n)}" if n else ""
-                self.time_lbl.config(text=f"{fmt_time(t)}{total}  ({state})")
-        except Exception:
-            pass
-        self.root.after(700, self._tick_time)
+    # ------------------------------------------------------------- clock
+    #
+    # The old clock polled the player three times per 700ms tick ON the Tk
+    # thread - in external mode that is three HTTP round trips, each able
+    # to stall the UI - and painted tenths of a second at a cadence that
+    # steps the tenths digit by ~0.7. Chunky, and irregular by design.
+    # Now: a worker samples the player once a second, and the Tk thread
+    # extrapolates between samples with perf_counter, painting at 10 fps.
+
+    def _clock_sampler(self):
+        while not self._closing:
+            player = self.active_player
+            try:
+                t, n, playing = player.snapshot()
+            except Exception:
+                t, n, playing = None, None, False
+            self.q.put(("clock", t, n, playing, id(player),
+                        time.perf_counter()))
+            time.sleep(1.0)
+
+    def _clock_set_playing(self, playing):
+        """Tk-thread hint that playback state just changed.
+
+        The sampler confirms within a second, but until then a paused
+        player would keep 'ticking' on extrapolation and then visibly
+        rewind when the real sample lands. Pauses the app cannot see
+        coming (external VLC's own UI, the auto loop's thread) still get
+        one small correction at the next sample - that one is honest.
+        """
+        c = self._clock
+        if c is None or c["playing"] == playing:
+            return
+        t = c["t"]
+        if c["playing"]:
+            t += time.perf_counter() - c["perf"]   # freeze at the estimate
+        self._clock = {**c, "t": t, "perf": time.perf_counter(),
+                       "playing": playing}
+
+    def _update_clock(self, t, n, playing, pid, perf):
+        if t is None:
+            self._clock = None
+            return
+        c = self._clock
+        if c and playing and c["playing"] and c["pid"] == pid:
+            expected = c["t"] + (perf - c["perf"])
+            err = t - expected
+            if abs(err) <= 0.75:
+                # sampling jitter, not a seek: absorb it instead of jumping
+                t = expected + 0.25 * err
+        self._clock = {"t": t, "perf": perf, "len": n,
+                       "playing": playing, "pid": pid}
+
+    def _render_time(self):
+        c = self._clock
+        if c is not None:
+            t = c["t"]
+            if c["playing"]:
+                t += time.perf_counter() - c["perf"]
+                last = self._clock_shown
+                if (last is not None and last[0] == c["pid"]
+                        and t < last[1] and last[1] - t < 0.5):
+                    t = last[1]     # never tick backwards over jitter
+                self._clock_shown = (c["pid"], t)
+            else:
+                self._clock_shown = None
+            total = f" / {fmt_time(c['len'])}" if c["len"] else ""
+            state = "playing" if c["playing"] else "paused"
+            self.time_lbl.config(text=f"{fmt_time(t)}{total}  ({state})")
+        self.root.after(100, self._render_time)
 
     def _save_config(self):
         try:
