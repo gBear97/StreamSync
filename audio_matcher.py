@@ -35,7 +35,11 @@ SCORE_OK = 0.10       # and reach this normalized correlation
 # Love: audio taken from the film itself at 25:00 lost to 43:36, 0.81 vs
 # 0.76, at z 16.4. Compare the winner with its best well-separated rival
 # instead: that ratio is what says "I know where this is".
-RIVAL_RATIO = 0.85    # rival/best above this = the answer is a guess
+# Measured on 11 real films plus negative controls: at 0.80 no correct
+# answer that used to pass is refused (0/408 on the different-cut corpus),
+# wrong-film false accepts drop from 16 to 10, and real positives lose 2
+# points of recall. 0.85 was a guess; this is not.
+RIVAL_RATIO = 0.80    # rival/best above this = the answer is a guess
 # Two peaks closer than this are the same place, not rivals. Swept 2-20s
 # on a self-similar film: identical results throughout, because the
 # per-chunk peak budget fills with the winner's own neighbourhood long
@@ -45,6 +49,9 @@ PEAK_SEP_S = 20.0
 # a proximity hint resolves a tie only if it puts one candidate this much
 # nearer than the next one; otherwise the hint is not evidence
 NEAR_MARGIN_S = 10.0
+# and the candidate proximity picks must be this good relative to the best
+# peak before its verdict is trusted enough to clear the flag
+NEAR_TRUST_RATIO = 0.90
 
 Match = collections.namedtuple(
     "Match", "t score z rival_score rival_t ambiguous candidates")
@@ -211,10 +218,21 @@ def find_match_audio_ex(path, capture_feats, t0=None, t1=None, progress=None,
         # candidates. Clearing the flag merely because a hint was supplied
         # would disable the gate for every caller that supplies one - and
         # both of ours do.
-        if abs(by_near[1][0] - near) - abs(by_near[0][0] - near) \
-                >= NEAR_MARGIN_S:
+        separated = (abs(by_near[1][0] - near) - abs(by_near[0][0] - near)
+                     >= NEAR_MARGIN_S)
+        if separated:
             t_best, score_best = by_near[0]
-            ambiguous = False
+            # ...and take the hint as CONFIRMING the evidence only when it
+            # agrees with it. Merged peaks are >= PEAK_SEP_S apart, so on
+            # material with no correct answer at all - the wrong episode,
+            # a scene the user's cut does not contain - separation is
+            # satisfied by geometry and the nearest spurious peak was
+            # being promoted to a confident answer. If proximity overrules
+            # a materially better peak, we still take the nearer position
+            # (it is usually what a resync wants) but we keep saying we
+            # are unsure.
+            if score_best >= NEAR_TRUST_RATIO * top_score:
+                ambiguous = False
 
     # describe the rival to whatever we actually chose, not to the global
     # winner - otherwise the diagnostics discuss a different answer

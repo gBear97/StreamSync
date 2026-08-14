@@ -487,12 +487,17 @@ class HostSession:
                 feats = audio_matcher.prep_capture(samples, sr)
                 lo = None if last_pos is None else last_pos - 60
                 hi = None if last_pos is None else last_pos + 90
-                t, score, z = audio_matcher.find_match_audio(
-                    self.video_path, feats, lo, hi)
-                if (z >= audio_matcher.Z_OK
-                        and score >= audio_matcher.SCORE_OK):
-                    self._anchor = (t, utc_start, True)
-                    last_pos = t
+                # the flag matters most here: the first pass scans the
+                # whole film, which is exactly the geometry that produces
+                # twins, and an anchor that lands on one drags every
+                # viewer with it
+                m = audio_matcher.find_match_audio_ex(
+                    self.video_path, feats, lo, hi, near=last_pos)
+                if (m.z >= audio_matcher.Z_OK
+                        and m.score >= audio_matcher.SCORE_OK
+                        and not m.ambiguous):
+                    self._anchor = (m.t, utc_start, True)
+                    last_pos = m.t
                 elif self._anchor is not None:
                     pos, utc, _ = self._anchor
                     self._anchor = (pos, utc, False)   # film likely paused

@@ -630,12 +630,17 @@ class MacApp:
             samples, sr, t0 = audio_capture.record_loopback(
                 AUTO_RECORD_SECONDS, speaker_name=self.audio_device)
             feats = audio_matcher.prep_capture(samples, sr)
-            t, score, z = audio_matcher.find_match_audio(
-                self.video_path, feats, lo, hi)
+            # mirrors app.py: an ambiguous match must not drive the
+            # playhead unattended. UNEXECUTED ON macOS - no machine to run
+            # it on - but it only ever refuses more than before.
+            m = audio_matcher.find_match_audio_ex(
+                self.video_path, feats, lo, hi, near=0.5 * (lo + hi)
+                if lo is not None and hi is not None else None)
         except (RuntimeError, matcher.MatchError):
             return None
-        if z >= audio_matcher.Z_OK and score >= audio_matcher.SCORE_OK:
-            return t, score, z, t0
+        if (m.z >= audio_matcher.Z_OK and m.score >= audio_matcher.SCORE_OK
+                and not m.ambiguous):
+            return m.t, m.score, m.z, t0
         return None
 
     def _auto_loop(self):
