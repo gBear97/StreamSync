@@ -10,7 +10,9 @@ BlackHole like a normal microphone. All the same functions apply; a
 "speaker name" on macOS is really an input-device name.
 """
 
+import queue
 import sys
+import threading
 import time
 
 import numpy as np
@@ -114,6 +116,105 @@ def record_mic(seconds, mic_name=None, sr=CAPTURE_SR):
     return data, sr, t0
 
 
+def _pick_loopback_mic(sc, speaker_name):
+    if IS_MAC:
+        return _pick_mac_source(sc, speaker_name), None
+    spk = None
+    if speaker_name:
+        for s in sc.all_speakers():
+            if speaker_name.lower() in s.name.lower():
+                spk = s
+                break
+    if spk is None:
+        spk = sc.default_speaker()
+    return sc.get_microphone(spk.name, include_loopback=True), spk.name
+
+
+class Listener:
+    """A continuously-pumped loopback stream.
+
+    A dedicated reader thread drains the device in quarter-second chunks
+    so slow consumers never stall the capture. That is not a nicety:
+    WASAPI's endpoint buffer is ~10 ms and overflow DROPS audio silently,
+    so a consumer that paused to run a multi-second match would lose that
+    much audio - and with frame-counted timestamps every loss would bias
+    every later block's stamp, feeding phantom drift into the sync math
+    that a double-confirm cannot catch (the bias is common-mode).
+
+    Blocks queue up bounded (~30 s, oldest dropped WITH their stamps, so
+    a huge stall costs coverage, never correctness). The device is opened
+    inside the pump thread under try/finally, so a failed open or priming
+    read cannot leak a started capture stream.
+    """
+
+    CHUNK_S = 0.25
+
+    def __init__(self, speaker_name=None, sr=CAPTURE_SR):
+        self.sr = sr
+        self._speaker = speaker_name
+        self._q = queue.Queue()
+        self._stop = threading.Event()
+        self._err = None
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        import soundcard as sc
+        rec = None
+        try:
+            mic, _ = _pick_loopback_mic(sc, self._speaker)
+            rec = mic.recorder(samplerate=self.sr)
+            rec.__enter__()
+            rec.record(numframes=int(PRIME_S * self.sr))
+            t0 = time.perf_counter()
+            frames = 0
+            n = int(self.CHUNK_S * self.sr)
+            while not self._stop.is_set():
+                data = rec.record(numframes=n)
+                t_start = t0 + frames / self.sr
+                frames += n
+                lag = time.perf_counter() - (t0 + frames / self.sr)
+                if -0.1 < lag < 0.1:  # provably live: ease clock drift out
+                    t0 += lag * 0.1
+                if data.ndim > 1:
+                    data = data.mean(axis=1)
+                self._q.put((data.astype(np.float32), t_start))
+                while self._q.qsize() > int(30.0 / self.CHUNK_S):
+                    try:
+                        self._q.get_nowait()
+                    except queue.Empty:
+                        break
+        except Exception as e:
+            self._err = e
+        finally:
+            if rec is not None:
+                try:
+                    rec.__exit__(None, None, None)
+                except Exception:
+                    pass
+
+    def read(self, seconds):
+        """(mono float32 block, perf_counter at the block's REAL start).
+
+        Assembles pumped chunks; raises RuntimeError if the pump died or
+        nothing arrives for five seconds.
+        """
+        need = int(seconds * self.sr)
+        got, blocks = 0, []
+        while got < need:
+            if self._err is not None:
+                raise RuntimeError(f"loopback capture failed: {self._err}")
+            try:
+                b, t = self._q.get(timeout=5.0)
+            except queue.Empty:
+                raise RuntimeError("loopback capture stalled")
+            blocks.append((b, t))
+            got += len(b)
+        return np.concatenate([b for b, _ in blocks]), blocks[0][1]
+
+    def close(self):
+        self._stop.set()   # the pump closes the device on its way out
+
+
 def record_loopback(seconds, speaker_name=None, sr=CAPTURE_SR, cancel=None):
     """Record `seconds` of the stream's audio.
 
@@ -121,8 +222,8 @@ def record_loopback(seconds, speaker_name=None, sr=CAPTURE_SR, cancel=None):
     `cancel` (callable -> bool) aborts between blocks with a RuntimeError.
     """
     import soundcard as sc
+    mic, spk_name = _pick_loopback_mic(sc, speaker_name)
     if IS_MAC:
-        mic = _pick_mac_source(sc, speaker_name)
         silence_hint = (
             f"Captured only silence from '{mic.name}'. On macOS the stream "
             "must be routed through BlackHole: install BlackHole, create a "
@@ -130,17 +231,8 @@ def record_loopback(seconds, speaker_name=None, sr=CAPTURE_SR, cancel=None):
             "Setup, select it as the system output, and pick BlackHole "
             "under 'Listen on'.")
     else:
-        spk = None
-        if speaker_name:
-            for s in sc.all_speakers():
-                if speaker_name.lower() in s.name.lower():
-                    spk = s
-                    break
-        if spk is None:
-            spk = sc.default_speaker()
-        mic = sc.get_microphone(spk.name, include_loopback=True)
         silence_hint = (
-            f"Captured only silence from '{spk.name}' - is the stream "
+            f"Captured only silence from '{spk_name}' - is the stream "
             "audible on that device?")
 
     data, t0 = _timed_record(mic, seconds, sr, cancel=cancel)

@@ -40,7 +40,6 @@ log = logging.getLogger("streamsync.app")
 BURST_FRAMES = 4
 BURST_SPACING = 1 / 3      # seconds between captured frames (aligns with 12 fps scan)
 AUDIO_SYNC_SECONDS = 6.0   # manual sync recording length
-AUTO_RECORD_SECONDS = 4.0  # auto-mode recording length
 PROBE_MAX_AHEAD = 600.0    # cap the growing resume-search window (_auto_loop)
 LOW_CONFIDENCE = 0.55      # video-match warning threshold
 
@@ -91,6 +90,7 @@ class App:
         self._osd_after = None
         self._clock = None           # last player sample the clock shows
         self._clock_shown = None     # (player id, seconds) last painted
+        self._film_fps = None        # probed per file; frame nudge unit
         self._fs_saved = None        # frame style + rect to restore from
 
         root.title("StreamSync")
@@ -321,9 +321,13 @@ class App:
         row = ttk.Frame(play)
         row.pack(fill="x", pady=(8, 0))
         ttk.Label(row, text="Nudge:").pack(side="left")
-        for d in (-2.0, -0.5, -0.1, 0.1, 0.5, 2.0):
-            ttk.Button(row, text=f"{d:+g}s", width=6,
-                       command=lambda d=d: self._nudge(d)).pack(side="left", padx=2)
+        # one frame is the precision unit; big drift is what Resync is for
+        ttk.Button(row, text="-1 Frame", width=9,
+                   command=lambda: self._nudge(-self._frame_s())
+                   ).pack(side="left", padx=(6, 0))
+        ttk.Button(row, text="+1 Frame", width=9,
+                   command=lambda: self._nudge(self._frame_s())
+                   ).pack(side="left", padx=(4, 0))
         self.offset_lbl = ttk.Label(row, text="offset: +0.00s")
         self.offset_lbl.pack(side="left", padx=(10, 0))
         ttk.Button(row, text="Reset", width=6,
@@ -475,6 +479,9 @@ class App:
         if not path:
             return
         self.video_path = path
+        self._film_fps = None
+        threading.Thread(target=self._probe_fps_worker, args=(path,),
+                         daemon=True).start()
         log.info("file chosen: %r (player=%s)", path,
                  "embedded" if self.player is self.embedded else "external")
         self.file_lbl.config(text=Path(path).name)
@@ -814,125 +821,213 @@ class App:
         return (players.CLOCK_OUTPUT_LAG
                 if self.active_player is self.embedded else 0.0)
 
-    def _auto_probe(self, lo, hi):
-        """One auto-mode listen+match attempt.
+    def _auto_probe(self, ring, lo, hi):
+        """Match `ring` (list of (block, t0) pairs) inside [lo, hi].
 
-        Returns (t, score, z, t0_perf) on a confident match, else None.
-        Silence counts as no-match: a silent stream is a paused stream as
-        far as syncing is concerned.
+        Returns (t, score, z, ring_t0) on a gate-passing hit, else None.
+        `t` is where the stream was at the RING's start, so seeks pair it
+        with ring_t0 exactly like a one-shot capture's t0. Silence counts
+        as no-match: a silent stream is a paused stream as far as syncing
+        is concerned.
         """
         try:
-            samples, sr, t0 = audio_capture.record_loopback(
-                AUTO_RECORD_SECONDS, speaker_name=self.audio_device)
-            feats = audio_matcher.prep_capture(samples, sr)
+            samples = np.concatenate([b for b, _ in ring])
+            feats = audio_matcher.prep_capture(samples, audio_capture.CAPTURE_SR)
             t, score, z = audio_matcher.find_match_audio(
                 self.video_path, feats, lo, hi)
-        except (RuntimeError, matcher.MatchError):
+        except (RuntimeError, ValueError, matcher.MatchError):
             return None
         if z >= audio_matcher.Z_OK and score >= audio_matcher.SCORE_OK:
-            return t, score, z, t0
+            return t, score, z, ring[0][1]
         return None
 
     def _auto_loop(self):
+        """Live follow: a held-open listener, an energy tripwire, and
+        tight-window match confirms.
+
+        The stream's audio is read in one-second blocks into a short ring.
+        Normal mode confirms the match on a cadence AND immediately when
+        the block energy collapses below the rolling baseline - the film
+        audio vanishing is what a pause sounds like - so a real pause is
+        caught in a couple of seconds instead of an interval. A false
+        pause self-heals: probe mode keeps listening at the same live
+        cadence and resyncs the moment the film's audio reappears.
+        Corrections require two consecutive agreeing drift readings; a
+        single reading can be one bad match.
+        """
+        listener = None
+        listen_dev = None
         mode = "normal"
-        failures = 0
+        ring = []            # [(block, t0_perf)] newest last, ~2.5s total
+        ring_len = 0.0
+        baseline = None      # EMA of block RMS while matching confirms
+        tripwire = True      # energy trigger armed; a miss disarms it so a
+                             # long quiet stretch cannot storm probes at 1 Hz
+        pending_drift = None
+        misses = 0
         pause_point = None
         paused_at = 0.0
-        next_at = 0.0
+        last_confirm = 0.0
+        BLOCK_S = 1.0
+        RING_S = 2.5
+
+        def close_listener():
+            nonlocal listener, ring, ring_len, baseline
+            if listener is not None:
+                listener.close()
+            listener = None
+            ring, ring_len, baseline = [], 0.0, None
+
         while not self._closing:
-            time.sleep(1.0)
             if (not self.auto_enabled or self.busy or not self.video_path
                     or self._session_running()):  # sessions own the playhead
-                mode, failures = "normal", 0
+                mode, misses, pending_drift = "normal", 0, None
+                close_listener()
+                time.sleep(1.0)
                 continue
-            if time.monotonic() < next_at:
+            if listener is None or listen_dev != self.audio_device:
+                try:
+                    close_listener()
+                    listener = audio_capture.Listener(
+                        self.audio_device or None)
+                    listen_dev = self.audio_device
+                except Exception as e:
+                    self.q.put(("status", f"Auto listener failed: {e}"))
+                    listener = None
+                    time.sleep(5.0)
+                    continue
+            try:
+                block, t0_blk = listener.read(BLOCK_S)
+            except Exception as e:
+                self.q.put(("status", f"Auto listener failed: {e}"))
+                close_listener()
+                time.sleep(3.0)
+                continue
+            ring.append((block, t0_blk))
+            ring_len += BLOCK_S
+            while ring_len - BLOCK_S >= RING_S:
+                ring.pop(0)
+                ring_len -= BLOCK_S
+            rms = float(np.sqrt(np.mean(block * block)))
+            if ring_len < RING_S:
                 continue
             player = self.active_player
             try:
                 if mode == "normal":
+                    energy_drop = (baseline is not None and tripwire
+                                   and rms < 0.35 * baseline
+                                   and time.monotonic() - last_confirm >= 2.0)
+                    cadence = min(max(float(self.auto_interval), 4.0), 30.0)
+                    if pending_drift is not None:
+                        cadence = 2.5     # confirm a suspected drift fast
+                    due = time.monotonic() - last_confirm >= cadence
+                    if not (energy_drop or due):
+                        continue
                     t_ref = player.time() if player.is_playing() else None
                     t_ref_at = time.perf_counter()
                     if t_ref is None:
-                        next_at = time.monotonic() + 5
+                        last_confirm = time.monotonic()
                         continue
-                    hit = self._auto_probe(t_ref - 45, t_ref + 50)
+                    c = t_ref - self.offset   # expected STREAM position
+                    hit = self._auto_probe(ring, c - 30.0, c + 30.0)
+                    last_confirm = time.monotonic()
                     if hit:
                         t, score, z, t0 = hit
-                        failures = 0
-                        # `t` is where the stream was when the capture
-                        # STARTED, so measure the film at that same
-                        # instant: t_ref predates it by however long the
-                        # capture device took to open, and the probe runs
-                        # for seconds after that.
+                        misses = 0
+                        tripwire = True
+                        baseline = (rms if baseline is None
+                                    else 0.9 * baseline + 0.1 * rms)
+                        # measure the film at the RING's start: t_ref
+                        # predates it and the match ran for a while after
                         now_pos = player.time()
                         moved = None if now_pos is None else now_pos - t_ref
                         if (now_pos is None or not player.is_playing()
                                 or abs(moved - (time.perf_counter() - t_ref_at))
                                 > 0.5):
-                            # Paused, seeked or stalled while we listened -
-                            # winding the clock back from now would invent a
-                            # position. Say nothing and look again shortly.
-                            next_at = time.monotonic() + 5
+                            # paused, seeked or stalled while we listened -
+                            # winding the clock back would invent a position
+                            pending_drift = None
                             continue
                         film_at_t0 = now_pos - (time.perf_counter() - t0)
-                        # Where the film SHOULD be: the stream's position
-                        # plus the offset the user nudged in, which every
-                        # sync_seek applies. Ignoring it would read a
-                        # deliberate offset as drift and undo it on a loop.
+                        # the stream's position plus the offset the user
+                        # nudged in, which every sync_seek applies -
+                        # ignoring it reads a deliberate offset as drift
                         drift = ((t + self.offset)
                                  - (film_at_t0 + self._clock_lag()))
-                        if abs(drift) > 0.35 and not self.busy \
+                        if abs(drift) <= 0.35:
+                            pending_drift = None
+                        elif pending_drift is None:
+                            pending_drift = drift   # once could be a fluke
+                        elif abs(drift - pending_drift) < 0.4 \
+                                and not self.busy \
                                 and not self._session_running():
                             player.sync_seek(t, t0, self.offset)
                             self.q.put(("status",
                                         f"Auto: corrected {drift:+.2f}s drift "
-                                        f"(score {score:.2f}, z {z:.0f})."))
-                        next_at = time.monotonic() + self.auto_interval
+                                        f"(score {score:.2f}, z {z:.0f}, "
+                                        "confirmed twice)."))
+                            pending_drift = None
+                        else:
+                            pending_drift = drift
                     else:
-                        failures += 1
-                        if self.auto_follow and failures >= 2:
+                        misses += 1
+                        pending_drift = None
+                        tripwire = False   # re-arms on the next hit
+                        # a miss plus the energy collapse IS the pause
+                        # signature; without the energy cue ask twice
+                        if self.auto_follow and (
+                                misses >= 2 or (misses >= 1 and energy_drop)):
                             player.pause()
-                            pause_point = t_ref
+                            pause_point = c
                             paused_at = time.monotonic()
                             mode = "probe"
                             self.q.put(("swap", True))
                             self.q.put(("status",
                                         "Auto: film audio not found on the stream "
                                         "- assuming pause. Watching for resume..."))
-                            next_at = time.monotonic() + 8
-                        else:
-                            next_at = time.monotonic() + 10
-                else:  # probe: paused, waiting for the stream to resume
-                    # A real pause resumes near pause_point, so look there
-                    # first - but the "pause" may have been a false alarm
-                    # (quiet dialog under loud commentary) and the stream
-                    # kept running. Grow the forward edge with elapsed time
-                    # so it keeps up with a stream that never stopped.
+                else:  # probe: film paused, live watch for the resume
+                    if time.monotonic() - last_confirm < 2.0:
+                        continue
+                    # a real pause resumes near pause_point; a FALSE pause
+                    # means the stream never stopped, so the forward edge
+                    # grows with elapsed time to keep up with it - that is
+                    # also what makes a wrong pause heal itself
                     ahead = min(time.monotonic() - paused_at, PROBE_MAX_AHEAD)
-                    hit = self._auto_probe(pause_point - 25,
-                                           pause_point + 40 + ahead)
+                    hit = self._auto_probe(ring, pause_point - 25.0,
+                                           pause_point + 40.0 + ahead)
+                    last_confirm = time.monotonic()
                     if hit:
                         t, score, z, t0 = hit
                         if self.busy or self._session_running():
-                            # Someone else is driving the playhead. Stay in
-                            # probe mode and try again shortly: dropping to
-                            # normal now would leave the film paused, and
-                            # normal mode ignores a film that is not
-                            # playing - the loop would idle for good.
-                            next_at = time.monotonic() + 5
+                            # someone else is driving the playhead; leaving
+                            # probe mode now would strand a paused film
                             continue
                         player.sync_seek(t, t0, self.offset)
                         self.q.put(("swap", False))
                         self.q.put(("status", "Auto: stream resumed - resynced."))
-                        mode, failures = "normal", 0
-                        next_at = time.monotonic() + self.auto_interval
-                    else:
-                        next_at = time.monotonic() + 8
+                        mode, misses, baseline = "normal", 0, None
             except Exception as e:
                 self.q.put(("status", f"Auto-resync check failed: {e}"))
-                next_at = time.monotonic() + max(self.auto_interval, 20)
+                log.warning("auto loop error", exc_info=True)
+                time.sleep(max(self.auto_interval, 10))
+        close_listener()
 
     # ------------------------------------------------------------- playback
+
+    def _frame_s(self):
+        """One frame of the loaded film in seconds (23.976 until probed)."""
+        return 1.0 / (self._film_fps or 23.976)
+
+    def _probe_fps_worker(self, path):
+        try:
+            fps = matcher.probe_fps(path)
+        except Exception:
+            fps = None
+        if path != self.video_path:
+            return   # a newer film was chosen while this probe ran
+        self._film_fps = fps
+        log.info("film fps: %s (frame = %.1f ms)", fps,
+                 1000.0 / (fps or 23.976))
 
     def _nudge(self, delta):
         self.player.nudge(delta)
@@ -1467,9 +1562,9 @@ class App:
         elif name == "pause":
             self._toggle_pause()
         elif name == "back":
-            self._nudge(-0.1)
+            self._nudge(-self._frame_s())
         elif name == "fwd":
-            self._nudge(0.1)
+            self._nudge(self._frame_s())
 
     def _install_hotkeys(self):
         try:
@@ -1481,7 +1576,7 @@ class App:
             keyboard.add_hotkey("ctrl+alt+right", lambda: self.q.put(("hotkey", "fwd")))
             self.hotkey_lbl.config(
                 text="Global hotkeys: Ctrl+Alt+S sync | Ctrl+Alt+R resync | "
-                     "Ctrl+Alt+P pause | Ctrl+Alt+Left/Right nudge 0.1s")
+                     "Ctrl+Alt+P pause | Ctrl+Alt+Left/Right nudge 1 frame")
         except Exception:
             self.hotkey_lbl.config(text="Global hotkeys unavailable "
                                         "(optional 'keyboard' package not working).")
@@ -1622,6 +1717,8 @@ class App:
             self.video_path = path
             log.info("config auto-load into embedded (window hidden): %r",
                      path)
+            threading.Thread(target=self._probe_fps_worker, args=(path,),
+                             daemon=True).start()
             self.embedded.load(path)
             self.file_lbl.config(text=Path(path).name)
             # picking a file says so; restoring the same file said nothing,

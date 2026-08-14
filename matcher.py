@@ -51,6 +51,29 @@ def probe(path):
     return duration, start
 
 
+_FPS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*fps\b")
+
+
+def probe_fps(path):
+    """The video stream's frame rate, or None if unreadable."""
+    out = subprocess.run(
+        [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-i", path],
+        capture_output=True, text=True, errors="replace",
+        creationflags=_creationflags(),
+    ).stderr
+    for line in out.splitlines():
+        # only the video-stream line: ffmpeg echoes the input path earlier
+        # in stderr, and a "24fps" inside a FILENAME would match first
+        if "Video:" not in line:
+            continue
+        m = _FPS_RE.search(line)
+        if m:
+            fps = float(m.group(1))
+            if 1.0 <= fps <= 240.0:
+                return fps
+    return None
+
+
 def _decode(path, seek_abs, end_abs, keyframes_only=False, fps=None,
             progress=None, label=""):
     """Decode grayscale thumbnails between two absolute source timestamps.
