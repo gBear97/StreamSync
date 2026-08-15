@@ -40,6 +40,14 @@ log = logging.getLogger("streamsync.app")
 BURST_FRAMES = 4
 BURST_SPACING = 1 / 3      # seconds between captured frames (aligns with 12 fps scan)
 AUDIO_SYNC_SECONDS = 6.0   # manual sync recording length
+# Median self-rival ratio above this = warn: the film repeats itself and
+# syncs will be ambiguous. Sits in the middle of the measured gap between
+# the hardest easy film (Harold and Maude, 0.489) and the easiest hard one
+# (Places in the Heart, 0.602) - seven films of ground truth. The campaign
+# quoted 0.60 for its own probe, but reading the self position directly
+# scores higher, so that number no longer sits where it did. A needless
+# warning costs a glance; a missing one costs the sync.
+DIFFICULTY_HARD = 0.55
 VERIFY_S = 6.0             # wrong-film guard: length of the confirming listen
 VERIFY_WIN_S = 45.0        # ...searched this far around the predicted spot
 VERIFY_TOL_S = 3.0         # ...and it must land this close to count
@@ -94,6 +102,8 @@ class App:
         self._clock = None           # last player sample the clock shows
         self._clock_shown = None     # (player id, seconds) last painted
         self._film_fps = None        # probed per file; frame nudge unit
+        self._film_difficulty = None  # median self-rival ratio, per file
+        self._difficulty_cache = {}   # path -> [median, mtime, size]
         self._fs_saved = None        # frame style + rect to restore from
 
         root.title("StreamSync")
@@ -179,6 +189,10 @@ class App:
         self.open_player_btn.pack(side="right")
         self.file_lbl = ttk.Label(row, text="no file selected")
         self.file_lbl.pack(side="left", padx=(8, 0))
+        # set by the background self-similarity pass when a film is likely
+        # to produce ambiguous syncs; empty for distinctive films
+        self.difficulty_lbl = ttk.Label(row, text="", foreground="#b25000")
+        self.difficulty_lbl.pack(side="left", padx=(8, 0))
 
         row = ttk.Frame(setup)
         row.pack(fill="x", pady=(6, 0))
@@ -483,11 +497,10 @@ class App:
             return
         self.video_path = path
         self._film_fps = None
-        threading.Thread(target=self._probe_fps_worker, args=(path,),
-                         daemon=True).start()
         log.info("file chosen: %r (player=%s)", path,
                  "embedded" if self.player is self.embedded else "external")
         self.file_lbl.config(text=Path(path).name)
+        self._start_film_analysis(path)
         if self.player is self.embedded:
             try:
                 self.embedded.load(path)
@@ -1114,6 +1127,68 @@ class App:
         log.info("film fps: %s (frame = %.1f ms)", fps,
                  1000.0 / (fps or 23.976))
 
+    def _start_film_analysis(self, path):
+        """Per-film background analysis: fps for the frame nudge, and a
+        self-similarity pass that predicts whether syncs will be
+        ambiguous (median self-rival ratio; Spearman 0.81 against
+        measured failure rates across 11 real films). Cached by
+        path+mtime+size so a film is only ever analyzed once."""
+        self._film_difficulty = None
+        self.difficulty_lbl.config(text="")
+        threading.Thread(target=self._probe_fps_worker, args=(path,),
+                         daemon=True).start()
+        cached = self._difficulty_cache.get(path)
+        try:
+            st = Path(path).stat()
+            fresh = (isinstance(cached, list) and len(cached) == 3
+                     and cached[1] == int(st.st_mtime)
+                     and cached[2] == st.st_size)
+        except OSError:
+            fresh = False
+        if fresh:
+            self._apply_difficulty(path, cached[0], from_cache=True)
+        else:
+            threading.Thread(target=self._difficulty_worker, args=(path,),
+                             daemon=True).start()
+
+    def _difficulty_worker(self, path):
+        try:
+            res = audio_matcher.self_similarity(
+                path,
+                cancel=lambda: self._closing or path != self.video_path)
+        except Exception as e:
+            log.info("difficulty analysis skipped: %s", e)
+            return
+        # the sample size travels with the number: a shrinking sample was
+        # exactly what made an earlier bias in this statistic invisible
+        log.info("difficulty probes: %d used, %d uncovered",
+                 res.get("n_probes", 0), res.get("n_skipped", 0))
+        self.q.put(("difficulty", path, res["median_ratio"]))
+
+    def _apply_difficulty(self, path, median, from_cache):
+        self._film_difficulty = round(float(median), 3)
+        hard = median > DIFFICULTY_HARD
+        self.difficulty_lbl.config(text="⚠ repeats itself" if hard else "")
+        log.info("film difficulty: median rival ratio %.2f -> %s%s",
+                 median, "HARD" if hard else "easy",
+                 " (cached)" if from_cache else "")
+        if hard:
+            self._set_status(
+                "Heads-up: this film repeats itself - expect ambiguous "
+                "syncs. Prefer the 15s/30s listens, and Resync if the "
+                "position looks wrong.")
+        if not from_cache:
+            try:
+                st = Path(path).stat()
+                self._difficulty_cache[path] = [
+                    self._film_difficulty, int(st.st_mtime), st.st_size]
+                while len(self._difficulty_cache) > 20:
+                    self._difficulty_cache.pop(
+                        next(iter(self._difficulty_cache)))
+                self._save_config()
+            except OSError:
+                pass
+
     def _nudge(self, delta):
         self.player.nudge(delta)
         self.offset += delta
@@ -1619,6 +1694,7 @@ class App:
                         "kind": "audio", "t": round(match_t, 3),
                         "score": round(score, 4), "z": round(z, 2),
                         "listen_s": listen, "player": pname,
+                        "difficulty": self._film_difficulty,
                         "ambiguous": ambiguous,
                         "rival_t": None if rival_t is None else round(rival_t, 1),
                         "rival_score": round(rival_score, 4)}
@@ -1704,6 +1780,11 @@ class App:
                         self._set_status(
                             "Synced; couldn't hear the stream well enough "
                             "to double-check it.")
+                elif kind == "difficulty":
+                    dpath, median = payload
+                    if dpath == self.video_path:
+                        self._apply_difficulty(dpath, median,
+                                               from_cache=False)
                 elif kind == "error":
                     self._set_status(f"Sync failed: {payload[0]}")
                 elif kind == "cancelled":
@@ -1872,6 +1953,7 @@ class App:
                 "swap": self.swap_var.get(),
                 "stream_title": self.stream_title,
                 "relay_url": self.relay_url,
+                "difficulty_cache": self._difficulty_cache,
             }))
         except OSError:
             pass
@@ -1881,19 +1963,22 @@ class App:
             cfg = json.loads(CONFIG_PATH.read_text())
         except (OSError, ValueError):
             return
+        cache = cfg.get("difficulty_cache")
+        if isinstance(cache, dict):
+            self._difficulty_cache = cache
         path = cfg.get("video_path")
         if path and Path(path).is_file():
             self.video_path = path
             log.info("config auto-load into embedded (window hidden): %r",
                      path)
-            threading.Thread(target=self._probe_fps_worker, args=(path,),
-                             daemon=True).start()
             self.embedded.load(path)
             self.file_lbl.config(text=Path(path).name)
             # picking a file says so; restoring the same file said nothing,
             # so "Pick a video file to begin." sat there under a named film
             self._set_status(f"{Path(path).name} loaded from last session. "
                              "Open player to see it, then Sync to the stream.")
+            # after the status: a hard-film warning should win the label
+            self._start_film_analysis(path)
         region = cfg.get("region")
         if region and len(region) == 4:
             self.region = tuple(int(v) for v in region)

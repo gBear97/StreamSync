@@ -244,6 +244,95 @@ def find_match_audio_ex(path, capture_feats, t0=None, t1=None, progress=None,
                  ambiguous=ambiguous, candidates=merged[:5])
 
 
+def self_similarity(path, probes=24, clip_s=6.0, seed=1234, progress=None,
+                    cancel=None):
+    """How much does this film sound like itself somewhere else?
+
+    Takes `probes` random clips from the film's own audio and asks, for
+    each, how well the best OTHER place matches it - the rival ratio.
+    The median across probes predicts measured sync failure per film
+    (Spearman 0.81 over 11 real films): a film whose median rival ratio
+    exceeds ~0.6 produces ambiguous and wrong syncs several times more
+    often than a distinctive one.
+
+    One decode pass over the film; the probes ride along. Returns
+    {"median_ratio", "ratios", "positions", "duration"} or raises
+    MatchError. `cancel` (callable -> bool) aborts between chunks.
+    """
+    progress = progress or (lambda msg: None)
+    duration, start = probe(path)
+    margin = 60.0 + clip_s
+    if duration < 2 * margin + 60.0:
+        raise MatchError("Film too short for a self-similarity pass.")
+    rng = np.random.default_rng(seed)
+    positions = np.sort(rng.uniform(margin, duration - margin, probes))
+
+    clips = []
+    for t in positions:
+        if cancel is not None and cancel():
+            raise MatchError("analysis stopped")
+        clips.append(features(decode_audio(path, start + t, clip_s), SR))
+
+    # every probe is correlated against every chunk in one pass over the
+    # film; overlap follows the clip so chunk boundaries hide nothing
+    cands = [[] for _ in clips]          # per probe: [(t_peak, score)]
+    selfs = [0.0] * len(clips)           # correlation AT each own position
+    overlap = min(max(OVERLAP_S, clip_s + 1.0), 0.5 * CHUNK_S)
+    seg0 = 0.0
+    while seg0 < duration:
+        if cancel is not None and cancel():
+            raise MatchError("analysis stopped")
+        seg1 = min(seg0 + CHUNK_S, duration)
+        if seg1 - seg0 >= 4.0:
+            progress(f"Analyzing {int(seg0) // 60}:{int(seg0) % 60:02d}"
+                     f" - {int(seg1) // 60}:{int(seg1) % 60:02d}...")
+            W = features(decode_audio(path, start + seg0, seg1 - seg0), SR)
+            for i, C in enumerate(clips):
+                try:
+                    scores = _corr_scores(W, C)
+                except MatchError:
+                    continue
+                cands[i].extend(_chunk_peaks(scores, seg0))
+                # Read the probe's own position DIRECTLY - its index is
+                # known exactly. Recovering it from _chunk_peaks instead
+                # would make it compete for a 6-peak budget it can lose
+                # (chunk-wide z-scoring makes a quiet passage correlate
+                # weakly against a loud chunk), and a peak exactly
+                # PEAK_SEP_S away can suppress it and then fail the
+                # strict self test. Those losses are one-sided - every
+                # one would have scored above 1.0 - so dropping them
+                # deflates the median precisely on the self-similar films
+                # this statistic exists to flag.
+                mid = int(round((positions[i] - seg0) / HOP_S))
+                for j in (mid - 1, mid, mid + 1):
+                    if 0 <= j < len(scores):
+                        selfs[i] = max(selfs[i], float(scores[j]))
+        if seg1 >= duration:
+            break
+        seg0 = seg1 - overlap
+
+    ratios, skipped = [], 0
+    for t, plist, self_score in zip(positions, cands, selfs):
+        plist.sort(key=lambda c: -c[1])
+        merged = []
+        for tp, sc in plist:
+            if all(abs(tp - m[0]) >= PEAK_SEP_S for m in merged):
+                merged.append((tp, sc))
+        rival = max((sc for tp, sc in merged
+                     if abs(tp - t) >= PEAK_SEP_S), default=0.0)
+        if self_score <= 0:
+            skipped += 1                 # position never covered by a chunk
+            continue
+        ratios.append(rival / self_score)
+    if not ratios:
+        raise MatchError("Self-similarity pass produced no usable probes.")
+    return {"median_ratio": float(np.median(ratios)),
+            "ratios": [round(r, 4) for r in ratios],
+            "positions": [round(float(t), 1) for t in positions],
+            "n_probes": len(ratios), "n_skipped": skipped,
+            "duration": duration}
+
+
 def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None,
                      cancel=None, near=None):
     """Locate the recording inside `path`'s audio track.
