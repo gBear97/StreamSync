@@ -51,7 +51,36 @@ DIFFICULTY_HARD = 0.55
 VERIFY_S = 6.0             # wrong-film guard: length of the confirming listen
 VERIFY_WIN_S = 45.0        # ...searched this far around the predicted spot
 VERIFY_TOL_S = 3.0         # ...and it must land this close to count
-PROBE_MAX_AHEAD = 600.0    # cap the growing resume-search window (_auto_loop)
+# Live tracker (_auto_loop): a sliding window of the film's own audio is
+# the expectation; every captured second is correlated against it.
+TRK_REF_BACK = 6.0         # expectation window: this far behind the spot...
+TRK_REF_AHEAD = 34.0       # ...to this far ahead (one decode, slides along)
+TRK_LOCK_SCORE = 0.22      # a block correlating this well = still locked
+TRK_LOCK_SLACK = 3.0
+TRK_ACT_SCORE = 0.55       # corrective ACTIONS (seek, resume) need real
+                           # confidence: mismatched-but-loud audio scores
+                           # up to ~0.45 on self-similar films
+TRK_LOST_AFTER = 12        # degraded-with-energy blocks before a bounded
+                           # wide search - a jump past the expectation
+                           # window would otherwise strand the tracker
+TRK_PAUSE_MISSES = 2       # MISSING blocks (in the recent window) = pause
+TRK_MISS_WINDOW = 12       # ...counted over this many recent blocks, so a
+                           # talked-over pause is caught at the breath gaps
+TRK_MISSING_RATIO = 0.25   # a block this far under its EXPECTED energy is
+                           # missing the film, whatever its score says
+TRK_EXP_FLOOR = 0.005      # expected audio quieter than this is silence -
+                           # a faithful silent passage proves nothing
+TRK_RESUME_ENERGY = 0.3    # a resume-counting block must carry at least
+                           # this much of the energy it claims to match
+TRK_MICRO_MIN = 0.15       # absorb drift above this smoothly...
+TRK_MICRO_MAX = 3.0        # ...up to the lock slack: every in-slack
+                           # error must have an owner (a ~2s rebuffer
+                           # would otherwise be held forever as "locked"),
+                           # and beyond the slack the seek paths take over
+TRK_MICRO_COOLDOWN = 8.0
+TRK_RESUME_WIN = 12.0      # resume watch reach around the pause point
+TRK_SKIP_AFTER = 15.0      # nothing there yet -> one bounded wider search
+TRK_SKIP_SPAN = 300.0
 LOW_CONFIDENCE = 0.55      # video-match warning threshold
 
 
@@ -270,18 +299,21 @@ class App:
         row = ttk.Frame(sync)
         row.pack(fill="x", pady=(8, 0))
         self.auto_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row, text="Auto re-sync (audio) every",
+        ttk.Checkbutton(row, text="Auto re-sync (live tracking)",
                         variable=self.auto_var,
                         command=self._on_auto_toggle).pack(side="left")
+        # the live tracker made the interval obsolete (it listens
+        # continuously); the var stays for config compatibility
         self.interval_var = tk.IntVar(value=30)
-        sp = ttk.Spinbox(row, from_=10, to=300, increment=5, width=5,
-                         textvariable=self.interval_var, command=self._on_auto_toggle)
-        sp.pack(side="left", padx=(4, 0))
-        ttk.Label(row, text="s").pack(side="left", padx=(2, 0))
         self.follow_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row, text="follow stream pauses",
-                        variable=self.follow_var,
-                        command=self._on_auto_toggle).pack(side="left", padx=(12, 0))
+        self.follow_chk = ttk.Checkbutton(row, text="follow stream pauses",
+                                          variable=self.follow_var,
+                                          command=self._on_auto_toggle)
+        self.follow_chk.pack(side="left", padx=(12, 0))
+        # follow does nothing without the tracker armed - SHOW that,
+        # rather than letting a checked box silently do nothing (which is
+        # exactly how follow-pauses "stopped working" in the field)
+        self.follow_chk.state(["disabled"])
 
         row = ttk.Frame(sync)
         row.pack(fill="x", pady=(8, 0))
@@ -352,9 +384,17 @@ class App:
 
         # monospace: with a proportional font the line shifts sideways as
         # digit widths change, which reads as jitter even at perfect cadence
-        self.time_lbl = ttk.Label(outer, text="-:-- / -:--",
+        trow = ttk.Frame(outer)
+        trow.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.time_lbl = ttk.Label(trow, text="-:-- / -:--",
                                   font=("Consolas", 10))
-        self.time_lbl.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.time_lbl.pack(side="left")
+        # the tracker's live lock meter: solid = locked to the stream,
+        # ring = listening through commentary, bars = following a pause
+        self.lock_canvas = tk.Canvas(trow, width=16, height=14,
+                                     highlightthickness=0)
+        self.lock_canvas.pack(side="left", padx=(10, 0))
+        self._draw_lock("off", 0.0)
         self.status_lbl = ttk.Label(outer, text="Pick a video file to begin.",
                                     wraplength=620, foreground="#245")
         self.status_lbl.grid(row=5, column=0, sticky="w", pady=(4, 0))
@@ -894,10 +934,13 @@ class App:
             self.auto_interval = max(10, int(self.interval_var.get()))
         except (ValueError, tk.TclError):
             self.auto_interval = 30
+        # follow does nothing without the tracker: show the dependency
+        self.follow_chk.state(
+            ["!disabled"] if self.auto_enabled else ["disabled"])
         if self.auto_enabled:
-            self._set_status(f"Auto re-sync on: checking every "
-                             f"{self.auto_interval} s"
-                             + (", following pauses." if self.auto_follow else "."))
+            self._set_status("Auto re-sync on: tracking the stream live"
+                             + (", following pauses."
+                                if self.auto_follow else "."))
         self._save_config()
 
     def _clock_lag(self):
@@ -910,75 +953,145 @@ class App:
         return (players.CLOCK_OUTPUT_LAG
                 if self.active_player is self.embedded else 0.0)
 
-    def _auto_probe(self, ring, lo, hi, near):
-        """Match `ring` (list of (block, t0) pairs) inside [lo, hi].
+    def _tracker_ref(self, film_start, center):
+        """Features of what the stream SHOULD play around `center`.
 
-        Returns (t, score, z, ring_t0) on a gate-passing hit, else None.
-        `t` is where the stream was at the RING's start, so seeks pair it
-        with ring_t0 exactly like a one-shot capture's t0. Silence counts
-        as no-match: a silent stream is a paused stream as far as syncing
-        is concerned.
+        The tracker never searches the open film - it asks whether the
+        incoming audio is where the film says it should be. No open
+        search means a self-similar film has nowhere to teleport it, and
+        one small decode slides along with the playhead.
         """
+        lo = max(0.0, center - TRK_REF_BACK)
+        x = audio_matcher.decode_audio(
+            self.video_path, film_start + lo, TRK_REF_BACK + TRK_REF_AHEAD)
+        sr = audio_matcher.SR
+        n = max(1, len(x) // sr)
+        # the film's own loudness, per second: "energy collapsed" is only
+        # meaningful against what was SUPPOSED to be playing right now
+        rms = np.sqrt(np.mean(x[:n * sr].reshape(n, sr) ** 2, axis=1))
+        return lo, audio_matcher.features(x, sr), rms
+
+    @staticmethod
+    def _corr_block(ref_t0, W, C):
+        """(position, score) of one captured block inside reference W."""
+        scores = audio_matcher._corr_scores(W, C)
+        i = int(np.argmax(scores))
+        d = 0.0
+        if 0 < i < len(scores) - 1:
+            a, b, c2 = scores[i - 1], scores[i], scores[i + 1]
+            denom = a - 2 * b + c2
+            if abs(denom) > 1e-12:
+                d = float(np.clip(0.5 * (a - c2) / denom, -1.0, 1.0))
+        return ref_t0 + (i + d) * audio_matcher.HOP_S, float(scores[i])
+
+    def _wide_relock(self, blocks, pause_point):
+        """The streamer resumed somewhere else: a bounded search around
+        the pause point, ambiguity refused - an unattended seek must be
+        sure or stay put."""
         try:
-            samples = np.concatenate([b for b, _ in ring])
-            feats = audio_matcher.prep_capture(samples, audio_capture.CAPTURE_SR)
-            # `near` must be a position we actually believe in, passed by
-            # the caller. Deriving it from the window would drift with the
-            # window: probe mode's forward edge grows for minutes, and its
-            # midpoint slides away from where a resume really happens.
+            samples = np.concatenate([b for b, _ in blocks])
+            feats = audio_matcher.prep_capture(samples,
+                                               audio_capture.CAPTURE_SR)
             m = audio_matcher.find_match_audio_ex(
-                self.video_path, feats, lo, hi, near=near)
+                self.video_path, feats,
+                pause_point - TRK_SKIP_SPAN, pause_point + TRK_SKIP_SPAN,
+                near=pause_point)
         except (RuntimeError, ValueError, matcher.MatchError):
             return None
         if (m.z >= audio_matcher.Z_OK and m.score >= audio_matcher.SCORE_OK
                 and not m.ambiguous):
-            return m.t, m.score, m.z, ring[0][1]
+            return m.t, blocks[0][1]
         return None
 
     def _auto_loop(self):
-        """Live follow: a held-open listener, an energy tripwire, and
-        tight-window match confirms.
+        """The live follower: a phase-locked tracker, not a poller.
 
-        The stream's audio is read in one-second blocks into a short ring.
-        Normal mode confirms the match on a cadence AND immediately when
-        the block energy collapses below the rolling baseline - the film
-        audio vanishing is what a pause sounds like - so a real pause is
-        caught in a couple of seconds instead of an interval. A false
-        pause self-heals: probe mode keeps listening at the same live
-        cadence and resyncs the moment the film's audio reappears.
-        Corrections require two consecutive agreeing drift readings; a
-        single reading can be one bad match.
+        We know exactly what the stream should sound like next - the
+        film's own audio at the position we believe it holds - so a small
+        window of expected features slides along with the playhead and
+        every captured second is correlated against it. The lock score
+        drives the meter; its lag is a continuous drift measurement,
+        absorbed smoothly when small; and losing the lock while the
+        energy signature collapses is a pause, caught within a couple of
+        seconds. A streamer talking over the film degrades the lock but
+        keeps the energy up - that never pauses anything.
         """
         listener = None
         listen_dev = None
-        mode = "normal"
-        ring = []            # [(block, t0_perf)] newest last, ~2.5s total
-        ring_len = 0.0
-        baseline = None      # EMA of block RMS while matching confirms
-        tripwire = True      # energy trigger armed; a miss disarms it so a
-                             # long quiet stretch cannot storm probes at 1 Hz
-        pending_drift = None
-        misses = 0
+        film_meta = None      # (path, container_start)
+        ref = None            # (ref_t0, feats, per-second rms) expectation
+        state = "off"         # off | locked | degraded | paused
+        last_sent = None
+        last_meter = 0.0
+        lock_streak = 0
+        gain = None           # EMA of capture-rms / film-rms while locked:
+                              # the loopback and the decoded file sit on
+                              # different gain chains, so "how loud should
+                              # this second BE" needs a learned scale
+        gain_seed = []        # commentary only ADDS energy, so the seed is
+                              # the MINIMUM over the first few confident
+                              # locks - one talk-polluted sample must not
+                              # calibrate the pause detector
+        prev = None           # previous 1s block: evidence rolls in pairs
+        classes = []          # recent block verdicts, for the pause rule
+        deg_streak = 0        # consecutive not-locked blocks WITH energy
+        resume_cand = None    # (t_found, t0) of the pending resume claim
+        held = None           # (pause_point, path) of a tracker-held pause
+                              # that survived a busy/disarm interruption -
+                              # without it the guard wipes "paused" and the
+                              # film would stay paused forever
+        errs = []             # recent locked-block position errors
+        big_err = None        # pending large-jump double-confirm
+        micro_at = 0.0
         pause_point = None
-        paused_at = 0.0
-        last_confirm = 0.0
-        BLOCK_S = 1.0
-        RING_S = 2.5
+        wide_at = 0.0
+        recent = []           # last few raw blocks, for the wide re-lock
 
         def close_listener():
-            nonlocal listener, ring, ring_len, baseline
+            nonlocal listener, ref, gain, gain_seed, errs, recent, prev
+            nonlocal classes, deg_streak, resume_cand
             if listener is not None:
                 listener.close()
             listener = None
-            ring, ring_len, baseline = [], 0.0, None
+            ref, gain, prev, resume_cand = None, None, None, None
+            errs, recent, classes, gain_seed = [], [], [], []
+            deg_streak = 0
+
+        def meter(new_state, strength=0.0):
+            nonlocal state, last_sent, last_meter
+            state = new_state
+            key = (new_state, round(strength, 1))
+            now = time.monotonic()
+            if key != last_sent or now - last_meter >= 2.0:
+                self.q.put(("lock", new_state, strength))
+                last_sent, last_meter = key, now
 
         while not self._closing:
             if (not self.auto_enabled or self.busy or not self.video_path
                     or self._session_running()):  # sessions own the playhead
-                mode, misses, pending_drift = "normal", 0, None
-                close_listener()
+                if state == "paused":
+                    # remember the pause WE hold: the interruption (a
+                    # manual sync, a toggle, a session) must not orphan
+                    # a film the tracker paused and still owes a resume
+                    held = (pause_point, self.video_path)
+                if state != "off":
+                    meter("off")
+                lock_streak = 0
+                big_err = None
+                close_listener()   # also clears streaks and candidates
                 time.sleep(1.0)
                 continue
+            if held is not None:
+                pp_h, path_h = held
+                held = None
+                if (path_h == self.video_path and self.active_player
+                        and not self.active_player.is_playing()):
+                    # still our pause: go back to watching for the resume
+                    # (if the interruption resumed playback - a successful
+                    # manual sync, the user pressing play - just track)
+                    pause_point = pp_h
+                    wide_at = time.monotonic()
+                    meter("paused")
             if listener is None or listen_dev != self.audio_device:
                 try:
                     close_listener()
@@ -991,119 +1104,291 @@ class App:
                     time.sleep(5.0)
                     continue
             try:
-                block, t0_blk = listener.read(BLOCK_S)
+                block, t0_blk = listener.read(1.0)
             except Exception as e:
                 self.q.put(("status", f"Auto listener failed: {e}"))
                 close_listener()
                 time.sleep(3.0)
                 continue
-            ring.append((block, t0_blk))
-            ring_len += BLOCK_S
-            while ring_len - BLOCK_S >= RING_S:
-                ring.pop(0)
-                ring_len -= BLOCK_S
             rms = float(np.sqrt(np.mean(block * block)))
-            if ring_len < RING_S:
-                continue
+            recent.append((block, t0_blk))
+            del recent[:-3]
             player = self.active_player
             try:
-                if mode == "normal":
-                    energy_drop = (baseline is not None and tripwire
-                                   and rms < 0.35 * baseline
-                                   and time.monotonic() - last_confirm >= 2.0)
-                    cadence = min(max(float(self.auto_interval), 4.0), 30.0)
-                    if pending_drift is not None:
-                        cadence = 2.5     # confirm a suspected drift fast
-                    due = time.monotonic() - last_confirm >= cadence
-                    if not (energy_drop or due):
-                        continue
+                if film_meta is None or film_meta[0] != self.video_path:
+                    film_meta = (self.video_path,
+                                 matcher.probe(self.video_path)[1])
+                    # a NEW film: nothing from the old timeline survives -
+                    # not the pause point (it would be watched inside the
+                    # wrong file), not the gain (different master levels),
+                    # not the verdict history
+                    ref, prev, gain, big_err = None, None, None, None
+                    errs, classes, gain_seed = [], [], []
+                    lock_streak = deg_streak = 0
+                    resume_cand, pause_point, held = None, None, None
+                    if state == "paused":
+                        meter("off")
+                    continue
+                # evidence rolls in overlapping 2s pairs: one second is
+                # too little audio to correlate reliably, and near-silence
+                # correlates as garbage-high (its energy divides to noise)
+                pair, prev = prev, (block, t0_blk)
+                if pair is None:
+                    continue
+                t0_cap = pair[1]
+                try:
+                    C = audio_matcher.prep_capture(
+                        np.concatenate([pair[0], block]),
+                        audio_capture.CAPTURE_SR)
+                except matcher.MatchError:
+                    C = None   # too quiet to featurize - judge by energy
+
+                if state != "paused":
                     t_ref = player.time() if player.is_playing() else None
-                    t_ref_at = time.perf_counter()
                     if t_ref is None:
-                        last_confirm = time.monotonic()
+                        meter("off")
                         continue
-                    c = t_ref - self.offset   # expected STREAM position
-                    hit = self._auto_probe(ring, c - 30.0, c + 30.0, near=c)
-                    last_confirm = time.monotonic()
-                    if hit:
-                        t, score, z, t0 = hit
-                        misses = 0
-                        tripwire = True
-                        baseline = (rms if baseline is None
-                                    else 0.9 * baseline + 0.1 * rms)
-                        # measure the film at the RING's start: t_ref
-                        # predates it and the match ran for a while after
-                        now_pos = player.time()
-                        moved = None if now_pos is None else now_pos - t_ref
-                        if (now_pos is None or not player.is_playing()
-                                or abs(moved - (time.perf_counter() - t_ref_at))
-                                > 0.5):
-                            # paused, seeked or stalled while we listened -
-                            # winding the clock back would invent a position
-                            pending_drift = None
-                            continue
-                        film_at_t0 = now_pos - (time.perf_counter() - t0)
-                        # the stream's position plus the offset the user
-                        # nudged in, which every sync_seek applies -
-                        # ignoring it reads a deliberate offset as drift
-                        drift = ((t + self.offset)
-                                 - (film_at_t0 + self._clock_lag()))
-                        if abs(drift) <= 0.35:
-                            pending_drift = None
-                        elif pending_drift is None:
-                            pending_drift = drift   # once could be a fluke
-                        elif abs(drift - pending_drift) < 0.4 \
-                                and not self.busy \
-                                and not self._session_running():
-                            player.sync_seek(t, t0, self.offset)
-                            self.q.put(("status",
-                                        f"Auto: corrected {drift:+.2f}s drift "
-                                        f"(score {score:.2f}, z {z:.0f}, "
-                                        "confirmed twice)."))
-                            pending_drift = None
-                        else:
-                            pending_drift = drift
+                    # where the film was when this pair STARTED playing,
+                    # then where the STREAM should be for it: the film
+                    # plus the player's clock lag, minus the user's offset
+                    film_at = t_ref - (time.perf_counter() - t0_cap)
+                    expect = film_at + self._clock_lag() - self.offset
+                    if (ref is None or expect < ref[0] + 2.0
+                            or expect + 2.0 > ref[0] + TRK_REF_BACK
+                            + TRK_REF_AHEAD - 4.0):
+                        ref = self._tracker_ref(film_meta[1], expect)
+                        errs = []
+                    if C is not None:
+                        t_found, score = self._corr_block(ref[0], ref[1], C)
+                        err = t_found - expect
                     else:
-                        misses += 1
-                        pending_drift = None
-                        tripwire = False   # re-arms on the next hit
-                        # a miss plus the energy collapse IS the pause
-                        # signature; without the energy cue ask twice
-                        if self.auto_follow and (
-                                misses >= 2 or (misses >= 1 and energy_drop)):
+                        t_found, score, err = None, 0.0, None
+                    # how loud the film ITSELF is in the second just heard
+                    # - judged against the QUIETEST nearby second, because
+                    # the playhead estimate can sit a second off and a
+                    # loud/quiet boundary must not read as missing energy
+                    i_exp = min(max(int(expect + 1.0 - ref[0]), 0),
+                                len(ref[2]) - 1)
+                    exp_ctr = float(ref[2][i_exp])
+                    exp_rms = float(np.min(
+                        ref[2][max(0, i_exp - 1):i_exp + 2]))
+                    # energy is judged BEFORE the correlator gets a vote:
+                    # a block missing the film's energy proves the film is
+                    # not playing, whatever its (garbage) score says
+                    if exp_rms < TRK_EXP_FLOOR:
+                        cls = "quiet"    # film is silent here: no evidence
+                    elif (C is not None and score >= TRK_ACT_SCORE
+                          and abs(err) <= TRK_LOCK_SLACK):
+                        # features are z-scored per band, so a confident
+                        # in-place lock is VOLUME-INVARIANT proof the film
+                        # is playing - it outranks a missing-energy read
+                        # (a streamer ducking the film must not pause it;
+                        # the gain EMA re-learns the new level instead)
+                        cls = "lock"
+                    elif (gain is not None
+                          and rms < TRK_MISSING_RATIO * gain * exp_rms):
+                        cls = "miss"
+                    elif (C is not None and score >= TRK_LOCK_SCORE
+                          and abs(err) <= TRK_LOCK_SLACK):
+                        cls = "lock"
+                    elif C is not None and score >= TRK_ACT_SCORE:
+                        cls = "big"
+                    else:
+                        cls = "deg"      # voice over the film, most likely
+                    classes.append(cls)
+                    del classes[:-TRK_MISS_WINDOW]
+
+                    if cls == "lock":
+                        lock_streak += 1
+                        deg_streak = 0
+                        big_err = None
+                        if (exp_ctr >= TRK_EXP_FLOOR
+                                and score >= TRK_ACT_SCORE):
+                            # calibrate only on CONFIDENT locks, and only
+                            # trust the minimum of the first few samples:
+                            # commentary only ever ADDS energy on top of
+                            # the film, so one talk-polluted ratio would
+                            # inflate the scale and read breath gaps on a
+                            # playing film as a pause. After seeding, the
+                            # clean gain is the LOWER envelope: sink fast,
+                            # rise reluctantly.
+                            g = rms / exp_ctr
+                            if gain is None:
+                                gain_seed.append(g)
+                                if len(gain_seed) >= 5:
+                                    gain = min(gain_seed)
+                            elif g < gain:
+                                gain = 0.7 * gain + 0.3 * g
+                            else:
+                                gain = 0.98 * gain + 0.02 * g
+                        errs.append(err)
+                        del errs[:-5]
+                        meter("locked", score)
+                        now = time.monotonic()
+                        if (len(errs) == 5
+                                and now - micro_at >= TRK_MICRO_COOLDOWN):
+                            med = float(np.median(errs))
+                            if (TRK_MICRO_MIN < abs(med) < TRK_MICRO_MAX
+                                    and not self.busy
+                                    and not self._session_running()):
+                                # the continuous lag IS the drift: absorb
+                                # it with a gentle rate pulse, no seek
+                                player.absorb_drift(med)
+                                log.info("tracker: absorbing %+.2fs drift",
+                                         med)
+                                micro_at = now
+                                errs = []
+                    elif cls == "big":
+                        # a strong match at the wrong lag is a real jump -
+                        # if a second consecutive block agrees on it
+                        lock_streak = 0
+                        deg_streak += 1
+                        if (big_err is not None
+                                and abs(err - big_err) < 0.5
+                                and not self.busy
+                                and not self._session_running()):
+                            player.sync_seek(t_found, t0_cap, self.offset)
+                            self.q.put((
+                                "status",
+                                f"Auto: corrected {err:+.2f}s "
+                                f"(score {score:.2f}, confirmed twice)."))
+                            big_err = None
+                            deg_streak = 0
+                            errs, classes, ref = [], [], None
+                        else:
+                            big_err = err
+                        meter("degraded", score)
+                    elif cls == "miss":
+                        lock_streak = 0
+                        deg_streak = 0
+                        big_err = None
+                        if (self.auto_follow
+                                and classes.count("miss")
+                                >= TRK_PAUSE_MISSES
+                                and not self.busy
+                                and not self._session_running()):
+                            # the film's energy signature is gone - twice
+                            # in the recent window, so even a pause masked
+                            # by talk is caught at the breath gaps
                             player.pause()
-                            pause_point = c
-                            paused_at = time.monotonic()
-                            mode = "probe"
+                            pause_point = expect
+                            wide_at = time.monotonic()
+                            deg_streak, resume_cand = 0, None
+                            ref, classes = None, []
                             self.q.put(("swap", True))
-                            self.q.put(("status",
-                                        "Auto: film audio not found on the stream "
-                                        "- assuming pause. Watching for resume..."))
-                else:  # probe: film paused, live watch for the resume
-                    if time.monotonic() - last_confirm < 2.0:
-                        continue
-                    # a real pause resumes near pause_point; a FALSE pause
-                    # means the stream never stopped, so the forward edge
-                    # grows with elapsed time to keep up with it - that is
-                    # also what makes a wrong pause heal itself
-                    ahead = min(time.monotonic() - paused_at, PROBE_MAX_AHEAD)
-                    # near is pause_point, NOT the window's middle: the
-                    # window grows forward to catch a stream that never
-                    # stopped, but a real resume happens where it paused
-                    hit = self._auto_probe(ring, pause_point - 25.0,
-                                           pause_point + 40.0 + ahead,
-                                           near=pause_point)
-                    last_confirm = time.monotonic()
-                    if hit:
-                        t, score, z, t0 = hit
-                        if self.busy or self._session_running():
-                            # someone else is driving the playhead; leaving
-                            # probe mode now would strand a paused film
-                            continue
-                        player.sync_seek(t, t0, self.offset)
+                            self.q.put((
+                                "status",
+                                "Auto: the stream stopped playing the film "
+                                "- pausing to match. Watching for the "
+                                "resume..."))
+                            meter("paused")
+                        else:
+                            meter("degraded", 0.0)
+                    elif cls == "deg":
+                        lock_streak = 0
+                        deg_streak += 1
+                        if (deg_streak >= TRK_LOST_AFTER
+                                and len(recent) >= 3 and not self.busy
+                                and not self._session_running()):
+                            # energy present but no lock for a while: the
+                            # stream may have jumped past the expectation
+                            # window. One bounded, sure search - and only
+                            # seek if it lands somewhere genuinely new.
+                            deg_streak = 0
+                            hit = self._wide_relock(recent, expect)
+                            # the hit is anchored at recent[0], one block
+                            # BEFORE the pair - shift the prediction to
+                            # the same instant or the acceptance band is
+                            # off by that second
+                            if (hit is not None
+                                    and abs(hit[0]
+                                            - (expect
+                                               - (t0_cap - hit[1])))
+                                    > TRK_LOCK_SLACK):
+                                t_w, t0_w = hit
+                                player.sync_seek(t_w, t0_w, self.offset)
+                                self.q.put((
+                                    "status",
+                                    "Auto: the stream moved - re-locked "
+                                    f"at {fmt_time(t_w)}."))
+                                errs, classes, ref = [], [], None
+                                meter("locked", 0.5)
+                                continue
+                        meter("degraded", score)
+                    else:  # "quiet": hold state, just heartbeat the meter
+                        meter(state if state in ("locked", "degraded")
+                              else "degraded", score)
+                else:  # paused: watch the pause point itself, live
+                    if ref is None:
+                        ref = self._tracker_ref(
+                            film_meta[1],
+                            max(0.0, pause_point - TRK_RESUME_WIN
+                                + TRK_REF_BACK))
+                    if C is None:
+                        lock_streak = 0
+                        resume_cand = None
+                    else:
+                        t_found, score = self._corr_block(ref[0], ref[1], C)
+                        i_exp = min(max(int(t_found - ref[0]), 0),
+                                    len(ref[2]) - 1)
+                        exp_rms = float(np.min(
+                            ref[2][max(0, i_exp - 1):i_exp + 2]))
+                        # a resume claim must CARRY the energy it claims
+                        # to match - silence scores are garbage, and they
+                        # were resuming the film at phantom moments. It
+                        # must also ADVANCE coherently: a real resume
+                        # moves a second per second, spurious peaks
+                        # scatter across the window.
+                        heard = (exp_rms >= TRK_EXP_FLOOR
+                                 and (gain is None
+                                      or rms >= TRK_RESUME_ENERGY
+                                      * gain * exp_rms))
+                        if (score >= TRK_ACT_SCORE and heard
+                                and abs(t_found - pause_point)
+                                <= TRK_RESUME_WIN):
+                            coherent = (
+                                resume_cand is not None
+                                and abs((t_found - resume_cand[0])
+                                        - (t0_cap - resume_cand[1]))
+                                <= 1.5)
+                            lock_streak = lock_streak + 1 if coherent else 1
+                            resume_cand = (t_found, t0_cap)
+                        else:
+                            lock_streak = 0
+                            resume_cand = None
+                    if (lock_streak >= 2 and not self.busy
+                            and not self._session_running()):
+                        player.sync_seek(t_found, t0_cap, self.offset)
                         self.q.put(("swap", False))
-                        self.q.put(("status", "Auto: stream resumed - resynced."))
-                        mode, misses, baseline = "normal", 0, None
+                        self.q.put(("status",
+                                    "Auto: stream resumed - following."))
+                        lock_streak = deg_streak = 0
+                        resume_cand = None
+                        errs, classes, ref = [], [], None
+                        meter("locked", score)
+                        continue
+                    now = time.monotonic()
+                    if (now - wide_at >= TRK_SKIP_AFTER
+                            and len(recent) >= 3 and not self.busy
+                            and not self._session_running()):
+                        # nothing at the pause point for a while - maybe
+                        # the streamer skipped. One bounded, sure search.
+                        wide_at = now
+                        hit = self._wide_relock(recent, pause_point)
+                        if hit is not None:
+                            t_w, t0_w = hit
+                            player.sync_seek(t_w, t0_w, self.offset)
+                            self.q.put(("swap", False))
+                            self.q.put((
+                                "status",
+                                "Auto: the stream moved - re-locked at "
+                                f"{fmt_time(t_w)}."))
+                            lock_streak = deg_streak = 0
+                            resume_cand = None
+                            errs, classes, ref = [], [], None
+                            meter("locked", 0.5)
+                            continue
+                    meter("paused")
             except Exception as e:
                 self.q.put(("status", f"Auto-resync check failed: {e}"))
                 log.warning("auto loop error", exc_info=True)
@@ -1666,14 +1951,20 @@ class App:
         try:
             while True:
                 kind, *payload = self.q.get_nowait()
-                if kind == "clock":
-                    pass          # one per second forever; not worth logging
+                if kind in ("clock", "lock"):
+                    pass          # continuous streams; not worth log space
                 elif kind in ("preview", "devices", "show"):
                     log.debug("queue: %s", kind)      # payloads too bulky
                 else:
                     log.debug("queue: %s %r", kind, payload)
                 if kind == "clock":
                     self._update_clock(*payload)
+                elif kind == "lock":
+                    lstate, strength = payload
+                    if lstate != getattr(self, "_lock_state", None):
+                        log.info("tracker: %s", lstate)
+                        self._lock_state = lstate
+                    self._draw_lock(lstate, strength)
                 elif kind == "status":
                     self._set_status(payload[0])
                 elif kind == "session":
@@ -1867,6 +2158,23 @@ class App:
     def _set_status(self, text):
         self.status_lbl.config(text=text)
 
+    def _draw_lock(self, state, strength):
+        """The tracker's glanceable truth, next to the clock."""
+        c = self.lock_canvas
+        c.config(bg=self.root.cget("bg"))
+        c.delete("all")
+        if state == "locked":
+            r = 3 + 3 * min(1.0, strength / 0.5)
+            c.create_oval(8 - r, 7 - r, 8 + r, 7 + r,
+                          fill="#2e7d32", outline="")
+        elif state == "degraded":
+            c.create_oval(2, 1, 14, 13, outline="#ef6c00", width=2)
+        elif state == "paused":
+            c.create_rectangle(4, 2, 7, 12, fill="#1565c0", outline="")
+            c.create_rectangle(9, 2, 12, 12, fill="#1565c0", outline="")
+        else:
+            c.create_oval(6, 5, 10, 9, fill="#9e9e9e", outline="")
+
     # ------------------------------------------------------------- clock
     #
     # The old clock polled the player three times per 700ms tick ON the Tk
@@ -1950,6 +2258,7 @@ class App:
                 "mirror": self.mirror_var.get(),
                 "auto_interval": self.auto_interval,
                 "follow_pauses": self.follow_var.get(),
+                "auto_resync": self.auto_var.get(),
                 "swap": self.swap_var.get(),
                 "stream_title": self.stream_title,
                 "relay_url": self.relay_url,
@@ -2005,6 +2314,15 @@ class App:
         # exactly once; re-enabling sticks from then on.
         self.follow_var.set(bool(cfg.get("follow_pauses", False)))
         self.auto_follow = self.follow_var.get()
+        # the master switch is persisted like every other setting - it
+        # used to reset silently every launch, leaving "follow stream
+        # pauses" checked, armed-looking, and completely inert
+        if bool(cfg.get("auto_resync", False)):
+            self.auto_var.set(True)
+            self.auto_enabled = True
+            self.follow_chk.state(["!disabled"])
+            log.info("auto re-sync restored: live tracking armed"
+                     + (", following pauses" if self.auto_follow else ""))
         self.swap_var.set(bool(cfg.get("swap", True)))
         self.stream_title = cfg.get("stream_title", "")
         if cfg.get("relay_url"):

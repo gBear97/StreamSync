@@ -85,6 +85,8 @@ class EmbeddedPlayer:
             self.mp.video_set_mouse_input(False)
             self.mp.video_set_key_input(False)
         self.has_media = False
+        self._pulse_lock = threading.Lock()
+        self._pulse_cancel = threading.Event()
 
     def load(self, path):
         log.info("embedded load: %r", path)
@@ -99,6 +101,30 @@ class EmbeddedPlayer:
             self.mp.set_hwnd(int(self.hwnd))
             self.mp.set_fullscreen(False)
         self.has_media = True
+
+    def absorb_drift(self, delta):
+        """Consume a small sync offset invisibly: run gently fast or slow
+        until `delta` seconds are absorbed, then return to 1x. A gentle
+        rate keeps video judder imperceptible; audio is muted in the mode
+        that uses this. Unlike a seek, nothing jumps."""
+        threading.Thread(target=self._absorb, args=(delta,),
+                         daemon=True).start()
+
+    def _absorb(self, delta):
+        if not self._pulse_lock.acquire(blocking=False):
+            return  # an absorb is already running
+        try:
+            self._pulse_cancel.clear()
+            rate = 1.05 if delta > 0 else 0.95
+            self.mp.set_rate(rate)
+            # a seek/pause cancels the pulse: after a jump the remaining
+            # rate offset would quietly re-break the fresh alignment
+            self._pulse_cancel.wait(min(abs(delta) / 0.05, 30.0))
+            self.mp.set_rate(1.0)
+        except Exception:
+            pass
+        finally:
+            self._pulse_lock.release()
 
     def ensure_playing(self, timeout=6.0):
         if not self.has_media:
@@ -135,10 +161,12 @@ class EmbeddedPlayer:
             self.mp.pause()
 
     def pause(self):
+        self._pulse_cancel.set()
         if self.mp.is_playing():
             self.mp.set_pause(1)
 
     def seek(self, seconds):
+        self._pulse_cancel.set()
         self.mp.set_time(max(0, int(seconds * 1000)))
 
     def time(self):
@@ -422,6 +450,12 @@ class ExternalPlayer:
             pass
         finally:
             self._pulse_lock.release()
+
+    def absorb_drift(self, delta):
+        """Same contract as EmbeddedPlayer.absorb_drift: consume a small
+        offset without a visible seek, via the existing rate pulse."""
+        threading.Thread(target=self._rate_pulse, args=(delta,),
+                         daemon=True).start()
 
     def set_mute(self, mute):
         try:
