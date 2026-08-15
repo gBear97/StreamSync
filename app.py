@@ -40,6 +40,9 @@ log = logging.getLogger("streamsync.app")
 BURST_FRAMES = 4
 BURST_SPACING = 1 / 3      # seconds between captured frames (aligns with 12 fps scan)
 AUDIO_SYNC_SECONDS = 6.0   # manual sync recording length
+VERIFY_S = 6.0             # wrong-film guard: length of the confirming listen
+VERIFY_WIN_S = 45.0        # ...searched this far around the predicted spot
+VERIFY_TOL_S = 3.0         # ...and it must land this close to count
 PROBE_MAX_AHEAD = 600.0    # cap the growing resume-search window (_auto_loop)
 LOW_CONFIDENCE = 0.55      # video-match warning threshold
 
@@ -738,6 +741,15 @@ class App:
             self.q.put(("swap", False))
             self.q.put(("adone", m.t, m.score, m.z, listen, pname,
                         m.ambiguous, m.rival_t, m.rival_score))
+            if not mute:
+                # an unmuted local player is audible on the loopback at
+                # exactly the predicted spot - the check would hear ITSELF
+                # and bless any film, including the wrong one
+                self.q.put(("averify", None, None, "selfhear"))
+            else:
+                self.q.put(("status", "Verifying with a second listen..."))
+                self.q.put(("averify", *self._verify_sync(m.t, t0, device,
+                                                          cancel)))
         except Exception as e:
             # a stop is not a failure - report it as what it was
             if cancel.is_set():
@@ -746,6 +758,67 @@ class App:
                 self.q.put(("error", str(e)))
         finally:
             self.q.put(("busy_off", None))
+
+    def _verify_sync(self, match_t, t0, device, cancel):
+        """The wrong-film guard: one FRESH listen must agree with the sync.
+
+        A single capture matched against the wrong film still finds a best
+        peak somewhere, and measured across real film pairs 1.9% of those
+        pass every gate. But a wrong film cannot pass twice COHERENTLY: a
+        second capture taken T seconds later must match at the first
+        answer plus T, and spurious peaks land anywhere in a feature-length
+        file. Two coherent passes on the wrong film are a ~3-in-100,000
+        event. On the right film the confirming listen lands on the
+        prediction essentially always, so a failure here means the loaded
+        file is not what the stream is playing - or the stream just went
+        quiet, which is why a miss gets one retry.
+
+        Runs AFTER the seek on purpose: the seek's UX is unchanged and the
+        user is already watching while this listens. The confirming match
+        gets NO proximity hint - a test must not lean on the hypothesis it
+        is testing.
+
+        Returns (verified, delta, reason):
+          (True, seconds_off, None)     - a fresh listen agrees
+          (False, delta, None)          - matched, but somewhere else
+          (False, None, "nomatch")      - nothing matched at all (wrong
+                                          film, loud commentary, or pause)
+          (None, None, "stopped")       - Stop was pressed
+          (None, None, "nohear")        - could not capture at all
+        """
+        verified, vdelta, reason = None, None, "nohear"
+        for attempt in (1, 2):
+            if cancel.is_set():
+                return None, None, "stopped"
+            try:
+                s2, sr2, t0v = audio_capture.record_loopback(
+                    VERIFY_S, speaker_name=device, cancel=cancel.is_set)
+                f2 = audio_matcher.prep_capture(s2, sr2)
+                pred = match_t + (t0v - t0)
+                m2 = audio_matcher.find_match_audio_ex(
+                    self.video_path, f2, pred - VERIFY_WIN_S,
+                    pred + VERIFY_WIN_S, cancel=cancel.is_set)
+                hit = (m2.score >= audio_matcher.SCORE_OK
+                       and m2.z >= audio_matcher.Z_OK)
+                if hit and abs(m2.t - pred) <= VERIFY_TOL_S:
+                    log.info("sync verify: agreed, delta %+.2fs "
+                             "(attempt %d)", m2.t - pred, attempt)
+                    return True, m2.t - pred, None
+                verified = False
+                vdelta = (m2.t - pred) if hit else None
+                reason = None if hit else "nomatch"
+                log.info("sync verify: attempt %d disagreed "
+                         "(hit=%s delta=%s)", attempt, hit,
+                         None if vdelta is None else round(vdelta, 2))
+            except Exception as e:
+                # never let verification break a sync that already landed:
+                # a raise here would surface as "Sync failed" AFTER the
+                # seek succeeded
+                if cancel.is_set():
+                    return None, None, "stopped"
+                log.info("sync verify: attempt %d could not listen: %s",
+                         attempt, e)
+        return verified, vdelta, reason
 
     def _video_search_worker(self, a, b, player, offset, mute, hidden,
                              mask, mirror, pname, cancel):
@@ -1584,6 +1657,53 @@ class App:
                         msg += (" Low confidence - check the capture region, or "
                                 "set a facecam ignore zone under Edge cases.")
                     self._set_status(msg)
+                elif kind == "averify":
+                    verified, vdelta, vreason = payload
+                    amb = bool(self._last_sync
+                               and self._last_sync.get("ambiguous"))
+                    if self._last_sync is not None:
+                        self._last_sync["verified"] = verified
+                        if vdelta is not None:
+                            self._last_sync["verify_delta"] = round(vdelta, 2)
+                        if vreason is not None:
+                            self._last_sync["verify_reason"] = vreason
+                    if verified is True and amb:
+                        # coherence cannot clear ambiguity: a twin elsewhere
+                        # is time-shifted identical audio and would pass
+                        # this exact check - keep the warning and its remedy
+                        self._set_status(
+                            "Second listen is coherent, but the match was "
+                            "AMBIGUOUS and a twin elsewhere would pass this "
+                            "check too. If it looks wrong, scrub near the "
+                            "right moment and hit Resync.")
+                    elif verified is True:
+                        self._set_status(
+                            f"Sync verified - a second listen agrees "
+                            f"({vdelta:+.1f}s).")
+                    elif verified is False and vdelta is not None:
+                        self._set_status(
+                            "WARNING: a second listen found the film "
+                            f"{vdelta:+.1f}s from where this sync put it. "
+                            "The sync is likely off - Resync, or check the "
+                            "loaded file.")
+                    elif verified is False:
+                        self._set_status(
+                            "Could not confirm this sync - a second listen "
+                            "found no match near it. Wrong film or episode, "
+                            "loud commentary, or the stream just paused. "
+                            "If the picture looks wrong, check the file "
+                            "and Resync.")
+                    elif vreason == "selfhear":
+                        self._set_status(
+                            "Synced. (Not double-checked: the local film is "
+                            "audible and the check would hear itself - mute "
+                            "local audio to enable verification.)")
+                    elif vreason == "stopped":
+                        self._set_status("Sync made; verification stopped.")
+                    else:
+                        self._set_status(
+                            "Synced; couldn't hear the stream well enough "
+                            "to double-check it.")
                 elif kind == "error":
                     self._set_status(f"Sync failed: {payload[0]}")
                 elif kind == "cancelled":
