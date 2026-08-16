@@ -68,10 +68,30 @@ TRK_MISS_WINDOW = 12       # ...counted over this many recent blocks, so a
                            # talked-over pause is caught at the breath gaps
 TRK_MISSING_RATIO = 0.25   # a block this far under its EXPECTED energy is
                            # missing the film, whatever its score says
+TRK_ABS_SILENCE = 1e-4     # capture this quiet is DEAD AIR (~-80 dBFS):
+                           # the film is missing no matter what, so pause
+                           # detection works before any calibration
+TRK_SEED_N = 10            # the gain seeds from the MINIMUM of this many
+                           # in-slack locks - commentary only ADDS energy,
+                           # so the min converges on the clean ratio while
+                           # single samples can be talk-inflated 6x
+TRK_LO_HZ = 80.0           # sub-bass band: film scores/effects live down
+                           # here, streamer mics are high-passed ~80-100Hz
+                           # - so missing sub-bass under LOUD talk still
+                           # means the film stopped (no breath gap needed)
+TRK_LO_FLOOR = 0.003       # ...but only when the film SHOULD have it
+TRK_LO_RATIO = 0.03        # a paused film leaves ~ZERO sub-bass (voices
+                           # are high-passed), while a duck still leaves
+                           # 10-20% - so the bar sits far below any duck
+                           # a streamer would actually use (~-30dB)
 TRK_EXP_FLOOR = 0.005      # expected audio quieter than this is silence -
                            # a faithful silent passage proves nothing
-TRK_RESUME_ENERGY = 0.3    # a resume-counting block must carry at least
-                           # this much of the energy it claims to match
+TRK_RESUME_ENERGY = 0.05   # a resume-counting block must carry SOME of
+                           # the energy it claims to match - a bar low
+                           # enough that an over-learned gain (talk can
+                           # inflate it several-fold) can never hold a
+                           # genuine resume hostage, yet dead air (the
+                           # phantom-resume source) still fails it
 TRK_MICRO_MIN = 0.15       # absorb drift above this smoothly...
 TRK_MICRO_MAX = 3.0        # ...up to the lock slack: every in-slack
                            # error must have an owner (a ~2s rebuffer
@@ -967,9 +987,23 @@ class App:
         sr = audio_matcher.SR
         n = max(1, len(x) // sr)
         # the film's own loudness, per second: "energy collapsed" is only
-        # meaningful against what was SUPPOSED to be playing right now
-        rms = np.sqrt(np.mean(x[:n * sr].reshape(n, sr) ** 2, axis=1))
-        return lo, audio_matcher.features(x, sr), rms
+        # meaningful against what was SUPPOSED to be playing right now.
+        # Sub-bass tracked separately - it is the band commentary can't
+        # reach, so it stays readable under continuous talk.
+        frames = x[:n * sr].reshape(n, sr)
+        rms = np.sqrt(np.mean(frames ** 2, axis=1))
+        X = np.fft.rfft(frames, axis=1)
+        k = max(int(TRK_LO_HZ), 2)   # 1s frames at sr -> bin index == Hz
+        rms_lo = np.sqrt(2.0 * np.sum(np.abs(X[:, 1:k]) ** 2, axis=1)) / sr
+        return lo, audio_matcher.features(x, sr), rms, rms_lo
+
+    @staticmethod
+    def _band_rms(x, sr, hi_hz):
+        """RMS of the sub-`hi_hz` band of a ~1s block (any sample rate)."""
+        X = np.fft.rfft(x.astype(np.float64))
+        k = max(int(hi_hz * len(x) / sr), 2)
+        return float(np.sqrt(2.0 * np.sum(np.abs(X[1:k]) ** 2))
+                     / max(len(x), 1))
 
     @staticmethod
     def _corr_block(ref_t0, W, C):
@@ -1029,9 +1063,13 @@ class App:
                               # different gain chains, so "how loud should
                               # this second BE" needs a learned scale
         gain_seed = []        # commentary only ADDS energy, so the seed is
-                              # the MINIMUM over the first few confident
+                              # the MINIMUM over the first TRK_SEED_N
                               # locks - one talk-polluted sample must not
                               # calibrate the pause detector
+        gain_lo = None        # same idea for the sub-bass band
+        gain_lo_seed = []
+        trace = []            # per-block verdict chars, flushed to the log
+        trace_scores = []     # every ~30s so a field night is diagnosable
         prev = None           # previous 1s block: evidence rolls in pairs
         classes = []          # recent block verdicts, for the pause rule
         deg_streak = 0        # consecutive not-locked blocks WITH energy
@@ -1040,6 +1078,11 @@ class App:
                               # that survived a busy/disarm interruption -
                               # without it the guard wipes "paused" and the
                               # film would stay paused forever
+        seen_lock = False     # the tracker has heard the film at least
+                              # once this listener - until then NO energy
+                              # arm may declare it missing (a wrong device
+                              # or muted tab is silence too, and pausing
+                              # on it would hold the film hostage)
         errs = []             # recent locked-block position errors
         big_err = None        # pending large-jump double-confirm
         micro_at = 0.0
@@ -1049,13 +1092,33 @@ class App:
 
         def close_listener():
             nonlocal listener, ref, gain, gain_seed, errs, recent, prev
-            nonlocal classes, deg_streak, resume_cand
+            nonlocal classes, deg_streak, resume_cand, gain_lo
+            nonlocal gain_lo_seed, trace, trace_scores, seen_lock
             if listener is not None:
                 listener.close()
             listener = None
             ref, gain, prev, resume_cand = None, None, None, None
+            gain_lo = None
             errs, recent, classes, gain_seed = [], [], [], []
+            gain_lo_seed, trace, trace_scores = [], [], []
             deg_streak = 0
+            seen_lock = False
+
+        def trace_add(code, score=None):
+            nonlocal trace, trace_scores
+            trace.append(code)
+            if score is not None:
+                trace_scores.append(score)
+            if len(trace) >= 30:
+                sc = trace_scores
+                log.info(
+                    "tracker trace: %s gain=%s lo=%s score p50=%s",
+                    "".join(trace),
+                    f"{gain:.2f}" if gain is not None
+                    else f"seed {len(gain_seed)}/{TRK_SEED_N}",
+                    f"{gain_lo:.2f}" if gain_lo is not None else "-",
+                    f"{float(np.median(sc)):.2f}" if sc else "-")
+                trace, trace_scores = [], []
 
         def meter(new_state, strength=0.0):
             nonlocal state, last_sent, last_meter
@@ -1111,6 +1174,8 @@ class App:
                 time.sleep(3.0)
                 continue
             rms = float(np.sqrt(np.mean(block * block)))
+            lo_rms = self._band_rms(block, audio_capture.CAPTURE_SR,
+                                    TRK_LO_HZ)
             recent.append((block, t0_blk))
             del recent[:-3]
             player = self.active_player
@@ -1123,8 +1188,11 @@ class App:
                     # wrong file), not the gain (different master levels),
                     # not the verdict history
                     ref, prev, gain, big_err = None, None, None, None
-                    errs, classes, gain_seed = [], [], []
+                    gain_lo = None
+                    errs, classes, gain_seed, gain_lo_seed = [], [], [], []
+                    trace, trace_scores = [], []
                     lock_streak = deg_streak = 0
+                    seen_lock = False
                     resume_cand, pause_point, held = None, None, None
                     if state == "paused":
                         meter("off")
@@ -1172,6 +1240,8 @@ class App:
                     exp_ctr = float(ref[2][i_exp])
                     exp_rms = float(np.min(
                         ref[2][max(0, i_exp - 1):i_exp + 2]))
+                    exp_lo = float(np.min(
+                        ref[3][max(0, i_exp - 1):i_exp + 2]))
                     # energy is judged BEFORE the correlator gets a vote:
                     # a block missing the film's energy proves the film is
                     # not playing, whatever its (garbage) score says
@@ -1185,42 +1255,86 @@ class App:
                         # (a streamer ducking the film must not pause it;
                         # the gain EMA re-learns the new level instead)
                         cls = "lock"
-                    elif (gain is not None
-                          and rms < TRK_MISSING_RATIO * gain * exp_rms):
+                    elif C is not None and score >= TRK_ACT_SCORE:
+                        # confident correlation at the WRONG lag still
+                        # proves the film is playing (a jump, not a
+                        # pause) - it must outrank every energy read or
+                        # a stream seek gets misread as a pause
+                        cls = "big"
+                    elif seen_lock and (
+                            rms < TRK_ABS_SILENCE
+                            or (gain is not None
+                                and rms < TRK_MISSING_RATIO * gain
+                                * exp_rms)
+                            or (gain_lo is not None
+                                and exp_lo >= TRK_LO_FLOOR
+                                and lo_rms < TRK_LO_RATIO * gain_lo
+                                * exp_lo)):
+                        # three ways to be missing: dead air (needs no
+                        # calibration), total energy far under expectation,
+                        # or the film's sub-bass gone while a mic-high-
+                        # passed voice talks over the pause. None may
+                        # fire before the film has been heard once.
                         cls = "miss"
+                        log.debug(
+                            "tracker miss: rms=%.5f lo=%.5f exp=%.4f "
+                            "exp_lo=%.4f gain=%s gain_lo=%s score=%.2f",
+                            rms, lo_rms, exp_rms, exp_lo,
+                            f"{gain:.2f}" if gain is not None else "-",
+                            f"{gain_lo:.2f}" if gain_lo is not None
+                            else "-", score)
                     elif (C is not None and score >= TRK_LOCK_SCORE
                           and abs(err) <= TRK_LOCK_SLACK):
                         cls = "lock"
-                    elif C is not None and score >= TRK_ACT_SCORE:
-                        cls = "big"
                     else:
                         cls = "deg"      # voice over the film, most likely
                     classes.append(cls)
                     del classes[:-TRK_MISS_WINDOW]
+                    trace_add({"lock": "L", "miss": "M", "big": "B",
+                               "deg": "D", "quiet": "q"}[cls],
+                              score if C is not None else None)
 
                     if cls == "lock":
                         lock_streak += 1
                         deg_streak = 0
                         big_err = None
-                        if (exp_ctr >= TRK_EXP_FLOOR
-                                and score >= TRK_ACT_SCORE):
-                            # calibrate only on CONFIDENT locks, and only
-                            # trust the minimum of the first few samples:
-                            # commentary only ever ADDS energy on top of
-                            # the film, so one talk-polluted ratio would
-                            # inflate the scale and read breath gaps on a
-                            # playing film as a pause. After seeding, the
-                            # clean gain is the LOWER envelope: sink fast,
-                            # rise reluctantly.
+                        seen_lock = True
+                        if exp_ctr >= TRK_EXP_FLOOR:
+                            # any in-slack lock calibrates - real streams
+                            # rarely reach confident scores, and waiting
+                            # for them left the pause detector disabled
+                            # all night in the field. The talk-pollution
+                            # protection is the MIN over TRK_SEED_N
+                            # samples (commentary only ever ADDS energy)
+                            # plus the lower-envelope EMA afterwards:
+                            # sink fast, rise reluctantly.
                             g = rms / exp_ctr
                             if gain is None:
                                 gain_seed.append(g)
-                                if len(gain_seed) >= 5:
+                                if len(gain_seed) >= TRK_SEED_N:
                                     gain = min(gain_seed)
+                                    log.info(
+                                        "tracker: gain calibrated %.3f "
+                                        "(min of %d locks)", gain,
+                                        TRK_SEED_N)
                             elif g < gain:
                                 gain = 0.7 * gain + 0.3 * g
                             else:
                                 gain = 0.98 * gain + 0.02 * g
+                        exp_lo_ctr = float(ref[3][i_exp])
+                        if exp_lo_ctr >= TRK_LO_FLOOR:
+                            g2 = lo_rms / exp_lo_ctr
+                            if gain_lo is None:
+                                gain_lo_seed.append(g2)
+                                if len(gain_lo_seed) >= TRK_SEED_N:
+                                    gain_lo = min(gain_lo_seed)
+                                    log.info(
+                                        "tracker: sub-bass gain "
+                                        "calibrated %.3f", gain_lo)
+                            elif g2 < gain_lo:
+                                gain_lo = 0.7 * gain_lo + 0.3 * g2
+                            else:
+                                gain_lo = 0.98 * gain_lo + 0.02 * g2
                         errs.append(err)
                         del errs[:-5]
                         meter("locked", score)
@@ -1356,6 +1470,8 @@ class App:
                         else:
                             lock_streak = 0
                             resume_cand = None
+                    trace_add("R" if lock_streak else "P",
+                              score if C is not None else None)
                     if (lock_streak >= 2 and not self.busy
                             and not self._session_running()):
                         player.sync_seek(t_found, t0_cap, self.offset)
