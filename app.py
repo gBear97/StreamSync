@@ -2430,8 +2430,12 @@ class App:
                 "relay_url": self.relay_url,
                 "difficulty_cache": self._difficulty_cache,
             }))
+            log.info("config saved (auto=%s follow=%s)",
+                     self.auto_var.get(), self.follow_var.get())
         except OSError:
-            pass
+            # the log is the only witness: a save that fails silently on
+            # exit looks identical to one that worked
+            log.warning("config save FAILED", exc_info=True)
 
     def _load_config(self):
         try:
