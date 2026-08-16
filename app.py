@@ -101,6 +101,10 @@ TRK_MICRO_COOLDOWN = 8.0
 TRK_RESUME_WIN = 12.0      # resume watch reach around the pause point
 TRK_SKIP_AFTER = 15.0      # nothing there yet -> one bounded wider search
 TRK_SKIP_SPAN = 300.0
+TRK_FAIL_GIVEUP = 3        # a check failing the SAME way this many times
+                           # running is permanent - the film's drive gone,
+                           # the file moved - not a blip: say so once,
+                           # disarm, and stop the churn
 LOW_CONFIDENCE = 0.55      # video-match warning threshold
 
 
@@ -1085,6 +1089,9 @@ class App:
                               # on it would hold the film hostage)
         errs = []             # recent locked-block position errors
         big_err = None        # pending large-jump double-confirm
+        fail_sig = None       # (type, message) of the failing check, and
+        fail_n = 0            # its consecutive count: identical repeats
+                              # mean permanent, and the loop gives up
         micro_at = 0.0
         pause_point = None
         wide_at = 0.0
@@ -1141,6 +1148,9 @@ class App:
                     meter("off")
                 lock_streak = 0
                 big_err = None
+                # an idle spell (busy, disarm, re-arm) starts the failure
+                # count fresh - a user retrying deserves the full three
+                fail_sig, fail_n = None, 0
                 close_listener()   # also clears streaks and candidates
                 time.sleep(1.0)
                 continue
@@ -1179,6 +1189,7 @@ class App:
             recent.append((block, t0_blk))
             del recent[:-3]
             player = self.active_player
+            check_failed = False
             try:
                 if film_meta is None or film_meta[0] != self.video_path:
                     film_meta = (self.video_path,
@@ -1506,9 +1517,42 @@ class App:
                             continue
                     meter("paused")
             except Exception as e:
-                self.q.put(("status", f"Auto-resync check failed: {e}"))
-                log.warning("auto loop error", exc_info=True)
-                time.sleep(max(self.auto_interval, 10))
+                check_failed = True
+                sig = (type(e).__name__, str(e))
+                fail_n = fail_n + 1 if sig == fail_sig else 1
+                fail_sig = sig
+                if fail_n == 1:
+                    # first sight of this failure: could be a blip. Say
+                    # so, keep the one full traceback, retry as usual.
+                    self.q.put(("status", f"Auto-resync check failed: {e}"))
+                    log.warning("auto loop error", exc_info=True)
+                elif fail_n < TRK_FAIL_GIVEUP:
+                    # same failure again: the traceback is already on
+                    # file - one line keeps the log readable
+                    log.warning("auto loop error repeated (%d/%d): %s",
+                                fail_n, TRK_FAIL_GIVEUP, e)
+                elif fail_n == TRK_FAIL_GIVEUP:
+                    # not a blip - the drive unplugged, the film moved.
+                    # One clear message, then disarm over the queue: the
+                    # box unticks on the Tk thread, never from here.
+                    log.warning("auto tracking gave up after %d "
+                                "identical failures: %s: %s", fail_n, *sig)
+                    if isinstance(e, (OSError, matcher.MatchError)):
+                        why = ("can't read the film's audio - check the "
+                               "file is still available")
+                    else:
+                        why = f"the same error kept hitting ({e})"
+                    self.q.put(("auto_off",
+                                f"Auto tracking stopped: {why}. "
+                                "Re-tick Auto re-sync to try again."))
+                # beyond the give-up: the untick is on its way through
+                # the queue - idle on short sleeps until it lands
+                time.sleep(1.0 if fail_n >= TRK_FAIL_GIVEUP
+                           else max(self.auto_interval, 10))
+            finally:
+                if not check_failed:
+                    # a check that ran clean breaks the streak
+                    fail_sig, fail_n = None, 0
         close_listener()
 
     # ------------------------------------------------------------- playback
@@ -2205,6 +2249,12 @@ class App:
                     pending, self._pending_search = self._pending_search, None
                     if pending == "resync" and not self._closing:
                         self.root.after(50, self._resync)
+                elif kind == "auto_off":
+                    # the tracker gave up (details in the log): untick
+                    # exactly as a manual uncheck would, then say why
+                    self.auto_var.set(False)
+                    self._on_auto_toggle()
+                    self._set_status(payload[0])
                 elif kind == "hotkey":
                     self._hotkey(payload[0])
         except queue.Empty:
