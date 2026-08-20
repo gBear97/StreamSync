@@ -209,6 +209,14 @@ python3 streamsync.py        # dependency gate, then the app
 sh build_app_mac.sh          # optional: build StreamSync.app (run on the Mac)
 ```
 
+No Mac at hand to build on? The **Build macOS app** GitHub Actions
+workflow compiles `StreamSync.app` on GitHub's macOS machines - for both
+Apple Silicon (`arm64`) and Intel (`x86_64`) - on every push to `main`
+or on demand (Actions tab > Build macOS app > Run workflow). Download
+the artifact from the run page, unzip, and right-click > **Open** on
+first launch (the build is unsigned). VLC still needs to be installed
+on the Mac that runs it.
+
 ### One-time macOS setup
 
 1. **VLC** - the first-run gate installs it via Homebrew or points you at

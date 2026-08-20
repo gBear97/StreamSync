@@ -1,0 +1,80 @@
+name: Build macOS app
+
+# Compiles StreamSync.app on GitHub's macOS runners (PyInstaller can't
+# cross-compile, so the build has to happen on real macOS). Runs on every
+# push to main, on this feature branch, and on demand via "Run workflow".
+# The finished app is attached to the run as a downloadable artifact.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - claude/streamsync-macos-build-uo1vr0
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: StreamSync.app (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest # Apple Silicon (M-series Macs)
+            arch: arm64
+          - runner: macos-15-intel # Intel Macs
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The UI needs a Python built with Tkinter (see MAC_FIRST_RUN.md);
+      # fail loudly here rather than ship an .app that can't open a window.
+      - name: Check Tk is available
+        run: python3 -c "import tkinter; print('Tk', tkinter.TkVersion)"
+
+      - name: Install dependencies
+        run: python3 -m pip install -r requirements.txt
+
+      # The no-UI, no-VLC, no-permissions engine tests from MAC_FIRST_RUN.md:
+      # prove the sync brain works on this macOS/arch before packaging it.
+      - name: Run engine tests
+        run: |
+          python3 test_matcher.py
+          python3 test_audio_matcher.py
+
+      - name: Build StreamSync.app
+        run: sh build_app_mac.sh
+
+      # ditto preserves the bundle's symlinks and execute bits, which
+      # upload-artifact's own zipping would strip.
+      - name: Zip the app bundle
+        run: ditto -c -k --sequesterRsrc --keepParent dist/StreamSync.app "StreamSync-macOS-${{ matrix.arch }}.app.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StreamSync-macOS-${{ matrix.arch }}
+          path: StreamSync-macOS-${{ matrix.arch }}.app.zip
+          if-no-files-found: error
+
+      - name: Write run summary
+        run: |
+          {
+            echo "### StreamSync.app (${{ matrix.arch }}) built"
+            echo ""
+            echo "Download the **StreamSync-macOS-${{ matrix.arch }}** artifact above and unzip it."
+            echo ""
+            echo "First open: the build is unsigned (no Apple Developer ID), so macOS will warn."
+            echo "Right-click StreamSync.app > **Open** > **Open**, or approve it under"
+            echo "**System Settings > Privacy & Security > Open Anyway**."
+            echo ""
+            echo "VLC.app must be installed on the Mac that runs it (the app's first-run gate offers to install it)."
+          } >> "$GITHUB_STEP_SUMMARY"
