@@ -1,7 +1,12 @@
-"""The reflex layer: sub-second pause/resume follow in app._auto_loop.
+"""The reflex layer: sub-second pause/resume follow in _auto_loop.
+
+The tracker lives line-for-line in BOTH shells (app.App on Windows,
+mac_app.MacApp on macOS), so the scenarios run against both: with no
+argument this script re-runs itself once per shell ("windows", "mac") in
+fresh processes; a shell whose stack this machine cannot import SKIPs.
 
 Same harness pattern as test_tracker_giveup.py - a FakeListener hands
-scripted 0.25s chunks to the REAL App._auto_loop - plus two ideas that
+scripted 0.25s chunks to the REAL _auto_loop - plus two ideas that
 make the reflex deterministic:
 
   * one virtual clock drives both the fake player and a stubbed
@@ -29,6 +34,7 @@ Scenarios:
 """
 import logging
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -38,30 +44,53 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np
 
+SHELLS = ("windows", "mac")
+shell = next((a for a in sys.argv[1:] if a in SHELLS), None)
+if shell is None:
+    # run once per shell, each in a fresh process so the monkeypatching
+    # (time.sleep, decode_audio, Listener, _corr_block) starts clean
+    code = 0
+    for name in SHELLS:
+        print(f"--- shell: {name}", flush=True)
+        code = max(code, subprocess.call([sys.executable, __file__, name]))
+    sys.exit(code)
+
 try:
-    import app
+    if shell == "mac":
+        import mac_app as S
+        AppShell = S.MacApp
+    else:
+        import app as S
+        AppShell = S.App
     import audio_capture
     import audio_matcher
     import matcher
+    import players
 except Exception as e:   # not this machine's stack (no VLC, no soundcard)
-    print(f"SKIPPED: app stack unavailable ({e})")
+    print(f"SKIPPED: {shell} app stack unavailable ({e})")
     sys.exit(0)
+
+# One virtual clock drives the fake player AND the stubbed correlator, so
+# the platform's real output lag has no business in the arithmetic: on
+# macOS the 0.17s constant would bias every scripted err and trip the
+# micro-absorber counts the scenarios assert on.
+players.CLOCK_OUTPUT_LAG = 0.0
 
 _real_sleep = time.sleep
 _real_time = time.time
 rng = np.random.default_rng(11)
 
 CSR = audio_capture.CAPTURE_SR
-CHUNK_N = int(app.TRK_R_CHUNK * CSR)
+CHUNK_N = int(S.TRK_R_CHUNK * CSR)
 OFF = 0.3                 # listener timestamps lag perf_counter by this
 
 # small, fast constants - all read by the loop at call time
-app.TRK_SEED_N = 3
-app.TRK_R_SEED_N = 3
-app.TRK_R_CONFIRM = 0.6
-app.TRK_R_VERIFY = 0.6
-app.TRK_R_COOLDOWN = 0.5
-app.TRK_R_CEIL_N = 8
+S.TRK_SEED_N = 3
+S.TRK_R_SEED_N = 3
+S.TRK_R_CONFIRM = 0.6
+S.TRK_R_VERIFY = 0.6
+S.TRK_R_COOLDOWN = 0.5
+S.TRK_R_CEIL_N = 8
 
 time.sleep = lambda s: _real_sleep(0.001)
 
@@ -108,7 +137,7 @@ def fake_decode(path, t0_abs, dur, sr=audio_matcher.SR):
 
 audio_matcher.decode_audio = fake_decode
 matcher.probe = lambda path: (7200.0, 0.0)
-app.App._wide_relock = lambda self, blocks, pp: None
+AppShell._wide_relock = lambda self, blocks, pp: None
 
 
 class Clock:
@@ -136,7 +165,7 @@ def fake_corr(ref_t0, W, C):
     return 700.0, 0.05            # dead: no useful correlation
 
 
-app.App._corr_block = staticmethod(fake_corr)
+AppShell._corr_block = staticmethod(fake_corr)
 
 
 POISON = object()          # scripted device death: read() raises on it
@@ -149,7 +178,7 @@ class FakeListener:
         pass
 
     def read(self, seconds):
-        assert abs(seconds - app.TRK_R_CHUNK) < 1e-9
+        assert abs(seconds - S.TRK_R_CHUNK) < 1e-9
         item = FakeListener.script.get()
         if item is POISON:
             raise RuntimeError("loopback capture failed (scripted)")
@@ -193,7 +222,7 @@ class FakePlayer:
         return len([c for c in self.calls if c[0] == kind])
 
 
-class FakeApp(app.App):
+class FakeApp(AppShell):
     def __init__(self, mode="live"):
         self.q = queue.Queue()
         self._closing = False
@@ -218,8 +247,8 @@ class Capture(logging.Handler):
         records.append(r)
 
 
-app.log.addHandler(Capture())
-app.log.setLevel(logging.DEBUG)
+S.log.addHandler(Capture())
+S.log.setLevel(logging.DEBUG)
 
 
 def logged(needle):
@@ -308,7 +337,7 @@ assert not s.kinds("swap"), "probation must stay silent"
 assert not s.statuses("pausing to match"), "probation must stay silent"
 CORR["mode"] = "dead"                # nothing contradicts the freeze
 put_chunks([voice(), voice()])       # completes the block: probation runs
-_real_sleep(app.TRK_R_CONFIRM + 0.2)
+_real_sleep(S.TRK_R_CONFIRM + 0.2)
 put_chunks([voice()])                # a tick past the deadline promotes
 wait_for(lambda: s.kinds("swap"), "the promotion swap")
 assert s.kinds("swap")[0] == [True]
@@ -359,28 +388,28 @@ put_chunks([voice(), voice()])
 wait_for(lambda: s.player.n("pause") == 1, "the reflex freeze")
 CORR["mode"] = "dead"
 put_chunks([voice(), voice()])
-_real_sleep(app.TRK_R_CONFIRM + 0.2)
+_real_sleep(S.TRK_R_CONFIRM + 0.2)
 put_chunks([voice()])
 wait_for(lambda: s.kinds("swap"), "promotion")
 feed_blocks(1, mk=voice)             # watcher ref rebuild
 put_chunks([loud(), loud()])         # a soundboard clip fakes the film
 wait_for(lambda: s.player.n("seek") == 1, "optimistic attempt #1")
 feed_blocks(1, mk=voice)             # verify window: no lock arrives
-_real_sleep(app.TRK_R_VERIFY + 0.2)
+_real_sleep(S.TRK_R_VERIFY + 0.2)
 feed_blocks(1, mk=voice)
 wait_for(lambda: s.player.n("pause") == 2, "the re-pause")
 assert not s.statuses("stream resumed")
 put_chunks([loud(), loud()])         # inside the cooldown: no attempt
 _real_sleep(0.1)
 assert s.player.n("seek") == 1, "cooldown ignored"
-_real_sleep(app.TRK_R_COOLDOWN)
+_real_sleep(S.TRK_R_COOLDOWN)
 put_chunks([loud(), loud()])         # attempt #2
 wait_for(lambda: s.player.n("seek") == 2, "optimistic attempt #2")
 feed_blocks(1, mk=voice)
-_real_sleep(app.TRK_R_VERIFY + 0.2)
+_real_sleep(S.TRK_R_VERIFY + 0.2)
 feed_blocks(1, mk=voice)
 wait_for(lambda: s.player.n("pause") == 3, "the second re-pause")
-_real_sleep(app.TRK_R_COOLDOWN + 0.1)
+_real_sleep(S.TRK_R_COOLDOWN + 0.1)
 put_chunks([loud(), loud(), loud(), loud()])   # episode cap: no third try
 _real_sleep(0.15)
 assert s.player.n("seek") == 2, "third optimistic attempt must not fire"
@@ -389,13 +418,13 @@ s.close()
 # --- R9: the slow layer's energy check overrules a bad optimistic
 # resume - one handover, no duplicate announcements, no stale deadline
 s = Scenario("R9: miss-path overrules a resume; no stale deadline")
-app.TRK_R_VERIFY = 5.0     # deadline far away: the miss path must win
+S.TRK_R_VERIFY = 5.0     # deadline far away: the miss path must win
 s.warmup()
 put_chunks([voice(), voice()])
 wait_for(lambda: s.player.n("pause") == 1, "the reflex freeze")
 CORR["mode"] = "dead"
 put_chunks([voice(), voice()])
-_real_sleep(app.TRK_R_CONFIRM + 0.2)
+_real_sleep(S.TRK_R_CONFIRM + 0.2)
 put_chunks([voice()])
 wait_for(lambda: s.kinds("swap"), "promotion")
 feed_blocks(1, mk=voice)             # watcher ref rebuild
@@ -414,7 +443,7 @@ assert logged("overruled"), "the handover should be logged"
 put_chunks([loud(), loud()])         # cooldown must hold optimism back
 _real_sleep(0.15)
 assert s.player.n("seek") == 1, "cooldown ignored after the overrule"
-_real_sleep(app.TRK_R_COOLDOWN)
+_real_sleep(S.TRK_R_COOLDOWN)
 CORR["mode"] = "lock"
 feed_blocks(4, mk=loud)              # the stream truly resumes
 wait_for(lambda: s.statuses("stream resumed"), "the confirmed resume")
@@ -423,19 +452,19 @@ feed_blocks(2, mk=loud)              # degraded blocks after the resume:
 _real_sleep(0.2)                     # a stale deadline would pause here
 assert s.player.paused is False, \
     "stale r_try re-paused a genuinely resumed film"
-app.TRK_R_VERIFY = 0.6
+S.TRK_R_VERIFY = 0.6
 s.close()
 
 # --- R10: the listener dies mid-verification - ownership falls back to
 # the proven pause instead of the film free-running
 s = Scenario("R10: listener death mid-verify re-parks the pause")
-app.TRK_R_VERIFY = 5.0
+S.TRK_R_VERIFY = 5.0
 s.warmup()
 put_chunks([voice(), voice()])
 wait_for(lambda: s.player.n("pause") == 1, "the reflex freeze")
 CORR["mode"] = "dead"
 put_chunks([voice(), voice()])
-_real_sleep(app.TRK_R_CONFIRM + 0.2)
+_real_sleep(S.TRK_R_CONFIRM + 0.2)
 put_chunks([voice()])
 wait_for(lambda: s.kinds("swap"), "promotion")
 feed_blocks(1, mk=voice)
@@ -449,7 +478,7 @@ CORR["mode"] = "lock"
 feed_blocks(4, mk=loud)              # listener reopens; stream resumes
 wait_for(lambda: s.statuses("stream resumed"), "the watcher recovery")
 assert [False] in s.kinds("swap")
-app.TRK_R_VERIFY = 0.6
+S.TRK_R_VERIFY = 0.6
 s.close()
 
 # --- R5: bass-less film - the voice-tilt bar adapts arming

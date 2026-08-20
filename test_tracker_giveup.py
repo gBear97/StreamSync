@@ -1,7 +1,12 @@
-"""Give-up behavior of the auto tracker's failure handler (app._auto_loop).
+"""Give-up behavior of the auto tracker's failure handler (_auto_loop).
+
+The tracker lives line-for-line in BOTH shells (app.App on Windows,
+mac_app.MacApp on macOS), so the scenarios run against both: with no
+argument this script re-runs itself once per shell ("windows", "mac") in
+fresh processes; a shell whose stack this machine cannot import SKIPs.
 
 The harness pattern: a FakeListener hands scripted capture blocks to the
-REAL App._auto_loop running on a real worker thread, and
+REAL _auto_loop running on a real worker thread, and
 audio_matcher.decode_audio is monkeypatched to fail the way a vanished
 film file fails (drive unplugged, file moved, dead ffmpeg). No Tk exists:
 a tiny pump plays _poll_queue's part - on "auto_off" it flips
@@ -19,6 +24,7 @@ Scenarios:
 """
 import logging
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -28,13 +34,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np
 
+SHELLS = ("windows", "mac")
+shell = next((a for a in sys.argv[1:] if a in SHELLS), None)
+if shell is None:
+    # run once per shell, each in a fresh process so the monkeypatching
+    # (time.sleep, decode_audio, Listener) starts clean every time
+    code = 0
+    for name in SHELLS:
+        print(f"--- shell: {name}", flush=True)
+        code = max(code, subprocess.call([sys.executable, __file__, name]))
+    sys.exit(code)
+
 try:
-    import app
+    if shell == "mac":
+        import mac_app as S
+        AppShell = S.MacApp
+    else:
+        import app as S
+        AppShell = S.App
     import audio_capture
     import audio_matcher
     import matcher
 except Exception as e:   # not this machine's stack (no VLC, no soundcard)
-    print(f"SKIPPED: app stack unavailable ({e})")
+    print(f"SKIPPED: {shell} app stack unavailable ({e})")
     sys.exit(0)
 
 _real_sleep = time.sleep
@@ -52,7 +74,7 @@ def _fast_sleep(s):
 time.sleep = _fast_sleep
 
 
-CHUNK_N = int(app.TRK_R_CHUNK * audio_capture.CAPTURE_SR)
+CHUNK_N = int(S.TRK_R_CHUNK * audio_capture.CAPTURE_SR)
 
 
 def noise(n=CHUNK_N):
@@ -84,8 +106,8 @@ class FakeListener:
         pass
 
     def read(self, seconds):
-        assert abs(seconds - app.TRK_R_CHUNK) < 1e-9, \
-            f"loop reads {seconds}s, harness scripts {app.TRK_R_CHUNK}s"
+        assert abs(seconds - S.TRK_R_CHUNK) < 1e-9, \
+            f"loop reads {seconds}s, harness scripts {S.TRK_R_CHUNK}s"
         return FakeListener.script.get(), time.perf_counter() - 0.3
 
     def close(self):
@@ -117,7 +139,7 @@ class FakePlayer:
         self.calls.append(("pause",))
 
 
-class FakeApp(app.App):
+class FakeApp(AppShell):
     def __init__(self):   # the real one builds the whole UI - skip it
         self.q = queue.Queue()
         self._closing = False
@@ -143,8 +165,8 @@ class Capture(logging.Handler):
         records.append(r)
 
 
-app.log.addHandler(Capture())
-app.log.setLevel(logging.DEBUG)
+S.log.addHandler(Capture())
+S.log.setLevel(logging.DEBUG)
 
 
 def tracebacks():
