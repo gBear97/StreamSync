@@ -105,6 +105,77 @@ TRK_FAIL_GIVEUP = 3        # a check failing the SAME way this many times
                            # running is permanent - the film's drive gone,
                            # the file moved - not a blip: say so once,
                            # disarm, and stop the churn
+
+# --- the reflex layer: sub-second pause/resume following. The slow layer
+# above PROVES things on 2s of correlation; the reflex ACTS on 0.5s of
+# band energy and lets the slow layer contradict it. Wrong guesses are
+# undone inside the absorbable window, so acting early is safe - the one
+# thing the reflex may never do is hold a freeze the correlator disputes.
+TRK_R_CHUNK = 0.25         # the Listener's native chunk - judged one at
+                           # a time, four to the slow layer's block
+TRK_R_BANDS = ((1.0, 80.0), (4000.0, 7000.0), (1500.0, 4000.0))
+                           # bands a voice cannot OWN outright: speech
+                           # has no sub-bass at all, holds 4-7k only in
+                           # sibilant bursts (7k cap = the reference is
+                           # decoded at 16k), and - for films carrying
+                           # nothing else, like an old mono master - the
+                           # upper mids, which speech DOES reach: that
+                           # band may only ever arm against the
+                           # streamer's own measured talk ceiling
+TRK_R_VOICE = (300.0, 1500.0)  # where speech lives - context, never a trigger
+TRK_R_POOL = 1.0           # expectation min-pooled +/- this many seconds:
+                           # the playhead estimate may sit that far off,
+                           # and a scene cut must not read as a collapse
+                           # (the slow layer's exact trick, same reason)
+TRK_R_RATIO = 0.10         # heard under a tenth of the scaled expectation
+                           # in EVERY armed band = the film left the mix;
+                           # deep enough that a duck cannot reach it
+TRK_R_NEED = 2             # consecutive collapsed chunks to freeze; 3 in
+                           # wary mode (recent undos = stalls tonight)
+TRK_R_FRESH = 3.0          # the reflex extrapolates the last LOCK's
+                           # position, never the raw player clock - and
+                           # only while the chunk STARTS within this long
+                           # of the anchor stamp (in-cadence chunks start
+                           # 2.00-2.75s after it: a full chunk of margin)
+TRK_R_ARM_ERR = 0.4        # ...and only while measured lag is small:
+                           # indexing quarter-second envelopes off a
+                           # drifted clock reads transitions as pauses
+TRK_R_STALE = 0.75         # never ACT on a chunk older than this (decode
+                           # stalls backlog the queue; count as evidence,
+                           # never as a trigger)
+TRK_R_CONFIRM = 2.5        # probation: a reflex freeze has this long to
+                           # be contradicted before it is announced; an
+                           # undo inside it leaves under 3s of error -
+                           # inside what the rate pulses can absorb
+TRK_R_UNDO_N = 2           # coherent ADVANCING pairs at mere lock grade
+                           # = the film never stopped. Certainty is not
+                           # required to undo our own guess: the cheap
+                           # failure is another reflex freeze.
+TRK_R_REARM = 5            # after an undo, this many fresh small-lag
+                           # locks before the reflex may fire again -
+                           # never re-fire on the misalignment the undo
+                           # itself created
+TRK_R_SEED_N = 20          # per-band gains seed from the 20th percentile
+                           # of this many locked blocks (a min ratchets
+                           # low at band scale - outliers point DOWN here)
+TRK_R_FLOOR = (0.003, 0.0015, 0.002)  # film-side arming floors per
+                           # band: it must carry real film energy to
+                           # testify - near-noise content never arms
+TRK_R_TILT = 0.3           # speech rarely holds 4-7k above this fraction
+                           # of its own voice-band energy for half a
+                           # second: the high band arms only where the
+                           # film should beat any plausible voice spill
+TRK_R_CEIL_N = 30          # proven-pause blocks before the streamer's
+                           # own measured talk ceilings gate arming
+TRK_R_CEIL_X = 4.0         # ...requiring expectation this far above them
+TRK_R_RES_RATIO = 0.5      # armed-band energy back at half expectation
+                           # buys ONE optimistic resume...
+TRK_R_VERIFY = 3.0         # ...which must earn a lock this fast or the
+                           # film re-pauses where it stood
+TRK_R_COOLDOWN = 8.0       # after a failed optimistic resume; a second
+                           # failure disables optimism for the episode
+TRK_R_WARY_S = 300.0       # two undos this recently = a stall-prone
+                           # night: demand 3 chunks while both stand
 LOW_CONFIDENCE = 0.55      # video-match warning threshold
 
 
@@ -137,6 +208,7 @@ class App:
         self.auto_enabled = False
         self.auto_follow = False     # experimental; Alex wants default off
         self.auto_interval = 30
+        self.reflex_mode = "live"    # live | shadow (log, never act) | off
         self._last_sync = None       # context for the verdict buttons
         self._closing = False
         self._preview_photo = None
@@ -999,7 +1071,23 @@ class App:
         X = np.fft.rfft(frames, axis=1)
         k = max(int(TRK_LO_HZ), 2)   # 1s frames at sr -> bin index == Hz
         rms_lo = np.sqrt(2.0 * np.sum(np.abs(X[:, 1:k]) ** 2, axis=1)) / sr
-        return lo, audio_matcher.features(x, sr), rms, rms_lo
+        # the reflex layer's expectation: per-chunk (0.25s) energies in
+        # the voice-proof bands plus full-band, same normalization as the
+        # per-second envelopes so one set of gains serves both
+        cn = int(TRK_R_CHUNK * sr)
+        m = max(1, len(x) // cn)
+        cf = x[:m * cn].reshape(m, cn)
+        CX = np.fft.rfft(cf, axis=1)
+
+        def band(f0, f1):
+            k0 = max(int(f0 * TRK_R_CHUNK), 1)
+            k1 = max(int(f1 * TRK_R_CHUNK), k0 + 1)
+            return (np.sqrt(2.0 * np.sum(np.abs(CX[:, k0:k1]) ** 2,
+                                         axis=1)) / cn)
+
+        renv = np.stack([band(*TRK_R_BANDS[0]), band(*TRK_R_BANDS[1]),
+                         band(*TRK_R_BANDS[2])], axis=1)
+        return lo, audio_matcher.features(x, sr), rms, rms_lo, renv
 
     @staticmethod
     def _band_rms(x, sr, hi_hz):
@@ -1007,6 +1095,16 @@ class App:
         X = np.fft.rfft(x.astype(np.float64))
         k = max(int(hi_hz * len(x) / sr), 2)
         return float(np.sqrt(2.0 * np.sum(np.abs(X[1:k]) ** 2))
+                     / max(len(x), 1))
+
+    @staticmethod
+    def _rband(x, sr, f0, f1):
+        """RMS of the [f0, f1) Hz band of any block, normalized the same
+        way as _band_rms and the reference envelopes."""
+        X = np.fft.rfft(x.astype(np.float64))
+        k0 = max(int(f0 * len(x) / sr), 1)
+        k1 = max(int(f1 * len(x) / sr), k0 + 1)
+        return float(np.sqrt(2.0 * np.sum(np.abs(X[k0:k1]) ** 2))
                      / max(len(x), 1))
 
     @staticmethod
@@ -1092,6 +1190,30 @@ class App:
         fail_sig = None       # (type, message) of the failing check, and
         fail_n = 0            # its consecutive count: identical repeats
                               # mean permanent, and the loop gives up
+        chunks = []           # the current second in 0.25s pieces: the
+                              # reflex judges each one; every fourth
+                              # assembles the block the slow layer knows
+        r_anchor = None       # (position, t0) of the last in-slack lock -
+                              # the reflex's ONLY notion of the playhead
+        r_gain = [None] * 3   # per-band capture/film gains (LO, HI, MID)
+        r_seed = [[], [], []]
+        r_ceil = [[], [], []]  # the streamer's talk during proven pauses,
+        r_ceilv = [None] * 3  # per band: live ceilings gating arming
+        r_voice = None        # EMA of the voice band while tracking
+        r_hits = 0            # consecutive collapsed chunks
+        r_hit0 = None         # position where the current collapse began
+        r_back = 0            # consecutive film-came-back chunks
+        r_hold = None         # probation: (deadline, freeze wall-time) of
+                              # a reflex pause not yet announced
+        r_undo_cand = None    # advancing evidence contradicting it
+        r_undo_n = 0
+        r_undone = []         # wall times of recent undos (wary mode)
+        r_lockout = 0         # fresh locks owed before the reflex re-arms
+        r_try = None          # (deadline,) of an optimistic resume under
+                              # verification by the slow layer
+        r_tries = 0           # optimistic attempts this pause episode
+        r_cool = 0.0
+        r_arm_n = r_tot_n = 0  # reflex coverage, reported with the trace
         micro_at = 0.0
         pause_point = None
         wide_at = 0.0
@@ -1101,6 +1223,9 @@ class App:
             nonlocal listener, ref, gain, gain_seed, errs, recent, prev
             nonlocal classes, deg_streak, resume_cand, gain_lo
             nonlocal gain_lo_seed, trace, trace_scores, seen_lock
+            nonlocal chunks, r_anchor, r_gain, r_seed, r_ceil, r_ceilv
+            nonlocal r_voice, r_hits, r_back, r_hold, r_undo_cand
+            nonlocal r_undo_n, r_try
             if listener is not None:
                 listener.close()
             listener = None
@@ -1110,22 +1235,37 @@ class App:
             gain_lo_seed, trace, trace_scores = [], [], []
             deg_streak = 0
             seen_lock = False
+            # reflex EVIDENCE dies with the device chain it was learned
+            # on; reflex OWNERSHIP does not - a probation that loses its
+            # listener quietly becomes a proven pause (state and
+            # pause_point survive, the watcher takes over)
+            chunks = []
+            r_anchor, r_voice = None, None
+            r_gain, r_seed = [None] * 3, [[], [], []]
+            r_ceil, r_ceilv = [[], [], []], [None] * 3
+            r_hits = r_back = r_undo_n = 0
+            r_undo_cand, r_try, r_hold = None, None, None
 
         def trace_add(code, score=None):
-            nonlocal trace, trace_scores
+            nonlocal trace, trace_scores, r_arm_n, r_tot_n
             trace.append(code)
             if score is not None:
                 trace_scores.append(score)
             if len(trace) >= 30:
                 sc = trace_scores
                 log.info(
-                    "tracker trace: %s gain=%s lo=%s score p50=%s",
+                    "tracker trace: %s gain=%s lo=%s score p50=%s "
+                    "reflex=%s",
                     "".join(trace),
                     f"{gain:.2f}" if gain is not None
                     else f"seed {len(gain_seed)}/{TRK_SEED_N}",
                     f"{gain_lo:.2f}" if gain_lo is not None else "-",
-                    f"{float(np.median(sc)):.2f}" if sc else "-")
+                    f"{float(np.median(sc)):.2f}" if sc else "-",
+                    # armed coverage: a reflex that cannot arm is a fact
+                    # a field night must be able to see
+                    f"{100 * r_arm_n // r_tot_n}%" if r_tot_n else "-")
                 trace, trace_scores = [], []
+                r_arm_n = r_tot_n = 0
 
         def meter(new_state, strength=0.0):
             nonlocal state, last_sent, last_meter
@@ -1136,9 +1276,251 @@ class App:
                 self.q.put(("lock", new_state, strength))
                 last_sent, last_meter = key, now
 
+        def r_ceil_val(b):
+            if len(r_ceil[b]) < TRK_R_CEIL_N:
+                return None
+            if r_ceilv[b] is None:
+                r_ceilv[b] = float(np.percentile(r_ceil[b], 90))
+            return r_ceilv[b]
+
+        def r_try_fallback():
+            """An unverified optimistic resume is OWNERSHIP, not
+            evidence: the player is PLAYING on our guess, and whatever
+            interrupted us (a dead listener, a device change, a manual
+            sync) killed the verification. Park the film back on its
+            proven pause - exactly what the in-loop deadline does - so
+            the watcher, or held, owns it again instead of the film
+            free-running over a paused stream."""
+            nonlocal r_try, r_cool, wide_at
+            if r_try is None or pause_point is None:
+                return
+            r_try = None
+            r_cool = time.monotonic() + TRK_R_COOLDOWN
+            wide_at = time.monotonic()
+            try:
+                self.embedded.pause()   # r_try is embedded-only
+            except Exception:
+                pass
+            meter("paused")
+            log.info("reflex: verification interrupted - back to the "
+                     "proven pause at %s", fmt_time(pause_point))
+
+        def _reflex_watch(player, chunk, t0c, now, act):
+            """Pause side of the reflex: fire when every armed band says
+            the film's contribution left the mix for half a second."""
+            nonlocal r_hits, r_hit0, r_voice, r_arm_n, r_tot_n, r_hold
+            nonlocal r_tries, r_undo_cand, r_undo_n, pause_point, wide_at
+            nonlocal lock_streak, deg_streak, big_err, resume_cand, classes
+            r_tot_n += 1
+            if (not self.auto_follow or self.busy
+                    or self._session_running() or not seen_lock
+                    or gain is None or r_anchor is None or r_lockout
+                    or r_try is not None):
+                r_hits = 0
+                return
+            age = t0c + TRK_R_CHUNK - r_anchor[1]
+            # gate the chunk's START age: in-cadence chunks start 2.00 to
+            # 2.75s after the anchor stamp (the 2s pair's start, refreshed
+            # once a second), so a full chunk of margin separates them
+            # from the boundary - the pump's clock easing must never
+            # decide it. The first chunk after a missed lock starts at
+            # 3.00 exactly and stays refused.
+            if (not 0.0 <= age - TRK_R_CHUNK < TRK_R_FRESH
+                    or len(errs) < 3
+                    or abs(float(np.median(errs[-3:]))) > TRK_R_ARM_ERR):
+                r_hits = 0
+                return
+            # stream-truth playhead: the last lock's position plus real
+            # time since - the player clock never touches the reflex
+            pos = r_anchor[0] + age
+            renv = ref[4]
+            i = int((pos - ref[0]) / TRK_R_CHUNK)
+            w = int(TRK_R_POOL / TRK_R_CHUNK)
+            if i - w < 0 or i + w >= len(renv):
+                return   # window about to slide; hold the evidence
+            exp_b = renv[i - w:i + w + 1].min(axis=0)
+            csr = audio_capture.CAPTURE_SR
+            h = (self._rband(chunk, csr, *TRK_R_BANDS[0]),
+                 self._rband(chunk, csr, *TRK_R_BANDS[1]),
+                 self._rband(chunk, csr, *TRK_R_BANDS[2]))
+            h_full = float(np.sqrt(np.mean(chunk * chunk)))
+            h_vo = self._rband(chunk, csr, *TRK_R_VOICE)
+            armed = []
+            for b in (0, 1, 2):
+                if r_gain[b] is None or exp_b[b] < TRK_R_FLOOR[b]:
+                    continue
+                scaled = r_gain[b] * exp_b[b]
+                if b == 1 and scaled < 3.0 * TRK_R_TILT * h_vo:
+                    continue   # a loud voice could fake this much 4-7k
+                ceil = r_ceil_val(b)
+                if b == 2 and ceil is None:
+                    continue   # the upper mids NEVER arm on a guess -
+                    #             only over this streamer's measured talk
+                if ceil is not None and scaled < TRK_R_CEIL_X * ceil:
+                    continue   # this streamer's talk reaches too close
+                armed.append(b)
+            if not armed:
+                r_hits = 0
+                r_voice = (h_vo if r_voice is None
+                           else 0.9 * r_voice + 0.1 * h_vo)
+                return
+            r_arm_n += 1
+            if not all(h[b] < TRK_R_RATIO * r_gain[b] * exp_b[b]
+                       for b in armed):
+                r_hits = 0
+                r_voice = (h_vo if r_voice is None
+                           else 0.9 * r_voice + 0.1 * h_vo)
+                return
+            need = TRK_R_NEED
+            if (len(r_undone) >= 2
+                    and now - r_undone[-2] <= TRK_R_WARY_S):
+                need += 1   # wary: tonight stalls or drops out a lot
+            if (h_full < TRK_ABS_SILENCE and r_voice is not None
+                    and r_voice >= 10 * TRK_ABS_SILENCE):
+                # digital zero right after healthy capture smells like a
+                # device dropout, not a pause - demand one more chunk
+                need = max(need, TRK_R_NEED + 1)
+            r_hits += 1
+            if r_hits == 1:
+                # remember where the collapse STARTED: if stale backlog
+                # interleaves, the acting chunk is not the start
+                r_hit0 = pos - TRK_R_CHUNK
+            if r_hits < need:
+                return
+            if not act:
+                return   # a backlogged chunk may complete the evidence;
+                         # only a live one may act on it
+            r_hits = 0
+            if self.reflex_mode == "shadow":
+                log.info("reflex[shadow]: would freeze at %s (bands %s)",
+                         fmt_time(pos), armed)
+                return
+            player.pause()
+            pause_point = (r_hit0 if r_hit0 is not None
+                           else pos - need * TRK_R_CHUNK)
+            wide_at = now
+            r_hold = (now + TRK_R_CONFIRM, time.perf_counter())
+            r_undo_cand, r_undo_n, r_tries = None, 0, 0
+            lock_streak = deg_streak = 0
+            big_err, resume_cand = None, None
+            classes = []
+            meter("paused")
+            log.info("reflex: film left the mix at %s (bands %s) - "
+                     "froze, awaiting confirmation", fmt_time(pause_point),
+                     armed)
+
+        def _reflex_resume(player, chunk, t0c, now, act):
+            """Resume side: film-shaped energy back at the pause point
+            buys ONE optimistic resume the slow layer must then confirm."""
+            nonlocal r_back, r_try, r_tries, r_cool
+            if (self.busy or self._session_running() or pause_point is None
+                    or now < r_cool or r_tries >= 2 or gain is None):
+                r_back = 0
+                return
+            renv = ref[4]
+            i = int((pause_point - ref[0]) / TRK_R_CHUNK)
+            w = int(TRK_R_POOL / TRK_R_CHUNK)
+            lo_i, hi_i = max(0, i - w), min(len(renv), i + w + 1)
+            if lo_i >= hi_i:
+                return
+            # a resume announces itself LOUD: judge against the window's
+            # peak - resumes into quiet film wait for the proven watcher
+            exp_b = renv[lo_i:hi_i].max(axis=0)
+            csr = audio_capture.CAPTURE_SR
+            h_lo = self._rband(chunk, csr, *TRK_R_BANDS[0])
+            h_hi = self._rband(chunk, csr, *TRK_R_BANDS[1])
+            h_vo = self._rband(chunk, csr, *TRK_R_VOICE)
+            h_full = float(np.sqrt(np.mean(chunk * chunk)))
+            j = min(max(int(pause_point - ref[0]), 0), len(ref[2]) - 1)
+            exp_full = float(np.max(ref[2][max(0, j - 1):j + 2]))
+            back = False
+            if (r_gain[0] is not None and exp_b[0] >= TRK_R_FLOOR[0]
+                    and h_lo >= TRK_R_RES_RATIO * r_gain[0] * exp_b[0]):
+                back = True   # sub-bass came back: no voice can do that
+            elif (r_gain[1] is not None and exp_b[1] >= TRK_R_FLOOR[1]
+                    and h_hi >= TRK_R_RES_RATIO * r_gain[1] * exp_b[1]
+                    and h_hi >= 2.0 * TRK_R_TILT * h_vo
+                    and h_full >= TRK_R_RES_RATIO * gain * exp_full):
+                back = True   # high band AND the whole mix filled back in
+            elif (r_gain[2] is not None and exp_b[2] >= TRK_R_FLOOR[2]
+                    and r_ceil_val(2) is not None
+                    and self._rband(chunk, csr, *TRK_R_BANDS[2])
+                    >= max(TRK_R_RES_RATIO * r_gain[2] * exp_b[2],
+                           TRK_R_CEIL_X * r_ceil_val(2))
+                    and h_full >= TRK_R_RES_RATIO * gain * exp_full):
+                back = True   # upper mids well past this streamer's talk
+            if not back:
+                r_back = 0
+                return
+            r_back += 1
+            if r_back < TRK_R_NEED:
+                return
+            if not act:
+                return   # backlogged evidence completes streaks, never acts
+            r_back = 0
+            if self.reflex_mode == "shadow":
+                log.info("reflex[shadow]: would resume at %s",
+                         fmt_time(pause_point))
+                return
+            r_tries += 1
+            # the film restarted no later than the FIRST back-chunk: the
+            # seek anchors there, not at the chunk that merely confirmed
+            player.sync_seek(pause_point,
+                             t0c - (TRK_R_NEED - 1) * TRK_R_CHUNK,
+                             self.offset)
+            r_try = (time.monotonic() + TRK_R_VERIFY,)
+            meter("degraded", 0.0)
+            log.info("reflex: optimistic resume #%d at %s", r_tries,
+                     fmt_time(pause_point))
+
+        def reflex_tick(player, chunk, t0c):
+            """The fast half of the tracker: judge one 0.25s chunk against
+            what the film should be emitting right now, and act - the
+            slow layer keeps the right to contradict every action."""
+            nonlocal r_hold, ref
+            now = time.monotonic()
+            # the deadline outranks every gate below: a probation must
+            # expire even if the player was switched out from under it -
+            # the freeze belongs to the EMBEDDED player either way
+            if (r_hold is not None and now >= r_hold[0]
+                    and not self.busy and not self._session_running()):
+                r_hold = None
+                if not self.auto_follow:
+                    try:   # follow was unticked mid-probation: give the
+                        self.embedded.resume()   # film back
+                    except Exception:
+                        pass
+                    meter("degraded", 0.0)
+                    log.info("reflex: probation lapsed with follow off "
+                             "- resumed")
+                else:
+                    ref = None   # the watcher wants its own window: more
+                    #              behind the point, for rewind-resumes
+                    self.q.put(("swap", True))
+                    self.q.put((
+                        "status",
+                        "Auto: the stream stopped playing the film "
+                        "- pausing to match. Watching for the resume..."))
+                    log.info("reflex: pause confirmed at %s",
+                             fmt_time(pause_point))
+                return
+            if (self.reflex_mode == "off" or player is not self.embedded
+                    or ref is None or len(ref) < 5 or film_meta is None):
+                return
+            # a backlogged chunk (a decode ran) still carries evidence -
+            # it just may not ACT: the act flag gates the triggers only
+            act = time.perf_counter() - t0c <= TRK_R_STALE
+            if state == "paused":
+                if r_hold is None:
+                    _reflex_resume(player, chunk, t0c, now, act)
+            else:
+                _reflex_watch(player, chunk, t0c, now, act)
+
         while not self._closing:
             if (not self.auto_enabled or self.busy or not self.video_path
                     or self._session_running()):  # sessions own the playhead
+                r_try_fallback()   # a playing, unverified resume must be
+                #                    parked BEFORE held looks at state
                 if state == "paused":
                     # remember the pause WE hold: the interruption (a
                     # manual sync, a toggle, a session) must not orphan
@@ -1151,6 +1533,8 @@ class App:
                 # an idle spell (busy, disarm, re-arm) starts the failure
                 # count fresh - a user retrying deserves the full three
                 fail_sig, fail_n = None, 0
+                r_hits = r_back = r_undo_n = 0
+                r_undo_cand = None
                 close_listener()   # also clears streaks and candidates
                 time.sleep(1.0)
                 continue
@@ -1167,6 +1551,7 @@ class App:
                     meter("paused")
             if listener is None or listen_dev != self.audio_device:
                 try:
+                    r_try_fallback()   # a device change kills the verify
                     close_listener()
                     listener = audio_capture.Listener(
                         self.audio_device or None)
@@ -1177,20 +1562,22 @@ class App:
                     time.sleep(5.0)
                     continue
             try:
-                block, t0_blk = listener.read(1.0)
+                chunk, t0_chk = listener.read(TRK_R_CHUNK)
             except Exception as e:
                 self.q.put(("status", f"Auto listener failed: {e}"))
+                r_try_fallback()   # a dead listener kills the verify
                 close_listener()
                 time.sleep(3.0)
                 continue
-            rms = float(np.sqrt(np.mean(block * block)))
-            lo_rms = self._band_rms(block, audio_capture.CAPTURE_SR,
-                                    TRK_LO_HZ)
-            recent.append((block, t0_blk))
-            del recent[:-3]
             player = self.active_player
             check_failed = False
+            check_ran = False
             try:
+                # capture is film-agnostic (it is the stream's audio):
+                # buffer the chunk before any film bookkeeping, so a
+                # probe iteration never eats a quarter of a block
+                chunks.append((chunk, t0_chk))
+                del chunks[:-4]
                 if film_meta is None or film_meta[0] != self.video_path:
                     film_meta = (self.video_path,
                                  matcher.probe(self.video_path)[1])
@@ -1205,9 +1592,27 @@ class App:
                     lock_streak = deg_streak = 0
                     seen_lock = False
                     resume_cand, pause_point, held = None, None, None
+                    r_anchor, r_voice = None, None
+                    r_gain, r_seed = [None] * 3, [[], [], []]
+                    r_ceil, r_ceilv = [[], [], []], [None] * 3
+                    r_hits = r_back = r_undo_n = r_lockout = r_tries = 0
+                    r_undo_cand, r_hold, r_try = None, None, None
+                    r_undone, r_cool = [], 0.0
                     if state == "paused":
                         meter("off")
                     continue
+                reflex_tick(player, chunk, t0_chk)
+                if len(chunks) < 4:
+                    continue
+                block = np.concatenate([c for c, _ in chunks])
+                t0_blk = chunks[0][1]
+                chunks = []
+                check_ran = True   # a full slow-layer check begins here
+                rms = float(np.sqrt(np.mean(block * block)))
+                lo_rms = self._band_rms(block, audio_capture.CAPTURE_SR,
+                                        TRK_LO_HZ)
+                recent.append((block, t0_blk))
+                del recent[:-3]
                 # evidence rolls in overlapping 2s pairs: one second is
                 # too little audio to correlate reliably, and near-silence
                 # correlates as garbage-high (its energy divides to noise)
@@ -1305,6 +1710,32 @@ class App:
                                "deg": "D", "quiet": "q"}[cls],
                               score if C is not None else None)
 
+                    if r_try is not None:
+                        if cls == "lock":
+                            # the optimistic resume found the film again:
+                            # now it is a real resume - say so
+                            r_try = None
+                            r_tries = 0
+                            self.q.put(("swap", False))
+                            self.q.put(("status",
+                                        "Auto: stream resumed - "
+                                        "following."))
+                            log.info("reflex: resume confirmed")
+                        elif (time.monotonic() >= r_try[0]
+                                and not self.busy
+                                and not self._session_running()):
+                            # nothing locked: that energy was not the
+                            # film. Back to the pause, where it stood -
+                            # on the EMBEDDED player, whatever is active
+                            self.embedded.pause()
+                            r_try = None
+                            r_cool = time.monotonic() + TRK_R_COOLDOWN
+                            wide_at = time.monotonic()
+                            meter("paused")
+                            log.info("reflex: resume not confirmed - "
+                                     "re-pausing (attempt %d)", r_tries)
+                            continue
+
                     if cls == "lock":
                         lock_streak += 1
                         deg_streak = 0
@@ -1348,6 +1779,54 @@ class App:
                                 gain_lo = 0.98 * gain_lo + 0.02 * g2
                         errs.append(err)
                         del errs[:-5]
+                        # the reflex extrapolates from here, and earns its
+                        # way back after an undo only through steady locks
+                        r_anchor = (t_found, t0_cap)
+                        if (r_lockout and len(errs) >= 3
+                                and abs(float(np.median(errs[-3:])))
+                                <= TRK_R_ARM_ERR):
+                            r_lockout -= 1
+                        # per-band reflex gains: center-learned like the
+                        # full-band gain, only where the film actually
+                        # carries the band; percentile seed - a min
+                        # ratchets low at band scale
+                        j0 = int((t_found + 1.0 - ref[0]) / TRK_R_CHUNK)
+                        if 0 <= j0 and j0 + 4 <= len(ref[4]):
+                            # quadratic mean: the block's band RMS is the
+                            # QM of its chunks' - an arithmetic mean would
+                            # inflate the gain up to 2x on bursty content
+                            rexp = np.sqrt(
+                                (ref[4][j0:j0 + 4] ** 2).mean(axis=0))
+                            for b in (0, 1, 2):
+                                if rexp[b] < TRK_R_FLOOR[b]:
+                                    continue
+                                gb = (self._rband(
+                                    block, audio_capture.CAPTURE_SR,
+                                    *TRK_R_BANDS[b]) / float(rexp[b]))
+                                if r_gain[b] is None:
+                                    r_seed[b].append(gb)
+                                    if len(r_seed[b]) >= TRK_R_SEED_N:
+                                        r_gain[b] = float(np.percentile(
+                                            r_seed[b], 20))
+                                        log.info(
+                                            "reflex: band %d gain "
+                                            "calibrated %.4f", b,
+                                            r_gain[b])
+                                    continue
+                                if gb < r_gain[b]:
+                                    # sink fast but never off a cliff -
+                                    # one codec-crushed block must not
+                                    # ratchet the band dead
+                                    r_gain[b] = max(
+                                        0.7 * r_gain[b] + 0.3 * gb,
+                                        0.25 * r_gain[b])
+                                else:
+                                    r_gain[b] = (0.98 * r_gain[b]
+                                                 + 0.02 * gb)
+                                if gain is not None:
+                                    r_gain[b] = min(max(r_gain[b],
+                                                        0.05 * gain),
+                                                    20.0 * gain)
                         meter("locked", score)
                         now = time.monotonic()
                         if (len(errs) == 5
@@ -1377,6 +1856,11 @@ class App:
                                 "status",
                                 f"Auto: corrected {err:+.2f}s "
                                 f"(score {score:.2f}, confirmed twice)."))
+                            if r_try is not None:
+                                # a confident corrective seek IS the
+                                # verification: the film is playing
+                                r_try, r_tries = None, 0
+                                self.q.put(("swap", False))
                             big_err = None
                             deg_streak = 0
                             errs, classes, ref = [], [], None
@@ -1396,17 +1880,33 @@ class App:
                             # in the recent window, so even a pause masked
                             # by talk is caught at the breath gaps
                             player.pause()
-                            pause_point = expect
                             wide_at = time.monotonic()
                             deg_streak, resume_cand = 0, None
                             ref, classes = None, []
-                            self.q.put(("swap", True))
-                            self.q.put((
-                                "status",
-                                "Auto: the stream stopped playing the film "
-                                "- pausing to match. Watching for the "
-                                "resume..."))
-                            meter("paused")
+                            if r_try is not None:
+                                # the slow layer is overruling our
+                                # optimistic resume: count it as the
+                                # failed attempt it is, keep the already-
+                                # announced pause point - the stream
+                                # never moved - and say nothing twice
+                                if player is not self.embedded:
+                                    self.embedded.pause()
+                                r_try = None
+                                r_cool = (time.monotonic()
+                                          + TRK_R_COOLDOWN)
+                                meter("paused")
+                                log.info("reflex: optimistic resume "
+                                         "overruled by the energy check "
+                                         "- back to the pause")
+                            else:
+                                pause_point = expect
+                                self.q.put(("swap", True))
+                                self.q.put((
+                                    "status",
+                                    "Auto: the stream stopped playing "
+                                    "the film - pausing to match. "
+                                    "Watching for the resume..."))
+                                meter("paused")
                         else:
                             meter("degraded", 0.0)
                     elif cls == "deg":
@@ -1436,6 +1936,11 @@ class App:
                                     "status",
                                     "Auto: the stream moved - re-locked "
                                     f"at {fmt_time(t_w)}."))
+                                if r_try is not None:
+                                    # the wide search found the film
+                                    # playing: verification satisfied
+                                    r_try, r_tries = None, 0
+                                    self.q.put(("swap", False))
                                 errs, classes, ref = [], [], None
                                 meter("locked", 0.5)
                                 continue
@@ -1449,6 +1954,56 @@ class App:
                             film_meta[1],
                             max(0.0, pause_point - TRK_RESUME_WIN
                                 + TRK_REF_BACK))
+                    if r_hold is not None:
+                        # probation: our own freeze, not yet announced.
+                        # Coherent ADVANCING evidence at mere lock grade
+                        # proves the film never stopped - certainty is
+                        # not required to undo our own guess; the cheap
+                        # failure is another reflex freeze. (The tracking
+                        # ref still covers the region ahead: it was NOT
+                        # cleared at the freeze, so no decode stalls the
+                        # 2.5s probation clock.)
+                        sc = None
+                        if C is not None:
+                            t_f, sc = self._corr_block(ref[0], ref[1], C)
+                            if sc >= TRK_LOCK_SCORE:
+                                coh = (r_undo_cand is not None
+                                       and abs((t_f - r_undo_cand[0])
+                                               - (t0_cap
+                                                  - r_undo_cand[1]))
+                                       <= 1.0)
+                                r_undo_n = r_undo_n + 1 if coh else 1
+                                r_undo_cand = (t_f, t0_cap)
+                            else:
+                                r_undo_n, r_undo_cand = 0, None
+                            if (r_undo_n >= TRK_R_UNDO_N
+                                    and not self.busy
+                                    and not self._session_running()):
+                                # the freeze was applied to the EMBEDDED
+                                # player; undo it there, whatever is
+                                # active by now
+                                self.embedded.resume()
+                                behind = (time.perf_counter()
+                                          - r_hold[1])
+                                r_hold = None
+                                r_undone.append(time.monotonic())
+                                del r_undone[:-4]
+                                r_lockout = TRK_R_REARM
+                                r_undo_n, r_undo_cand = 0, None
+                                lock_streak = 0
+                                # errs stays: the median absorber must
+                                # finish what one pulse cannot (1.5s cap,
+                                # and the pulse may be busy - it reports,
+                                # we do not insist)
+                                self.embedded.absorb_drift(
+                                    min(behind, 1.5))
+                                meter("degraded", sc)
+                                log.info("reflex: false alarm - resumed "
+                                         "after %.1fs, absorbing", behind)
+                                continue
+                        trace_add("f", sc)
+                        meter("paused")
+                        continue
                     if C is None:
                         lock_streak = 0
                         resume_cand = None
@@ -1483,6 +2038,15 @@ class App:
                             resume_cand = None
                     trace_add("R" if lock_streak else "P",
                               score if C is not None else None)
+                    # a proven pause is free calibration: whatever energy
+                    # arrives now is the streamer's talk alone - the live
+                    # ceiling a reflex band must clear to ever arm
+                    for b in (0, 1, 2):
+                        r_ceil[b].append(self._rband(
+                            block, audio_capture.CAPTURE_SR,
+                            *TRK_R_BANDS[b]))
+                        del r_ceil[b][:-300]
+                        r_ceilv[b] = None
                     if (lock_streak >= 2 and not self.busy
                             and not self._session_running()):
                         player.sync_seek(t_found, t0_cap, self.offset)
@@ -1491,6 +2055,7 @@ class App:
                                     "Auto: stream resumed - following."))
                         lock_streak = deg_streak = 0
                         resume_cand = None
+                        r_try, r_tries, r_back = None, 0, 0
                         errs, classes, ref = [], [], None
                         meter("locked", score)
                         continue
@@ -1512,6 +2077,7 @@ class App:
                                 f"{fmt_time(t_w)}."))
                             lock_streak = deg_streak = 0
                             resume_cand = None
+                            r_try, r_tries, r_back = None, 0, 0
                             errs, classes, ref = [], [], None
                             meter("locked", 0.5)
                             continue
@@ -1550,8 +2116,9 @@ class App:
                 time.sleep(1.0 if fail_n >= TRK_FAIL_GIVEUP
                            else max(self.auto_interval, 10))
             finally:
-                if not check_failed:
-                    # a check that ran clean breaks the streak
+                if check_ran and not check_failed:
+                    # a full check that ran clean breaks the streak -
+                    # reflex-only chunk passes prove nothing about it
                     fail_sig, fail_n = None, 0
         close_listener()
 
@@ -2425,6 +2992,7 @@ class App:
                 "auto_interval": self.auto_interval,
                 "follow_pauses": self.follow_var.get(),
                 "auto_resync": self.auto_var.get(),
+                "reflex": self.reflex_mode,
                 "swap": self.swap_var.get(),
                 "stream_title": self.stream_title,
                 "relay_url": self.relay_url,
@@ -2487,6 +3055,9 @@ class App:
         # the master switch is persisted like every other setting - it
         # used to reset silently every launch, leaving "follow stream
         # pauses" checked, armed-looking, and completely inert
+        mode = cfg.get("reflex", "live")
+        self.reflex_mode = mode if mode in ("live", "shadow", "off") \
+            else "live"
         if bool(cfg.get("auto_resync", False)):
             self.auto_var.set(True)
             self.auto_enabled = True

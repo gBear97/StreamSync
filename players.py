@@ -106,13 +106,16 @@ class EmbeddedPlayer:
         """Consume a small sync offset invisibly: run gently fast or slow
         until `delta` seconds are absorbed, then return to 1x. A gentle
         rate keeps video judder imperceptible; audio is muted in the mode
-        that uses this. Unlike a seek, nothing jumps."""
+        that uses this. Unlike a seek, nothing jumps. Returns False when
+        a pulse is already running - the caller can retry, or leave the
+        remainder to the tracker's median absorber."""
+        if not self._pulse_lock.acquire(blocking=False):
+            return False  # an absorb is already running
         threading.Thread(target=self._absorb, args=(delta,),
                          daemon=True).start()
+        return True
 
     def _absorb(self, delta):
-        if not self._pulse_lock.acquire(blocking=False):
-            return  # an absorb is already running
         try:
             self._pulse_cancel.clear()
             rate = 1.05 if delta > 0 else 0.95
@@ -164,6 +167,12 @@ class EmbeddedPlayer:
         self._pulse_cancel.set()
         if self.mp.is_playing():
             self.mp.set_pause(1)
+
+    def resume(self):
+        """Idempotent un-pause, the counterpart of pause(): set_pause(0)
+        cannot toggle back into a pause however the calls interleave."""
+        if self.has_media:
+            self.mp.set_pause(0)
 
     def seek(self, seconds):
         self._pulse_cancel.set()
@@ -441,6 +450,9 @@ class ExternalPlayer:
         until the drift is absorbed, then return to 1x."""
         if not self._pulse_lock.acquire(blocking=False):
             return  # a pulse is already running
+        self._rate_pulse_locked(delta)
+
+    def _rate_pulse_locked(self, delta):
         try:
             rate = 1.5 if delta > 0 else 0.5
             self._cmd("rate", str(rate))
@@ -453,9 +465,20 @@ class ExternalPlayer:
 
     def absorb_drift(self, delta):
         """Same contract as EmbeddedPlayer.absorb_drift: consume a small
-        offset without a visible seek, via the existing rate pulse."""
-        threading.Thread(target=self._rate_pulse, args=(delta,),
+        offset without a visible seek, via the existing rate pulse.
+        Returns False when a pulse is already running."""
+        if not self._pulse_lock.acquire(blocking=False):
+            return False
+        threading.Thread(target=self._rate_pulse_locked, args=(delta,),
                          daemon=True).start()
+        return True
+
+    def resume(self):
+        """Idempotent un-pause: force-resume never toggles into a pause."""
+        try:
+            self._cmd("pl_forceresume")
+        except Exception:
+            pass
 
     def set_mute(self, mute):
         try:

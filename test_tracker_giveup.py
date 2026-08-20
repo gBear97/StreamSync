@@ -52,7 +52,10 @@ def _fast_sleep(s):
 time.sleep = _fast_sleep
 
 
-def noise(n=audio_capture.CAPTURE_SR):
+CHUNK_N = int(app.TRK_R_CHUNK * audio_capture.CAPTURE_SR)
+
+
+def noise(n=CHUNK_N):
     return (0.1 * rng.standard_normal(n)).astype(np.float32)
 
 
@@ -73,13 +76,17 @@ matcher.probe = lambda path: (7200.0, 0.0)
 
 
 class FakeListener:
+    # the real Listener pumps 0.25s chunks; the loop reads them one at a
+    # time and assembles its own 1s blocks - the script holds CHUNKS
     script = queue.Queue()
 
     def __init__(self, name=None, sr=audio_capture.CAPTURE_SR):
         pass
 
     def read(self, seconds):
-        return FakeListener.script.get(), time.perf_counter() - 1.0
+        assert abs(seconds - app.TRK_R_CHUNK) < 1e-9, \
+            f"loop reads {seconds}s, harness scripts {app.TRK_R_CHUNK}s"
+        return FakeListener.script.get(), time.perf_counter() - 0.3
 
     def close(self):
         pass
@@ -124,6 +131,8 @@ class FakeApp(app.App):
         self.session = None
         self.active_player = FakePlayer()
         self.embedded = object()      # is-not active_player -> no clock lag
+        self.reflex_mode = "off"      # the give-up tests exercise the slow
+                                      # layer; test_tracker_reflex covers it
 
 
 records = []
@@ -151,11 +160,13 @@ def wait_for(cond, what, timeout=8.0):
 
 
 def feed(n=1):
-    """Feed n capture blocks and wait until the loop has taken them all."""
-    for _ in range(n):
+    """Feed n capture BLOCKS (4 chunks each) and wait for consumption.
+    Feeding whole blocks keeps the loop parked only at block boundaries,
+    so mode flips between feeds attach to the intended check."""
+    for _ in range(4 * n):
         FakeListener.script.put(noise())
-    wait_for(FakeListener.script.empty, "blocks to be consumed")
-    _real_sleep(0.1)      # let the iteration holding the last block finish
+    wait_for(FakeListener.script.empty, "chunks to be consumed")
+    _real_sleep(0.15)     # let the check holding the last chunk finish
 
 
 class Scenario:
@@ -191,7 +202,8 @@ class Scenario:
 
     def close(self):
         self.fake._closing = True
-        FakeListener.script.put(noise())   # unblock a parked read
+        for _ in range(4):                 # unblock a parked read at any
+            FakeListener.script.put(noise())   # position within a block
         self.loop.join(5.0)
         alive = self.loop.is_alive()
         self._stop.set()
@@ -202,7 +214,8 @@ class Scenario:
 
 # --- A: identical permanent failure -> one status, one traceback, one off
 s = Scenario("A: permanent identical failure gives up cleanly")
-feed(2)                  # film probe + pair prime: clean iterations
+feed(1)                  # film probe rides the first chunk; the first
+                         # assembled block just primes the pair
 feed(3)                  # three identical FileNotFoundError checks
 wait_for(lambda: s.kinds("auto_off"), "the give-up message")
 raw = s.statuses("Auto-resync check failed")
@@ -225,7 +238,7 @@ s.close()
 
 # --- B: a clean check breaks the streak
 s = Scenario("B: clean check resets the counter")
-feed(2)                  # probe + prime
+feed(1)                  # probe + prime
 feed(2)                  # fails 1, 2
 assert not s.kinds("auto_off"), "gave up after only two failures"
 DECODE["mode"] = "ok"
@@ -244,7 +257,7 @@ s.close()
 
 # --- C: alternating signatures never accumulate to a give-up
 s = Scenario("C: alternating signatures don't accumulate")
-feed(2)
+feed(1)
 DECODE["mode"] = "fnf"
 feed(1)
 DECODE["mode"] = "alt"
@@ -259,7 +272,7 @@ s.close()
 # --- D: a non-file error gets the generic wording
 s = Scenario("D: non-file failures word the stop generically")
 DECODE["mode"] = "alt"
-feed(2)
+feed(1)
 feed(3)
 wait_for(lambda: s.kinds("auto_off"), "the generic give-up")
 msg = s.kinds("auto_off")[0][0]
