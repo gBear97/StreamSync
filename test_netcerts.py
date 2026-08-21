@@ -85,6 +85,21 @@ with no_certifi():
     ok("certifi treated as absent when it cannot be imported",
        netcerts._load_certifi(empty_context()) is False)
 
+# --- the reported source is the one that actually supplied the roots ----
+# Two sources can yield the same certificate count, so the count alone
+# cannot tell CI which one carried the request.
+_saved_ctx, _saved_src = netcerts._ctx, netcerts._source
+_orig_default = ssl.create_default_context
+try:
+    ssl.create_default_context = empty_context  # no roots from OpenSSL
+    netcerts._ctx = None
+    netcerts._build()
+    check("source names certifi when OpenSSL has nothing",
+          netcerts._source, "certifi")
+finally:
+    ssl.create_default_context = _orig_default
+    netcerts._ctx, netcerts._source = _saved_ctx, _saved_src
+
 # --- the keychain fallback, which needs nothing bundled -----------------
 if sys.platform == "darwin":
     c = empty_context()
@@ -191,7 +206,7 @@ finally:
 
 # --- describe() reports enough to diagnose a repeat ---------------------
 info = netcerts.describe()
-for key in ("ca_certs", "openssl_cafile", "certifi", "frozen"):
+for key in ("ca_certs", "source", "openssl_cafile", "certifi", "frozen"):
     ok(f"describe() reports {key}", key in info)
 
 # --- nothing bypasses netcerts ------------------------------------------

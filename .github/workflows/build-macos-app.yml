@@ -103,8 +103,18 @@ jobs:
           echo "--- as this runner is configured ---"
           "$APP" --netcheck
           echo "--- with OpenSSL's default CA paths taken away ---"
-          SSL_CERT_FILE=/nonexistent/cert.pem \
-          SSL_CERT_DIR=/nonexistent/certs "$APP" --netcheck
+          out=$(SSL_CERT_FILE=/nonexistent/cert.pem \
+                SSL_CERT_DIR=/nonexistent/certs "$APP" --netcheck)
+          echo "$out"
+          # Assert the bundle's own roots did the work. Two sources can
+          # report the same certificate count, so without this the step
+          # passes just as happily if the override stops applying and
+          # OpenSSL's roots quietly carried the request after all.
+          case "$out" in
+            *"source: certifi"*) ;;
+            *) echo "Expected the bundled certifi to supply the roots."
+               exit 1 ;;
+          esac
 
       # A disk image is how a Mac app is normally shipped. It keeps the
       # bundle's symlinks and execute bits (which upload-artifact's own

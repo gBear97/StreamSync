@@ -51,6 +51,7 @@ _KEYCHAINS = [
 _lock = threading.Lock()
 _ctx = None
 _widened = False
+_source = "none"   # which of the three below actually supplied the roots
 
 
 def _ca_count(ctx):
@@ -117,11 +118,24 @@ def _load_keychain(ctx):
 
 
 def _build():
+    """The first source that yields any roots wins, and is recorded.
+
+    Recording it is not decoration: two sources can produce the same
+    certificate count, so a log line saying "121 roots" cannot show which
+    one carried the request - and "the bundle's own roots are enough" is
+    exactly the claim CI exists to check.
+    """
+    global _source
     ctx = ssl.create_default_context()
-    if _ca_count(ctx) == 0:
-        _load_certifi(ctx)
-    if _ca_count(ctx) == 0:
-        _load_keychain(ctx)
+    for name, load in (("openssl", None),
+                       ("certifi", _load_certifi),
+                       ("keychain", _load_keychain)):
+        if load is not None:
+            load(ctx)
+        if _ca_count(ctx):
+            _source = name
+            return ctx
+    _source = "none"
     return ctx
 
 
@@ -180,6 +194,7 @@ def describe():
         where = None
     return {
         "ca_certs": n,
+        "source": _source,
         "widened": _widened,
         "openssl_cafile": paths.openssl_cafile,
         "openssl_cafile_exists": bool(paths.openssl_cafile
