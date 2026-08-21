@@ -51,6 +51,13 @@ jobs:
           python3 test_matcher.py
           python3 test_audio_matcher.py
 
+      # Builds the real first-run dialog against Aqua Tk and auto-closes it.
+      # Catches "window opens but never paints" and anything that throws
+      # while the widgets are being laid out.
+      - name: Smoke-test the first-run dialog
+        timeout-minutes: 3
+        run: python3 depcheck.py --demo
+
       - name: Build StreamSync.app
         run: sh build_app_mac.sh
 

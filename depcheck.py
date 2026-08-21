@@ -37,6 +37,18 @@ BLACKHOLE_DRIVERS = [
     "/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver",
     "/Library/Audio/Plug-Ins/HAL/BlackHole16ch.driver",
 ]
+# An .app launched from Finder inherits a minimal PATH (no ~/.zprofile), so
+# Homebrew's bin is missing from it - look in its two standard locations.
+BREW_PATHS = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+VLC_SITE = ("https://www.videolan.org/vlc/download-macosx.html" if IS_MAC
+            else "https://www.videolan.org/vlc/download-windows.html")
+
+if IS_MAC:
+    UI_FONT, MONO_FONT = ("Helvetica Neue", 13, "bold"), ("Menlo", 11)
+elif sys.platform == "win32":
+    UI_FONT, MONO_FONT = ("Segoe UI", 10, "bold"), ("Consolas", 9)
+else:
+    UI_FONT, MONO_FONT = ("DejaVu Sans", 10, "bold"), ("DejaVu Sans Mono", 9)
 
 _DEMO_NO_VLC = False  # test hook
 
@@ -76,7 +88,7 @@ def vlc_dll_path():
         p = os.path.join(d, "libvlc.dll")
         if os.path.isfile(p):
             return p
-    except OSError:
+    except (OSError, ImportError):  # ImportError: no winreg off Windows
         pass
     return None
 
@@ -102,9 +114,16 @@ def ffmpeg_ok():
         return False
 
 
-def has_pkgmgr():
-    """winget on Windows, Homebrew on macOS."""
-    return shutil.which("brew" if IS_MAC else "winget") is not None
+def pkgmgr_path():
+    """Path to Homebrew (macOS) / winget (Windows), or None.
+
+    Returns a full path rather than a bare name: with Finder's minimal PATH
+    neither the lookup nor a later subprocess call would find brew by name.
+    """
+    found = shutil.which("brew" if IS_MAC else "winget")
+    if found or not IS_MAC:
+        return found
+    return next((p for p in BREW_PATHS if os.path.isfile(p)), None)
 
 
 def collect():
@@ -116,7 +135,7 @@ def collect():
         "vlc32_only": (not IS_MAC and vlc_dll_path() is None
                        and os.path.isfile(VLC32_DLL)),
         "ffmpeg": None if pkgs else ffmpeg_ok(),
-        "winget": has_pkgmgr(),
+        "pkgmgr": pkgmgr_path(),
         "blackhole": blackhole_present(),
     }
 
@@ -151,12 +170,14 @@ class _Dialog:
 
         self.root = tk.Tk()
         self.root.title("StreamSync - first-run check")
-        self.root.resizable(False, False)
+        # Fixed-size everywhere except macOS, where leaving the window
+        # resizable is the user's escape hatch if it ever comes up unpainted.
+        self.root.resizable(IS_MAC, IS_MAC)
         frm = ttk.Frame(self.root, padding=12)
         frm.grid(sticky="nsew")
 
         ttk.Label(frm, text="StreamSync needs a couple of things before it "
-                            "can start:", font=("Segoe UI", 10, "bold")
+                            "can start:", font=UI_FONT
                   ).grid(row=0, column=0, columnspan=2, sticky="w")
 
         self.row_lbls = {}
@@ -187,7 +208,7 @@ class _Dialog:
                    command=self._open_vlc_site).pack(side="left", padx=(8, 0))
 
         self.out = tk.Text(frm, height=10, width=78, state="disabled",
-                           font=("Consolas", 9))
+                           font=MONO_FONT)
         self.out.grid(row=7, column=0, columnspan=2, pady=(10, 0))
 
         self.status = ttk.Label(frm, text="", foreground="#245")
@@ -256,7 +277,7 @@ class _Dialog:
         state_pip = "!disabled" if (c["packages"] and not frozen()) else "disabled"
         self.pip_btn.state([state_pip])
         self.vlc_btn.state(["!disabled"] if not c["vlc"] else ["disabled"])
-        if not c["winget"]:
+        if not c["pkgmgr"]:
             self.vlc_btn.state(["disabled"])
         if self.bh_btn is not None:
             self.bh_btn.state(["!disabled"] if c["blackhole"] is False
@@ -279,20 +300,21 @@ class _Dialog:
                   "Python packages installed.")
 
     def _fix_vlc(self):
-        if not self.checks["winget"]:
+        mgr = self.checks["pkgmgr"]
+        if not mgr:
             self._open_vlc_site()
             return
         if IS_MAC:
             self._log("Installing VLC through Homebrew (the cask downloads "
                       "VideoLAN's own signed app).\n")
-            self._run(["brew", "install", "--cask", "vlc"],
+            self._run([mgr, "install", "--cask", "vlc"],
                       "VLC installed successfully.")
         else:
             self._log("Installing VLC through winget (Microsoft's package "
                       "manager - the download is verified and the installer "
                       "is VideoLAN's own signed one). A Windows admin prompt "
                       "will appear; please approve it.\n")
-            self._run(["winget", "install", "-e", "--id", "VideoLAN.VLC",
+            self._run([mgr, "install", "-e", "--id", "VideoLAN.VLC",
                        "--accept-source-agreements",
                        "--accept-package-agreements"],
                       "VLC installed successfully.")
@@ -385,9 +407,12 @@ class _Dialog:
 
     def _open_vlc_site(self):
         import webbrowser
-        webbrowser.open("https://www.videolan.org/vlc/download-windows.html")
-        self.status.config(text="Get the 64-bit Windows installer, run it, "
-                                "then this dialog will re-check automatically.")
+        webbrowser.open(VLC_SITE)
+        self.status.config(
+            text="Drag VLC into /Applications, then this dialog will re-check "
+                 "automatically." if IS_MAC else
+                 "Get the 64-bit Windows installer, run it, then this dialog "
+                 "will re-check automatically.")
         self.root.after(4000, self._auto_recheck)
 
     def _auto_recheck(self):
@@ -453,7 +478,33 @@ class _Dialog:
         self.proceed = True
         self.root.destroy()
 
+    def _present(self):
+        """Force the window to draw itself before we block in mainloop.
+
+        A packaged .app starts out behind whatever the user was looking at
+        and without keyboard focus; on macOS that can leave Tk showing a
+        titled but completely empty window, since the contents are never
+        painted. Claiming focus and nudging the geometry once makes Aqua
+        lay it out for real.
+        """
+        r = self.root
+        r.update_idletasks()
+        if IS_MAC:
+            w, h = r.winfo_reqwidth(), r.winfo_reqheight()
+            r.geometry(f"{w}x{h + 1}")
+            r.update_idletasks()
+            r.geometry(f"{w}x{h}")
+            r.lift()
+            r.attributes("-topmost", True)
+            r.after_idle(r.attributes, "-topmost", False)
+            try:
+                r.focus_force()
+            except self.tk.TclError:
+                pass
+        r.update()
+
     def run(self):
+        self._present()
         self.root.mainloop()
         return self.proceed
 
@@ -472,5 +523,5 @@ if __name__ == "__main__":
         print("optional missing:", c["optional"] or "none")
         print("vlc:", c["vlc"] or "NOT FOUND")
         print("ffmpeg ok:", c["ffmpeg"])
-        print("winget available:", c["winget"])
+        print("package manager:", c["pkgmgr"] or "NOT FOUND")
         print("ALL OK" if all_ok(c) else "PROBLEMS FOUND")
