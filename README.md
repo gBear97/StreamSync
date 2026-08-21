@@ -212,10 +212,13 @@ sh build_app_mac.sh          # optional: build StreamSync.app (run on the Mac)
 No Mac at hand to build on? The **Build macOS app** GitHub Actions
 workflow compiles `StreamSync.app` on GitHub's macOS machines - for both
 Apple Silicon (`arm64`) and Intel (`x86_64`) - on every push to `main`
-or on demand (Actions tab > Build macOS app > Run workflow). Download
-the artifact from the run page, unzip, and right-click > **Open** on
-first launch (the build is unsigned). VLC still needs to be installed
-on the Mac that runs it.
+or on demand (Actions tab > Build macOS app > Run workflow). Each run
+attaches a disk image; download it from the run page, unzip the artifact
+GitHub wraps it in, open the `.dmg`, and drag StreamSync.app to
+Applications. The build is unsigned, so clear the download quarantine
+once - `xattr -dr com.apple.quarantine /Applications/StreamSync.app` -
+and use right-click > **Open** the first time. VLC still needs to be
+installed on the Mac that runs it.
 
 ### One-time macOS setup
 

@@ -61,15 +61,31 @@ jobs:
       - name: Build StreamSync.app
         run: sh build_app_mac.sh
 
-      # ditto preserves the bundle's symlinks and execute bits, which
-      # upload-artifact's own zipping would strip.
-      - name: Zip the app bundle
-        run: ditto -c -k --sequesterRsrc --keepParent dist/StreamSync.app "StreamSync-macOS-${{ matrix.arch }}.app.zip"
+      # A disk image is how a Mac app is normally shipped. It keeps the
+      # bundle's symlinks and execute bits (which upload-artifact's own
+      # zipping strips) and it mounts on double-click - so the download
+      # doesn't have to survive a second trip through Archive Utility, which
+      # is where the previous zip-inside-a-zip broke.
+      - name: Package as a disk image
+        run: |
+          hdiutil create -volname StreamSync \
+            -srcfolder dist/StreamSync.app -fs HFS+ -ov -format UDZO \
+            "StreamSync-macOS-${{ matrix.arch }}.dmg"
+
+      - name: Verify the disk image mounts and the app is intact
+        run: |
+          MNT=$(mktemp -d)
+          hdiutil attach "StreamSync-macOS-${{ matrix.arch }}.dmg" \
+            -mountpoint "$MNT" -nobrowse -readonly
+          test -x "$MNT/StreamSync.app/Contents/MacOS/StreamSync" \
+            || { echo "main binary missing or not executable"; exit 1; }
+          echo "Mounted OK:"; ls -l "$MNT/StreamSync.app/Contents/MacOS/" | head
+          hdiutil detach "$MNT"
 
       - uses: actions/upload-artifact@v4
         with:
           name: StreamSync-macOS-${{ matrix.arch }}
-          path: StreamSync-macOS-${{ matrix.arch }}.app.zip
+          path: StreamSync-macOS-${{ matrix.arch }}.dmg
           if-no-files-found: error
 
       - name: Write run summary
@@ -77,11 +93,11 @@ jobs:
           {
             echo "### StreamSync.app (${{ matrix.arch }}) built"
             echo ""
-            echo "Download the **StreamSync-macOS-${{ matrix.arch }}** artifact above and unzip it."
+            echo "Download the **StreamSync-macOS-${{ matrix.arch }}** artifact above and unzip it (GitHub always wraps artifacts in a zip). Open the .dmg inside, then drag StreamSync.app to Applications."
             echo ""
-            echo "First open: the build is unsigned (no Apple Developer ID), so macOS will warn."
-            echo "Right-click StreamSync.app > **Open** > **Open**, or approve it under"
-            echo "**System Settings > Privacy & Security > Open Anyway**."
+            echo "The build is unsigned (no Apple Developer ID), so macOS quarantines it. Clear the flag once:"
             echo ""
-            echo "VLC.app must be installed on the Mac that runs it (the app's first-run gate offers to install it)."
+            echo "    xattr -dr com.apple.quarantine /Applications/StreamSync.app"
+            echo ""
+            echo "VLC.app must also be installed on the Mac that runs it (the app's first-run gate offers to install it)."
           } >> "$GITHUB_STEP_SUMMARY"
