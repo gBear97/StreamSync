@@ -36,6 +36,17 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Version plus short SHA: the version says what this is, the SHA
+      # guarantees two builds never land in Downloads under one name.
+      - name: Name this build
+        run: |
+          VERSION=$(python3 -c 'from version import __version__; print(__version__)')
+          NAME="StreamSync-$VERSION-${{ matrix.arch }}-$(git rev-parse --short HEAD)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "ARTIFACT=$NAME" >> "$GITHUB_ENV"
+          echo "DMG=$NAME.dmg" >> "$GITHUB_ENV"
+          echo "Building $NAME.dmg"
+
       # The UI needs a Python built with Tkinter (see MAC_FIRST_RUN.md);
       # fail loudly here rather than ship an .app that can't open a window.
       - name: Check Tk is available
@@ -50,6 +61,7 @@ jobs:
         run: |
           python3 test_matcher.py
           python3 test_audio_matcher.py
+          python3 test_updater.py
 
       # Builds the real first-run dialog against Aqua Tk and auto-closes it.
       # Catches "window opens but never paints" and anything that throws
@@ -80,15 +92,13 @@ jobs:
       # is where the previous zip-inside-a-zip broke.
       - name: Package as a disk image
         run: |
-          hdiutil create -volname StreamSync \
-            -srcfolder dist/StreamSync.app -fs HFS+ -ov -format UDZO \
-            "StreamSync-macOS-${{ matrix.arch }}.dmg"
+          hdiutil create -volname "StreamSync $VERSION" \
+            -srcfolder dist/StreamSync.app -fs HFS+ -ov -format UDZO "$DMG"
 
       - name: Verify the disk image mounts and the app is intact
         run: |
           MNT=$(mktemp -d)
-          hdiutil attach "StreamSync-macOS-${{ matrix.arch }}.dmg" \
-            -mountpoint "$MNT" -nobrowse -readonly
+          hdiutil attach "$DMG" -mountpoint "$MNT" -nobrowse -readonly
           test -x "$MNT/StreamSync.app/Contents/MacOS/StreamSync" \
             || { echo "main binary missing or not executable"; exit 1; }
           echo "Mounted OK:"; ls -l "$MNT/StreamSync.app/Contents/MacOS/" | head
@@ -96,16 +106,16 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: StreamSync-macOS-${{ matrix.arch }}
-          path: StreamSync-macOS-${{ matrix.arch }}.dmg
+          name: ${{ env.ARTIFACT }}
+          path: ${{ env.DMG }}
           if-no-files-found: error
 
       - name: Write run summary
         run: |
           {
-            echo "### StreamSync.app (${{ matrix.arch }}) built"
+            echo "### StreamSync $VERSION (${{ matrix.arch }})"
             echo ""
-            echo "Download the **StreamSync-macOS-${{ matrix.arch }}** artifact above and unzip it (GitHub always wraps artifacts in a zip). Open the .dmg inside, then drag StreamSync.app to Applications."
+            echo "Download the **$ARTIFACT** artifact above and unzip it (GitHub always wraps artifacts in a zip). Open $DMG inside, then drag StreamSync.app to Applications."
             echo ""
             echo "The build is unsigned (no Apple Developer ID), so macOS quarantines it. Clear the flag once:"
             echo ""

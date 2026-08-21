@@ -31,6 +31,7 @@ import matcher
 import session
 import windowctl
 from players import EmbeddedPlayer, ExternalPlayer, VLCError
+from version import __version__
 
 CONFIG_PATH = Path.home() / ".streamsync.json"
 BURST_FRAMES = 4
@@ -90,7 +91,7 @@ class App:
         self.session = None          # active HostSession / ViewerSession
         self.relay_url = "ws://localhost:8765"
 
-        root.title("StreamSync")
+        root.title(f"StreamSync {__version__}")
         root.resizable(False, False)
 
         self._build_video_window()

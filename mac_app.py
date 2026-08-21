@@ -17,6 +17,7 @@ import json
 import os
 import queue
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -34,6 +35,8 @@ import depcheck
 import macwindowctl
 import matcher
 import session
+import updater
+from version import __version__
 from players import EmbeddedPlayer, ExternalPlayer, VLCError
 
 CONFIG_PATH = Path.home() / ".streamsync.json"
@@ -92,7 +95,7 @@ class MacApp:
         self.session = None          # active HostSession / ViewerSession
         self.relay_url = "ws://localhost:8765"
 
-        root.title("StreamSync")
+        root.title(f"StreamSync {__version__}")
         root.resizable(False, False)
 
         # menu variables (created before menus reference them)
@@ -133,6 +136,8 @@ class MacApp:
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         root.after(80, self._poll_queue)
         root.after(700, self._tick_time)
+        # Quiet: only speaks up when there is actually something newer.
+        root.after(2500, lambda: self._check_updates(quiet=True))
 
     # -------------------------------------------------------------- main UI
 
@@ -292,6 +297,9 @@ class MacApp:
         advm.add_separator()
         advm.add_command(label="Show Last Capture Preview",
                          command=self.preview_win.deiconify)
+        advm.add_separator()
+        advm.add_command(label="Check for Updates...",
+                         command=lambda: self._check_updates(quiet=False))
         m.add_cascade(label="Advanced", menu=advm)
 
         self.root.config(menu=m)
@@ -301,6 +309,91 @@ class MacApp:
         self.root.bind_all("<Command-p>", lambda e: self._toggle_pause())
         self.root.bind_all("<Shift-Command-f>",
                            lambda e: self._toggle_fullscreen())
+
+    # ------------------------------------------------------------- updates
+
+    def _check_updates(self, quiet=True):
+        """Ask GitHub for a newer release, off the UI thread.
+
+        quiet=True is the startup check: it stays silent unless there is
+        something to offer, so a laptop with no network never nags.
+        """
+        def work():
+            try:
+                tag, rel = updater.available_update()
+            except updater.UpdateError as e:
+                if not quiet:
+                    self.q.put(("update_err", str(e)))
+                return
+            if tag:
+                self.q.put(("update", tag, rel))
+            elif not quiet:
+                self.q.put(("update_none", __version__))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _offer_update(self, tag, rel):
+        app_path = updater.installed_app_path()
+        if app_path is None:
+            messagebox.showinfo(
+                "StreamSync - update available",
+                f"Version {tag} is available (you have {__version__}).\n\n"
+                "This copy is running from source, so it can't replace "
+                "itself - git pull instead.")
+            return
+
+        if not messagebox.askyesno(
+                "StreamSync - update available",
+                f"Version {tag} is available. You have {__version__}.\n\n"
+                "StreamSync will download it, check it against the checksum "
+                "published with the release, then restart into the new "
+                "version. Your settings are kept.\n\nUpdate now?"):
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("StreamSync - updating")
+        dlg.resizable(True, False)
+        frm = ttk.Frame(dlg, padding=12)
+        frm.grid(sticky="nsew")
+        status = ttk.Label(frm, text="Starting...", width=52)
+        status.grid(row=0, column=0, sticky="w")
+        bar = ttk.Progressbar(frm, length=380, mode="determinate")
+        bar.grid(row=1, column=0, pady=(8, 0))
+        depcheck.present_window(dlg)
+
+        def say(text):
+            self.root.after(0, lambda: status.config(text=text))
+
+        def work():
+            try:
+                asset = updater.pick_asset(rel.get("assets", []))
+                sums = next((a["browser_download_url"]
+                             for a in rel.get("assets", [])
+                             if a.get("name") == updater.SUMS_ASSET), None)
+
+                def progress(done, total):
+                    if total:
+                        pct = done * 100 // total
+                        self.root.after(0, lambda: bar.config(value=pct))
+                    self.root.after(0, lambda: status.config(
+                        text=f"Downloading {asset['name']} - "
+                             f"{done // 1024 // 1024} MB"))
+
+                tmp = tempfile.mkdtemp(prefix="streamsync-dl-")
+                dmg = updater.download_verified(asset, sums, tmp, progress)
+                say("Checksum verified. Installing...")
+                staged = updater.stage(dmg, app_path, say)
+                say("Restarting into the new version...")
+                updater.swap_and_relaunch(app_path, staged)
+                self.root.after(300, self._on_close)
+            except Exception as e:
+                self.root.after(0, dlg.destroy)
+                self.root.after(0, lambda: messagebox.showerror(
+                    "StreamSync - update failed",
+                    f"{e}\n\nYour installed copy has not been changed. You "
+                    f"can download it yourself from:\n{updater.RELEASES_PAGE}"))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _rebuild_subs_menu(self, tracks):
         self.subs_menu.delete(0, "end")
@@ -911,6 +1004,15 @@ class MacApp:
                     self._rebuild_streamapp_menu(payload[0])
                 elif kind == "preview":
                     self._show_preview(payload[0])
+                elif kind == "update":
+                    self._offer_update(payload[0], payload[1])
+                elif kind == "update_none":
+                    messagebox.showinfo(
+                        "StreamSync",
+                        f"You're on the latest version ({payload[0]}).")
+                elif kind == "update_err":
+                    messagebox.showwarning(
+                        "StreamSync - update check failed", payload[0])
                 elif kind == "adone":
                     match_t, score, z = payload
                     msg = (f"Matched at {fmt_time(match_t)} "

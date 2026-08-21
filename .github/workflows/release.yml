@@ -1,0 +1,104 @@
+name: Release
+
+# Publishes a GitHub Release when a version tag is pushed. The release is
+# what the in-app updater reads, so its shape matters: one .dmg per
+# architecture, named the same way CI names every other build, plus a
+# SHA256SUMS the updater checks each download against before installing.
+#
+#   1. bump __version__ in version.py and commit
+#   2. git tag v1.0.1 && git push origin v1.0.1
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The tag is the release's identity, so it must agree with the
+      # version baked into the app - otherwise the updater would offer an
+      # update that reports a different version once installed, and keep
+      # offering it forever.
+      - name: Check the tag matches version.py
+        run: |
+          FILE=$(python3 -c 'from version import __version__; print(__version__)')
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$FILE" != "$TAG" ]; then
+            echo "Tag $GITHUB_REF_NAME says $TAG but version.py says $FILE."
+            echo "Bump version.py to match the tag, or retag."
+            exit 1
+          fi
+          echo "DMG=StreamSync-$FILE-${{ matrix.arch }}-$(git rev-parse --short HEAD).dmg" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        run: python3 -m pip install -r requirements.txt
+
+      - name: Run tests
+        run: |
+          python3 test_matcher.py
+          python3 test_audio_matcher.py
+          python3 test_updater.py
+
+      - name: Build StreamSync.app
+        run: sh build_app_mac.sh
+
+      - name: Package as a disk image
+        run: |
+          hdiutil create -volname "StreamSync ${GITHUB_REF_NAME#v}" \
+            -srcfolder dist/StreamSync.app -fs HFS+ -ov -format UDZO "$DMG"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dmg-${{ matrix.arch }}
+          path: ${{ env.DMG }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dmg-*
+          merge-multiple: true
+          path: dist
+
+      # The updater refuses any download it cannot match here, so a
+      # release without this file installs nothing.
+      - name: Checksum the disk images
+        working-directory: dist
+        run: |
+          sha256sum *.dmg | tee SHA256SUMS
+          ls -lh
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "StreamSync $GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*.dmg dist/SHA256SUMS
