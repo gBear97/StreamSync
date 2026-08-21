@@ -1,0 +1,103 @@
+name: Build macOS app
+
+# Compiles StreamSync.app on GitHub's macOS runners (PyInstaller can't
+# cross-compile, so the build has to happen on real macOS). Runs on every
+# push to main, on this feature branch, and on demand via "Run workflow".
+# The finished app is attached to the run as a downloadable artifact.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - claude/streamsync-macos-build-uo1vr0
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: StreamSync.app (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest # Apple Silicon (M-series Macs)
+            arch: arm64
+          - runner: macos-15-intel # Intel Macs
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The UI needs a Python built with Tkinter (see MAC_FIRST_RUN.md);
+      # fail loudly here rather than ship an .app that can't open a window.
+      - name: Check Tk is available
+        run: python3 -c "import tkinter; print('Tk', tkinter.TkVersion)"
+
+      - name: Install dependencies
+        run: python3 -m pip install -r requirements.txt
+
+      # The no-UI, no-VLC, no-permissions engine tests from MAC_FIRST_RUN.md:
+      # prove the sync brain works on this macOS/arch before packaging it.
+      - name: Run engine tests
+        run: |
+          python3 test_matcher.py
+          python3 test_audio_matcher.py
+
+      # Builds the real first-run dialog against Aqua Tk and auto-closes it.
+      # Catches "window opens but never paints" and anything that throws
+      # while the widgets are being laid out.
+      - name: Smoke-test the first-run dialog
+        timeout-minutes: 3
+        run: python3 depcheck.py --demo
+
+      - name: Build StreamSync.app
+        run: sh build_app_mac.sh
+
+      # A disk image is how a Mac app is normally shipped. It keeps the
+      # bundle's symlinks and execute bits (which upload-artifact's own
+      # zipping strips) and it mounts on double-click - so the download
+      # doesn't have to survive a second trip through Archive Utility, which
+      # is where the previous zip-inside-a-zip broke.
+      - name: Package as a disk image
+        run: |
+          hdiutil create -volname StreamSync \
+            -srcfolder dist/StreamSync.app -fs HFS+ -ov -format UDZO \
+            "StreamSync-macOS-${{ matrix.arch }}.dmg"
+
+      - name: Verify the disk image mounts and the app is intact
+        run: |
+          MNT=$(mktemp -d)
+          hdiutil attach "StreamSync-macOS-${{ matrix.arch }}.dmg" \
+            -mountpoint "$MNT" -nobrowse -readonly
+          test -x "$MNT/StreamSync.app/Contents/MacOS/StreamSync" \
+            || { echo "main binary missing or not executable"; exit 1; }
+          echo "Mounted OK:"; ls -l "$MNT/StreamSync.app/Contents/MacOS/" | head
+          hdiutil detach "$MNT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StreamSync-macOS-${{ matrix.arch }}
+          path: StreamSync-macOS-${{ matrix.arch }}.dmg
+          if-no-files-found: error
+
+      - name: Write run summary
+        run: |
+          {
+            echo "### StreamSync.app (${{ matrix.arch }}) built"
+            echo ""
+            echo "Download the **StreamSync-macOS-${{ matrix.arch }}** artifact above and unzip it (GitHub always wraps artifacts in a zip). Open the .dmg inside, then drag StreamSync.app to Applications."
+            echo ""
+            echo "The build is unsigned (no Apple Developer ID), so macOS quarantines it. Clear the flag once:"
+            echo ""
+            echo "    xattr -dr com.apple.quarantine /Applications/StreamSync.app"
+            echo ""
+            echo "VLC.app must also be installed on the Mac that runs it (the app's first-run gate offers to install it)."
+          } >> "$GITHUB_STEP_SUMMARY"
