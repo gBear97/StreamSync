@@ -34,6 +34,7 @@ import depcheck
 import macwindowctl
 import matcher
 import session
+from version import __version__
 from players import EmbeddedPlayer, ExternalPlayer, VLCError
 
 CONFIG_PATH = Path.home() / ".streamsync.json"
@@ -92,7 +93,7 @@ class MacApp:
         self.session = None          # active HostSession / ViewerSession
         self.relay_url = "ws://localhost:8765"
 
-        root.title("StreamSync")
+        root.title(f"StreamSync {__version__}")
         root.resizable(False, False)
 
         # menu variables (created before menus reference them)
