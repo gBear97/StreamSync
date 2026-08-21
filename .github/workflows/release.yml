@@ -35,7 +35,7 @@ jobs:
     # the job was cancelled at exactly 30 minutes with notarytool still
     # running and nothing logged. A job budget has to exceed the sum of
     # what its steps may take, not match one of them.
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -274,12 +274,25 @@ jobs:
             --key "$RUNNER_TEMP/notary.p8" \
             --key-id "$NOTARY_KEY_ID" \
             --issuer "$NOTARY_ISSUER_ID" \
-            --wait --timeout 30m 2>&1 | tee "$LOG" || true
+            --wait --timeout 45m 2>&1 | tee "$LOG" || true
           SUBMIT=$(cat "$LOG")
 
           if ! printf '%s\n' "$SUBMIT" | grep -q "status: Accepted"; then
             ID=$(printf '%s\n' "$SUBMIT" | awk '/ id: /{print $2; exit}')
             echo ""
+            # A refusal and an unanswered submission are different things,
+            # and only one of them is about this build. Saying "Apple
+            # refused" after a timeout sends everyone hunting for a defect
+            # that was never reported - there is no log to fetch yet,
+            # because processing had not finished.
+            if printf '%s\n' "$SUBMIT" | grep -q "Timeout of"; then
+              echo "=== Apple did not answer within the wait. ==="
+              echo "The submission is still queued on Apple's side; nothing"
+              echo "here says the build is bad. Re-running usually clears it."
+              echo "To ask about this exact submission later:"
+              echo "  xcrun notarytool log $ID --key-id ... --issuer ..."
+              exit 1
+            fi
             echo "=== Apple refused this build. Its reasons: ==="
             if [ -n "$ID" ]; then
               xcrun notarytool log "$ID" \
@@ -317,12 +330,17 @@ jobs:
             --key "$RUNNER_TEMP/notary.p8" \
             --key-id "$NOTARY_KEY_ID" \
             --issuer "$NOTARY_ISSUER_ID" \
-            --wait --timeout 30m 2>&1 | tee "$LOG" || true
+            --wait --timeout 45m 2>&1 | tee "$LOG" || true
           SUBMIT=$(cat "$LOG")
 
           if ! printf '%s\n' "$SUBMIT" | grep -q "status: Accepted"; then
             ID=$(printf '%s\n' "$SUBMIT" | awk '/ id: /{print $2; exit}')
             echo ""
+            if printf '%s\n' "$SUBMIT" | grep -q "Timeout of"; then
+              echo "=== Apple did not answer within the wait. ==="
+              echo "Still queued on Apple's side; submission $ID."
+              exit 1
+            fi
             echo "=== Apple refused the disk image. Its reasons: ==="
             [ -n "$ID" ] && xcrun notarytool log "$ID" \
               --key "$RUNNER_TEMP/notary.p8" \
