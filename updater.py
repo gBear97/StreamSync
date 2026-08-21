@@ -21,6 +21,7 @@ import platform
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 
 from version import __version__
@@ -96,9 +97,17 @@ def _get(url, timeout=30):
 
 
 def fetch_latest(timeout=15):
-    """The latest published release, as GitHub's JSON."""
+    """The latest published release, or None if the repo has none yet.
+
+    A repo with no releases answers 404, which is not a failure - it is
+    just nothing to offer, and must not be reported as unreachable.
+    """
     try:
         return json.loads(_get(LATEST_URL, timeout))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise UpdateError(f"GitHub returned HTTP {e.code}.") from e
     except Exception as e:
         raise UpdateError(f"Could not reach GitHub: {e}") from e
 
@@ -106,6 +115,8 @@ def fetch_latest(timeout=15):
 def available_update():
     """(version, release) if a newer release exists, else (None, None)."""
     rel = fetch_latest()
+    if not rel:
+        return (None, None)
     tag = rel.get("tag_name") or rel.get("name") or ""
     return (tag, rel) if is_newer(tag) else (None, None)
 
