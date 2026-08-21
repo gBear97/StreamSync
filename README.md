@@ -198,6 +198,29 @@ Embedded video window: **F11**/Fullscreen button toggles fullscreen,
 - If global hotkeys don't register, run the terminal as administrator
   once, or just use the buttons.
 
+## Updates
+
+StreamSync checks GitHub for a newer release when it starts, and quietly
+does nothing if there isn't one or the machine is offline. **Advanced >
+Check for Updates...** asks on demand. When something newer exists it
+offers to install it: the disk image is downloaded over HTTPS, checked
+against the `SHA256SUMS` published in the same release, unpacked beside
+the installed copy, and only swapped in after the app quits - by a helper
+that puts the old bundle back if the move fails. A copy running from a
+source checkout never replaces itself; it tells you to `git pull`.
+
+To cut a release:
+
+```
+# 1. bump __version__ in version.py, commit it
+git tag v1.0.1 && git push origin v1.0.1
+```
+
+The Release workflow refuses to build if the tag and `version.py`
+disagree - otherwise an update would install a build that reports a
+different version and be offered again forever. It publishes one `.dmg`
+per architecture plus the `SHA256SUMS` the updater verifies against.
+
 ## macOS
 
 The same engine with a Mac-shaped shell: a minimal main window (film,

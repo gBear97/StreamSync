@@ -61,6 +61,7 @@ jobs:
         run: |
           python3 test_matcher.py
           python3 test_audio_matcher.py
+          python3 test_updater.py
 
       # Builds the real first-run dialog against Aqua Tk and auto-closes it.
       # Catches "window opens but never paints" and anything that throws
