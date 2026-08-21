@@ -14,6 +14,7 @@ Platform notes:
 """
 
 import json
+import os
 import queue
 import sys
 import threading
@@ -114,6 +115,11 @@ class MacApp:
         try:
             self.player_backend = EmbeddedPlayer(None)  # libvlc's own window
         except VLCError as e:
+            if "--selftest" in sys.argv:
+                # Nobody can dismiss a modal in an unattended run, and a
+                # blocked dialog looks identical to a hung app.
+                print(f"SELFTEST: VLC unavailable - {e}", file=sys.stderr)
+                raise SystemExit(2)
             messagebox.showerror("StreamSync - VLC problem", str(e))
             raise SystemExit(1)
         self.active_player = self.player_backend
@@ -1054,6 +1060,10 @@ def main():
     root.mainloop()
     if "--selftest" in sys.argv:
         print("SELFTEST OK")
+        # libvlc leaves native threads running that a plain return would wait
+        # on; an unattended check must never be able to hang.
+        sys.stdout.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":

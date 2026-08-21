@@ -60,8 +60,14 @@ class RegionSelector:
         top.overrideredirect(True)
 
         if sys.platform == "darwin":
-            # Tk works in points, mss in physical pixels (Retina 2x):
-            # overlay covers the primary display, coords scale up on return
+            # Overlay covers the primary display only. macOS reports
+            # display geometry in points through *both* Tk and mss (measured
+            # 1440x900 from each on a 1440x900 MBP, mss 10.2), so this ratio
+            # is 1.0 and the region passes through in points - which is the
+            # unit sct.grab() wants back. Computed rather than hardcoded so a
+            # pixel-reporting mss would still line up. A Retina panel may hand
+            # back a larger image than the box asked for; harmless, since
+            # _to_gray reads each frame's own dimensions.
             with mss.mss() as sct:
                 mon = sct.monitors[1]
             over_w, over_h = top.winfo_screenwidth(), top.winfo_screenheight()
