@@ -68,6 +68,21 @@ def missing_packages(pkgs=REQUIRED_PKGS):
             if importlib.util.find_spec(mod) is None]
 
 
+def _mac_vlc_from_spotlight():
+    """Ask Spotlight for VLC.app, covering installs outside /Applications."""
+    try:
+        r = subprocess.run(
+            ["mdfind", "kMDItemCFBundleIdentifier == 'org.videolan.vlc'"],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for app in r.stdout.splitlines():
+        dylib = os.path.join(app.strip(), "Contents/MacOS/lib/libvlc.dylib")
+        if app.strip() and os.path.isfile(dylib):
+            return dylib
+    return None
+
+
 def vlc_dll_path():
     """Path to a loadable libvlc, or None."""
     if _DEMO_NO_VLC:
@@ -76,7 +91,7 @@ def vlc_dll_path():
         for p in VLC_MAC_DYLIBS:
             if os.path.isfile(p):
                 return p
-        return None
+        return _mac_vlc_from_spotlight()
     if os.path.isfile(VLC64_DLL):
         return VLC64_DLL
     try:
@@ -204,7 +219,7 @@ class _Dialog:
                 side="left", padx=(8, 0))
         else:
             self.bh_btn = None
-        ttk.Button(btns, text="Open videolan.org instead",
+        ttk.Button(btns, text="Open videolan.org",
                    command=self._open_vlc_site).pack(side="left", padx=(8, 0))
 
         self.out = tk.Text(frm, height=10, width=78, state="disabled",
@@ -216,6 +231,8 @@ class _Dialog:
 
         bottom = ttk.Frame(frm)
         bottom.grid(row=9, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(bottom, text="Re-check",
+                   command=self._recheck).pack(side="left", padx=(0, 8))
         self.cont_btn = ttk.Button(bottom, text="Start StreamSync",
                                    command=self._continue)
         self.cont_btn.pack(side="left")
@@ -244,7 +261,8 @@ class _Dialog:
             self.row_lbls["vlc"].config(
                 text="[MISSING] VLC: only 32-bit found - 64-bit VLC is required")
         else:
-            self.row_lbls["vlc"].config(text="[MISSING] VLC media player")
+            self.row_lbls["vlc"].config(
+                text="[MISSING] VLC media player - get it at videolan.org/vlc")
 
         if c["blackhole"] is True:
             self.row_lbls["blackhole"].config(
@@ -276,9 +294,12 @@ class _Dialog:
 
         state_pip = "!disabled" if (c["packages"] and not frozen()) else "disabled"
         self.pip_btn.state([state_pip])
-        self.vlc_btn.state(["!disabled"] if not c["vlc"] else ["disabled"])
-        if not c["pkgmgr"]:
+        if c["vlc"]:
             self.vlc_btn.state(["disabled"])
+        else:
+            self.vlc_btn.state(["!disabled"])
+            self.vlc_btn.config(text="Install VLC automatically"
+                                if c["pkgmgr"] else "Download VLC...")
         if self.bh_btn is not None:
             self.bh_btn.state(["!disabled"] if c["blackhole"] is False
                               else ["disabled"])
