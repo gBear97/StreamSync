@@ -65,23 +65,32 @@ jobs:
 
       # Fail in seconds on a missing secret rather than ten minutes later
       # at the signing step, with a message naming what to add.
+      #
+      # These env names deliberately match the secret names exactly. They
+      # used to be shorter aliases, and the failure then read "Missing
+      # repository secret(s): P12 ..." - naming something that cannot be
+      # found in the settings page, which is the one place the message is
+      # read. What it prints must be what you paste.
       - name: Check the signing secrets are present
         env:
-          P12: ${{ secrets.MACOS_CERT_P12 }}
-          P12_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
-          NOTARY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
           NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
           NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
         run: |
           missing=""
-          for v in P12 P12_PASSWORD NOTARY_P8 NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+          for v in MACOS_CERT_P12 MACOS_CERT_PASSWORD NOTARY_KEY_P8 \
+                   NOTARY_KEY_ID NOTARY_ISSUER_ID; do
             eval "val=\$$v"
             [ -n "$val" ] || missing="$missing $v"
           done
           if [ -n "$missing" ]; then
             echo "Missing repository secret(s):$missing"
-            echo "Add them under Settings > Secrets and variables > Actions."
-            echo "Releases are signed and notarized, so none of these are optional."
+            echo ""
+            echo "Add them at Settings > Secrets and variables > Actions >"
+            echo "New repository secret, using exactly the names above."
+            echo "Releases are signed and notarized, so none are optional."
             exit 1
           fi
           echo "All five signing secrets are present."
