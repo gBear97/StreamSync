@@ -4,9 +4,14 @@
 set -e
 VERSION=$(python3 -c 'from version import __version__; print(__version__)')
 python3 -m pip install -r requirements.txt pyinstaller
+# certifi is collected explicitly: netcerts imports it lazily, so
+# PyInstaller's import scan never sees it, and without its cacert.pem the
+# bundle has no CA roots and every HTTPS call fails to verify.
 python3 -m PyInstaller --noconfirm --windowed --name StreamSync \
     --collect-all imageio_ffmpeg \
     --collect-all soundcard \
+    --collect-all certifi \
+    --hidden-import certifi \
     streamsync.py
 
 PLIST=dist/StreamSync.app/Contents/Info.plist

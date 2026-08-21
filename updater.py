@@ -3,7 +3,9 @@
 This is the one place StreamSync fetches and runs code it did not ship
 with, so each step is checked rather than trusted:
 
-- the release feed and the download are HTTPS to github.com;
+- the release feed and the download are HTTPS to github.com, verified
+  against real CA roots (see netcerts - a frozen build ships none of its
+  own, so this was silently failing closed until it was fixed);
 - the disk image must match the SHA256 published beside it in the same
   release, which catches a truncated or corrupted download;
 - the unpacked bundle must carry an intact Developer ID signature from
@@ -21,12 +23,14 @@ import hashlib
 import json
 import os
 import platform
+import ssl
 import subprocess
 import sys
 import tempfile
 import urllib.error
 import urllib.request
 
+import netcerts
 from version import __version__
 
 REPO = "gBear97/StreamSync"
@@ -98,9 +102,18 @@ def installed_app_path():
 # ------------------------------------------------------------------ network
 
 def _get(url, timeout=30):
-    with urllib.request.urlopen(
+    with netcerts.urlopen(
             urllib.request.Request(url, headers=_UA), timeout=timeout) as r:
         return r.read()
+
+
+def _why(e):
+    """A reason a user can act on, for whatever stopped the request."""
+    reason = getattr(e, "reason", e)
+    if isinstance(reason, ssl.SSLError):
+        return ("Could not verify GitHub's certificate, so nothing was "
+                f"downloaded. Update from {RELEASES_PAGE} instead.\n\n{reason}")
+    return f"Could not reach GitHub: {e}"
 
 
 def fetch_latest(timeout=15):
@@ -116,7 +129,7 @@ def fetch_latest(timeout=15):
             return None
         raise UpdateError(f"GitHub returned HTTP {e.code}.") from e
     except Exception as e:
-        raise UpdateError(f"Could not reach GitHub: {e}") from e
+        raise UpdateError(_why(e)) from e
 
 
 def available_update():
@@ -147,16 +160,19 @@ def download_verified(asset, sums_url, dest_dir, progress=None):
     total = asset.get("size") or 0
     done = 0
     req = urllib.request.Request(asset["browser_download_url"], headers=_UA)
-    with urllib.request.urlopen(req, timeout=60) as r, open(path, "wb") as f:
-        while True:
-            chunk = r.read(256 * 1024)
-            if not chunk:
-                break
-            f.write(chunk)
-            digest.update(chunk)
-            done += len(chunk)
-            if progress:
-                progress(done, total)
+    try:
+        with netcerts.urlopen(req, timeout=60) as r, open(path, "wb") as f:
+            while True:
+                chunk = r.read(256 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                digest.update(chunk)
+                done += len(chunk)
+                if progress:
+                    progress(done, total)
+    except OSError as e:
+        raise UpdateError(_why(e)) from e
 
     got = digest.hexdigest()
     if got != want:
