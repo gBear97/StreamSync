@@ -173,6 +173,32 @@ def ensure_ready(force_dialog=False):
     return _Dialog(checks).run()
 
 
+def present_window(root):
+    """Force a Tk window to actually draw itself before its mainloop.
+
+    A packaged .app starts out behind whatever the user was looking at and
+    without keyboard focus; on macOS that can leave Tk showing a titled but
+    completely empty window, because the contents are never painted.
+    Claiming focus and nudging the geometry once makes Aqua lay it out for
+    real. The nudge still works on a resizable(False, False) window - that
+    only stops the *user* dragging the frame, not a programmatic resize.
+    """
+    root.update_idletasks()
+    if IS_MAC:
+        w, h = root.winfo_reqwidth(), root.winfo_reqheight()
+        root.geometry(f"{w}x{h + 1}")
+        root.update_idletasks()
+        root.geometry(f"{w}x{h}")
+        root.lift()
+        root.attributes("-topmost", True)
+        root.after_idle(root.attributes, "-topmost", False)
+        try:
+            root.focus_force()
+        except Exception:
+            pass
+    root.update()
+
+
 class _Dialog:
     def __init__(self, checks, demo=False):
         import tkinter as tk
@@ -499,33 +525,8 @@ class _Dialog:
         self.proceed = True
         self.root.destroy()
 
-    def _present(self):
-        """Force the window to draw itself before we block in mainloop.
-
-        A packaged .app starts out behind whatever the user was looking at
-        and without keyboard focus; on macOS that can leave Tk showing a
-        titled but completely empty window, since the contents are never
-        painted. Claiming focus and nudging the geometry once makes Aqua
-        lay it out for real.
-        """
-        r = self.root
-        r.update_idletasks()
-        if IS_MAC:
-            w, h = r.winfo_reqwidth(), r.winfo_reqheight()
-            r.geometry(f"{w}x{h + 1}")
-            r.update_idletasks()
-            r.geometry(f"{w}x{h}")
-            r.lift()
-            r.attributes("-topmost", True)
-            r.after_idle(r.attributes, "-topmost", False)
-            try:
-                r.focus_force()
-            except self.tk.TclError:
-                pass
-        r.update()
-
     def run(self):
-        self._present()
+        present_window(self.root)
         self.root.mainloop()
         return self.proceed
 

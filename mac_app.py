@@ -14,6 +14,7 @@ Platform notes:
 """
 
 import json
+import os
 import queue
 import sys
 import threading
@@ -29,6 +30,7 @@ from PIL import Image, ImageTk
 import audio_capture
 import audio_matcher
 import capture
+import depcheck
 import macwindowctl
 import matcher
 import session
@@ -113,6 +115,11 @@ class MacApp:
         try:
             self.player_backend = EmbeddedPlayer(None)  # libvlc's own window
         except VLCError as e:
+            if "--selftest" in sys.argv:
+                # Nobody can dismiss a modal in an unattended run, and a
+                # blocked dialog looks identical to a hung app.
+                print(f"SELFTEST: VLC unavailable - {e}", file=sys.stderr)
+                raise SystemExit(2)
             messagebox.showerror("StreamSync - VLC problem", str(e))
             raise SystemExit(1)
         self.active_player = self.player_backend
@@ -1045,11 +1052,18 @@ class MacApp:
 def main():
     root = tk.Tk()
     MacApp(root)
+    # Same exposure the first-run dialog had: launched from Finder this
+    # window can come up titled but unpainted until something forces a draw.
+    depcheck.present_window(root)
     if "--selftest" in sys.argv:
         root.after(3000, root.destroy)
     root.mainloop()
     if "--selftest" in sys.argv:
         print("SELFTEST OK")
+        # libvlc leaves native threads running that a plain return would wait
+        # on; an unattended check must never be able to hang.
+        sys.stdout.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":
