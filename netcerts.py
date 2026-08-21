@@ -222,6 +222,14 @@ def selfcheck(url="https://api.github.com/", out=print):
             url, headers={"User-Agent": "StreamSync-netcheck"})
         with urlopen(req, timeout=30) as r:
             out(f"  HTTP {r.status} from {url}")
+    except urllib.error.HTTPError as e:
+        # A refusal at the HTTP layer is still a verified connection: the
+        # handshake completed and the certificate checked out, which is
+        # the entire question here. GitHub's unauthenticated rate limit
+        # lands here routinely from shared CI addresses and says nothing
+        # about whether the bundle has usable roots.
+        out(f"  HTTP {e.code} from {url} - the server refused the request,"
+            f" but the connection to it verified, which is what this asks")
     except Exception as e:
         out(f"FAIL: {type(e).__name__}: {e}")
         return 1

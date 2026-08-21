@@ -204,6 +204,43 @@ finally:
     urllib.request.urlopen = _real_urlopen
     _reset()
 
+# --- an HTTP error is a verified connection, not a CA failure -----------
+# selfcheck used to treat any exception as failure, so GitHub answering
+# "403 rate limit exceeded" from a shared CI address failed the release -
+# even though receiving an HTTP status at all proves the certificate
+# verified.
+_real_urlopen2 = urllib.request.urlopen
+
+
+def _refusing(status):
+    def f(req, timeout=None, context=None):
+        raise urllib.error.HTTPError("https://x/", status, "nope", {}, None)
+    return f
+
+
+try:
+    urllib.request.urlopen = _refusing(403)
+    lines = []
+    try:
+        check("an HTTP refusal still passes the check",
+              netcerts.selfcheck(out=lines.append), 0)
+        ok("and it says the connection verified",
+           any("verified" in ln for ln in lines))
+    except Exception as e:
+        fails.append(f"an HTTP refusal was not tolerated: {e!r}")
+
+    def _tls_broken(req, timeout=None, context=None):
+        raise urllib.error.URLError(
+            ssl.SSLCertVerificationError("certificate verify failed"))
+
+    _reset(widened=True)  # widened, so the retry cannot rescue it
+    urllib.request.urlopen = _tls_broken
+    check("a verification failure still fails the check",
+          netcerts.selfcheck(out=lambda _: None), 1)
+finally:
+    urllib.request.urlopen = _real_urlopen2
+    _reset()
+
 # --- describe() reports enough to diagnose a repeat ---------------------
 info = netcerts.describe()
 for key in ("ca_certs", "source", "openssl_cafile", "certifi", "frozen"):
