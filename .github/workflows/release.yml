@@ -1,17 +1,27 @@
 name: Release
 
-# Publishes a GitHub Release when a version tag is pushed. The release is
-# what the in-app updater reads, so its shape matters: one .dmg per
-# architecture, named the same way CI names every other build, plus a
-# SHA256SUMS the updater checks each download against before installing.
+# Publishes a GitHub Release, which is what the in-app updater reads. Its
+# shape matters: one .dmg per architecture, named the way CI names every
+# other build, plus a SHA256SUMS the updater checks each download against
+# before installing anything.
 #
-#   1. bump __version__ in version.py and commit
-#   2. git tag v1.0.1 && git push origin v1.0.1
+# Two ways in, both requiring the tag to agree with version.py:
+#   - push a tag:  git tag v1.0.1 && git push origin v1.0.1
+#   - Actions tab: Release > Run workflow > enter v1.0.1
+#
+# The manual route exists because creating the release also creates the
+# tag, so a release can be cut without a local clone or push rights.
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, e.g. v1.0.1 (must match version.py)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -38,18 +48,20 @@ jobs:
 
       # The tag is the release's identity, so it must agree with the
       # version baked into the app - otherwise the updater would offer an
-      # update that reports a different version once installed, and keep
+      # update that reports a different version once installed, and go on
       # offering it forever.
       - name: Check the tag matches version.py
         run: |
+          TAG="${{ inputs.version || github.ref_name }}"
           FILE=$(python3 -c 'from version import __version__; print(__version__)')
-          TAG="${GITHUB_REF_NAME#v}"
-          if [ "$FILE" != "$TAG" ]; then
-            echo "Tag $GITHUB_REF_NAME says $TAG but version.py says $FILE."
-            echo "Bump version.py to match the tag, or retag."
+          if [ "$FILE" != "${TAG#v}" ]; then
+            echo "Tag $TAG means ${TAG#v}, but version.py says $FILE."
+            echo "Bump version.py to match, or use a different tag."
             exit 1
           fi
+          echo "VERSION=$FILE" >> "$GITHUB_ENV"
           echo "DMG=StreamSync-$FILE-${{ matrix.arch }}-$(git rev-parse --short HEAD).dmg" >> "$GITHUB_ENV"
+          echo "Publishing $TAG as StreamSync $FILE"
 
       - name: Install dependencies
         run: python3 -m pip install -r requirements.txt
@@ -65,8 +77,16 @@ jobs:
 
       - name: Package as a disk image
         run: |
-          hdiutil create -volname "StreamSync ${GITHUB_REF_NAME#v}" \
+          hdiutil create -volname "StreamSync $VERSION" \
             -srcfolder dist/StreamSync.app -fs HFS+ -ov -format UDZO "$DMG"
+
+      - name: Verify the disk image mounts and the app is intact
+        run: |
+          MNT=$(mktemp -d)
+          hdiutil attach "$DMG" -mountpoint "$MNT" -nobrowse -readonly
+          test -x "$MNT/StreamSync.app/Contents/MacOS/StreamSync" \
+            || { echo "main binary missing or not executable"; exit 1; }
+          hdiutil detach "$MNT"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -79,6 +99,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           pattern: dmg-*
@@ -93,12 +115,17 @@ jobs:
           sha256sum *.dmg | tee SHA256SUMS
           ls -lh
 
+      # --target pins the tag to this commit, so the manual route creates
+      # the tag as part of publishing rather than needing one up front.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          TAG="${{ inputs.version || github.ref_name }}"
+          gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "StreamSync $GITHUB_REF_NAME" \
+            --target "$GITHUB_SHA" \
+            --title "StreamSync $TAG" \
             --generate-notes \
             dist/*.dmg dist/SHA256SUMS
+          echo "Published: $(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url -q .url)"
