@@ -29,6 +29,7 @@ from PIL import Image, ImageTk
 import audio_capture
 import audio_matcher
 import capture
+import depcheck
 import macwindowctl
 import matcher
 import session
@@ -1045,6 +1046,9 @@ class MacApp:
 def main():
     root = tk.Tk()
     MacApp(root)
+    # Same exposure the first-run dialog had: launched from Finder this
+    # window can come up titled but unpainted until something forces a draw.
+    depcheck.present_window(root)
     if "--selftest" in sys.argv:
         root.after(3000, root.destroy)
     root.mainloop()

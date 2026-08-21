@@ -58,6 +58,13 @@ jobs:
         timeout-minutes: 3
         run: python3 depcheck.py --demo
 
+      # The main window is built and handed straight to mainloop, the same
+      # shape that left the first-run dialog unpainted. --selftest builds
+      # the real window against Aqua Tk and closes it after 3s.
+      - name: Smoke-test the main window
+        timeout-minutes: 3
+        run: python3 mac_app.py --selftest
+
       - name: Build StreamSync.app
         run: sh build_app_mac.sh
 

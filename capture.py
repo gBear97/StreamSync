@@ -7,6 +7,13 @@ import tkinter as tk
 import numpy as np
 import mss
 
+if sys.platform == "darwin":
+    OVERLAY_FONT = ("Helvetica Neue", 14)
+elif sys.platform == "win32":
+    OVERLAY_FONT = ("Segoe UI", 14)
+else:
+    OVERLAY_FONT = ("DejaVu Sans", 14)
+
 
 def _to_gray(shot):
     a = np.frombuffer(shot.bgra, dtype=np.uint8)
@@ -79,7 +86,7 @@ class RegionSelector:
         canvas.create_text(
             over_w // 2, 40,
             text="Drag to select the stream's video area  -  Esc cancels",
-            fill="white", font=("Segoe UI", 14))
+            fill="white", font=OVERLAY_FONT)
 
         state = {}
 
