@@ -6,3 +6,4 @@ python-vlc
 soundcard
 websockets
 keyboard; sys_platform == "win32"
+certifi

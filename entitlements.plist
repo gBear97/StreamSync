@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Notarization requires the hardened runtime, which forbids several
+         things StreamSync legitimately does. Each exception below is here
+         because the app breaks without it, not as a blanket loosening. -->
+
+    <!-- The decisive one: libvlc lives inside VLC.app and is signed by
+         VideoLAN, not by us. A hardened process refuses to load a library
+         signed by a different team unless library validation is off, so
+         without this the player cannot start at all. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- CPython writes and executes memory it generates at runtime. Both
+         are needed for the interpreter PyInstaller embeds. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- PyInstaller's bootloader relaunches itself with DYLD_* set so the
+         bundled libraries resolve. -->
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+
+    <!-- Audio sync records from the loopback device (BlackHole). -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>

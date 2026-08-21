@@ -38,6 +38,14 @@ def _report(details):
 
 
 def main():
+    # A frozen build has no console and no test harness reaching inside it,
+    # so this is how CI asks the shipped bundle - the real one, not a
+    # source checkout with the system's CA store behind it - whether it can
+    # actually complete a verified HTTPS request.
+    if "--netcheck" in sys.argv:
+        import netcerts
+        raise SystemExit(netcerts.selfcheck())
+
     try:
         ready = depcheck.ensure_ready()
     except Exception:

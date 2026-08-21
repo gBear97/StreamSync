@@ -4,7 +4,8 @@ Checks - before the app itself loads - that VLC, the bundled ffmpeg and
 the required Python packages are present, and offers one-click fixes:
 pip for Python packages, winget (Windows' built-in, signature-verified
 package manager) for VLC. Stdlib-only on purpose: it must run even when
-none of the app's packages are installed yet.
+none of the app's packages are installed yet. (netcerts is part of
+StreamSync and is stdlib-only for the same reason.)
 """
 
 import importlib.util
@@ -14,6 +15,8 @@ import shutil
 import subprocess
 import sys
 import threading
+
+import netcerts
 
 # (import name, pip name)
 REQUIRED_PKGS = [
@@ -388,9 +391,11 @@ class _Dialog:
             import urllib.request
 
             def get(url):
+                # netcerts, not plain urlopen: a frozen build carries no CA
+                # roots of its own, so verification would fail on every URL.
                 req = urllib.request.Request(
                     url, headers={"User-Agent": "StreamSync-setup"})
-                with urllib.request.urlopen(req, timeout=30) as r:
+                with netcerts.urlopen(req, timeout=30) as r:
                     return r.read()
 
             try:

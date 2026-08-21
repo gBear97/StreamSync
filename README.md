@@ -200,14 +200,40 @@ Embedded video window: **F11**/Fullscreen button toggles fullscreen,
 
 ## Updates
 
+> **1.0.0 and 1.0.1 cannot update themselves.** Those builds shipped
+> without any CA certificates, so every HTTPS call out of them failed to
+> verify and the update check never reached GitHub. If you are on one of
+> them, download 1.0.2 or later from the
+> [releases page](https://github.com/gBear97/StreamSync/releases) once by
+> hand; updates work from there on.
+
 StreamSync checks GitHub for a newer release when it starts, and quietly
 does nothing if there isn't one or the machine is offline. **Advanced >
 Check for Updates...** asks on demand. When something newer exists it
 offers to install it: the disk image is downloaded over HTTPS, checked
-against the `SHA256SUMS` published in the same release, unpacked beside
-the installed copy, and only swapped in after the app quits - by a helper
-that puts the old bundle back if the move fails. A copy running from a
-source checkout never replaces itself; it tells you to `git pull`.
+against the `SHA256SUMS` published in the same release, and unpacked
+beside the installed copy - where its code signature must prove intact
+and issued to StreamSync's own Developer ID team before anything is
+installed. Only then is the swap handed to a helper that runs after the
+app quits and puts the old bundle back if the move fails. A copy running
+from a source checkout never replaces itself; it tells you to `git pull`.
+
+All of that runs on top of `netcerts`, which is where the CA roots come
+from. It matters because a PyInstaller build carries no certificate store
+of its own: OpenSSL looks for roots where the *build* machine kept them,
+and macOS keeps its own in the system keychain, which OpenSSL never
+reads. So the roots are taken from OpenSSL if it has any, otherwise from
+the bundled `certifi`, otherwise by exporting the system keychain - and
+if a request still fails to verify, the remaining sources are added and
+it is retried once, which is what lets the app work on a network that
+inspects TLS with a root only the keychain knows about.
+
+A test cannot catch this from a source checkout, because there the
+system's own certificates are present and everything passes. So CI runs
+`StreamSync.app/Contents/MacOS/StreamSync --netcheck` against the built
+bundle - on release builds, against the *signed* bundle, before spending
+a notarization on it - and fails if it cannot complete a verified request
+to GitHub. You can run the same command against your own copy.
 
 To cut a release, bump `__version__` in `version.py`, commit it, then
 either push a tag or use the Actions tab:
@@ -222,8 +248,17 @@ without a local clone.
 
 The Release workflow refuses to build if the tag and `version.py`
 disagree - otherwise an update would install a build that reports a
-different version and be offered again forever. It publishes one `.dmg`
-per architecture plus the `SHA256SUMS` the updater verifies against.
+different version and be offered again forever. It signs the app with a
+Developer ID, has Apple notarize it, staples the ticket into both the app
+and the disk image, and checks `spctl` accepts the result before
+publishing - so a release that would trip Gatekeeper fails the build
+rather than reaching anyone. It publishes one `.dmg` per architecture
+plus the `SHA256SUMS` the updater verifies against.
+
+Signing needs five repository secrets - `MACOS_CERT_P12`,
+`MACOS_CERT_PASSWORD`, `NOTARY_KEY_P8`, `NOTARY_KEY_ID` and
+`NOTARY_ISSUER_ID`. The workflow checks for all five up front and stops
+immediately naming any that are missing.
 
 ## macOS
 
@@ -246,10 +281,13 @@ the commit it came from, so two downloads never collide in your Downloads
 folder. Grab it from the run page, unzip the artifact GitHub wraps it in,
 open the `.dmg`, and drag StreamSync.app to Applications. The running
 app shows its version in the window title, and Finder's Get Info reads it
-from the bundle. The build is unsigned, so clear the download quarantine
-once - `xattr -dr com.apple.quarantine /Applications/StreamSync.app` -
-and use right-click > **Open** the first time. VLC still needs to be
-installed on the Mac that runs it.
+from the bundle. These per-commit builds are **not signed** - only tagged
+releases are - so clear the download quarantine once (`xattr -dr
+com.apple.quarantine /Applications/StreamSync.app`) and use right-click >
+**Open** the first time. For an ordinary install take a
+[release](https://github.com/gBear97/StreamSync/releases) instead: those
+are signed and notarized, and just open. VLC still needs to be installed
+on the Mac that runs it.
 
 ### One-time macOS setup
 

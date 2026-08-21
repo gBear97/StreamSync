@@ -76,6 +76,69 @@ check("sha with dir", updater.expected_sha256(
 # --- running from source must never self-replace -------------------------
 check("source checkout is not a bundle", updater.installed_app_path(), None)
 
+# --- signature verification ---------------------------------------------
+# codesign is macOS-only, so stub it out and check the decisions this
+# makes from its output. The point is that anything short of an intact
+# signature from our own team is refused.
+import subprocess as _sp
+
+_real_run = _sp.run
+
+
+class _Result:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+def _fake_codesign(verify_rc=0, team="52T7L6ZVY8", verify_err=""):
+    def run(cmd, *a, **kw):
+        if cmd[0] != "codesign":
+            return _real_run(cmd, *a, **kw)
+        if "--verify" in cmd:
+            return _Result(verify_rc, "", verify_err)
+        # the -dv identity probe; codesign reports on stderr
+        body = "Identifier=StreamSync\n"
+        if team is not None:
+            body += f"TeamIdentifier={team}\n"
+        else:
+            body += "TeamIdentifier=not set\n"
+        return _Result(0, "", body)
+    return run
+
+
+def _expect_refusal(label, **kw):
+    _sp.run = _fake_codesign(**kw)
+    try:
+        updater.verify_signature("/tmp/whatever.app")
+        fails.append(f"{label}: should have raised UpdateError")
+    except updater.UpdateError:
+        pass
+    finally:
+        _sp.run = _real_run
+
+
+_sp.run = _fake_codesign()
+try:
+    check("intact signature from our team is accepted",
+          updater.verify_signature("/tmp/whatever.app"), True)
+finally:
+    _sp.run = _real_run
+
+# A broken or tampered signature.
+_expect_refusal("broken signature", verify_rc=1,
+                verify_err="a sealed resource is missing or invalid")
+# Correctly signed, but by somebody else - the case a checksum cannot catch.
+_expect_refusal("signed by another team", team="ABCDE12345")
+# Ad-hoc signed, which is what an unsigned PyInstaller build looks like.
+_expect_refusal("ad-hoc / unsigned", team=None)
+
+_sp.run = _fake_codesign(team="ABCDE12345")
+try:
+    check("signing_team reads the team out", updater.signing_team("/tmp/x.app"),
+          "ABCDE12345")
+finally:
+    _sp.run = _real_run
+
 if fails:
     print("UPDATER TEST FAILED")
     for f in fails:
