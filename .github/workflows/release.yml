@@ -63,6 +63,29 @@ jobs:
           echo "DMG=StreamSync-$FILE-${{ matrix.arch }}-$(git rev-parse --short HEAD).dmg" >> "$GITHUB_ENV"
           echo "Publishing $TAG as StreamSync $FILE"
 
+      # Fail in seconds on a missing secret rather than ten minutes later
+      # at the signing step, with a message naming what to add.
+      - name: Check the signing secrets are present
+        env:
+          P12: ${{ secrets.MACOS_CERT_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          NOTARY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          missing=""
+          for v in P12 P12_PASSWORD NOTARY_P8 NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+            eval "val=\$$v"
+            [ -n "$val" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "Missing repository secret(s):$missing"
+            echo "Add them under Settings > Secrets and variables > Actions."
+            echo "Releases are signed and notarized, so none of these are optional."
+            exit 1
+          fi
+          echo "All five signing secrets are present."
+
       - name: Install dependencies
         run: python3 -m pip install -r requirements.txt
 
@@ -75,17 +98,107 @@ jobs:
       - name: Build StreamSync.app
         run: sh build_app_mac.sh
 
+      # A keychain of our own, unlocked only for this job, so the
+      # certificate never touches the runner's default keychain.
+      - name: Import the signing certificate
+        env:
+          P12: ${{ secrets.MACOS_CERT_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN=$RUNNER_TEMP/signing.keychain-db
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$P12_PASSWORD" -T /usr/bin/codesign
+          # Let codesign use the key without an interactive prompt, which
+          # nothing could answer on a runner.
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | grep "Developer ID Application" | head -1 \
+            | sed -E 's/.*"(.*)"/\1/')
+          if [ -z "$IDENTITY" ]; then
+            echo "No Developer ID Application identity in the imported .p12."
+            echo "Check MACOS_CERT_P12 was exported as an identity (cert + private key)."
+            exit 1
+          fi
+          echo "IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          echo "Signing as: $IDENTITY"
+
+      # Nested code must be signed before the bundle that contains it, so
+      # walk inside-out rather than relying on --deep, which Apple
+      # discourages and which silently misses some layouts.
+      - name: Sign the app
+        run: |
+          APP=dist/StreamSync.app
+          find "$APP" -type f \( -name "*.dylib" -o -name "*.so" \) -print0 \
+            | xargs -0 -I{} codesign --force --timestamp --options runtime \
+                --keychain "$KEYCHAIN" --sign "$IDENTITY" {}
+          codesign --force --timestamp --options runtime \
+            --entitlements entitlements.plist \
+            --keychain "$KEYCHAIN" --sign "$IDENTITY" "$APP"
+          echo "--- verifying ---"
+          codesign --verify --strict --deep --verbose=2 "$APP"
+          codesign -dv --verbose=4 "$APP" 2>&1 | grep -E "TeamIdentifier|Authority|Runtime"
+
+      # Notarize the app itself first and staple the ticket into the
+      # bundle, so it still validates once dragged out of the disk image
+      # and the image is gone.
+      - name: Notarize and staple the app
+        env:
+          NOTARY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          echo "$NOTARY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          ditto -c -k --keepParent dist/StreamSync.app "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --wait --timeout 30m
+          xcrun stapler staple dist/StreamSync.app
+          xcrun stapler validate dist/StreamSync.app
+
       - name: Package as a disk image
         run: |
           hdiutil create -volname "StreamSync $VERSION" \
             -srcfolder dist/StreamSync.app -fs HFS+ -ov -format UDZO "$DMG"
 
-      - name: Verify the disk image mounts and the app is intact
+      # Sign and notarize the image too: it is the thing that actually
+      # gets downloaded, so Gatekeeper judges it first.
+      - name: Sign, notarize and staple the disk image
+        env:
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          codesign --force --timestamp --keychain "$KEYCHAIN" \
+            --sign "$IDENTITY" "$DMG"
+          xcrun notarytool submit "$DMG" \
+            --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --wait --timeout 30m
+          xcrun stapler staple "$DMG"
+          rm -f "$RUNNER_TEMP/notary.p8"
+
+      # What a user's Mac will conclude on first launch, asserted here
+      # rather than discovered by them.
+      - name: Verify the image mounts and Gatekeeper accepts the app
         run: |
           MNT=$(mktemp -d)
           hdiutil attach "$DMG" -mountpoint "$MNT" -nobrowse -readonly
           test -x "$MNT/StreamSync.app/Contents/MacOS/StreamSync" \
             || { echo "main binary missing or not executable"; exit 1; }
+          codesign --verify --strict --deep --verbose=2 "$MNT/StreamSync.app"
+          xcrun stapler validate "$MNT/StreamSync.app"
+          spctl --assess --type execute --verbose=4 "$MNT/StreamSync.app"
           hdiutil detach "$MNT"
 
       - uses: actions/upload-artifact@v4

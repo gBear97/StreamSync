@@ -117,7 +117,7 @@ jobs:
             echo ""
             echo "Download the **$ARTIFACT** artifact above and unzip it (GitHub always wraps artifacts in a zip). Open $DMG inside, then drag StreamSync.app to Applications."
             echo ""
-            echo "The build is unsigned (no Apple Developer ID), so macOS quarantines it. Clear the flag once:"
+            echo "This is a per-commit build and is **not signed** - only tagged releases are. macOS quarantines it, so clear the flag once:"
             echo ""
             echo "    xattr -dr com.apple.quarantine /Applications/StreamSync.app"
             echo ""

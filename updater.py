@@ -6,6 +6,9 @@ with, so each step is checked rather than trusted:
 - the release feed and the download are HTTPS to github.com;
 - the disk image must match the SHA256 published beside it in the same
   release, which catches a truncated or corrupted download;
+- the unpacked bundle must carry an intact Developer ID signature from
+  our own team, which is what actually establishes the update came from
+  us rather than merely arriving intact;
 - the new bundle is copied out of the image and verified *before*
   anything touches the installed copy, and the swap itself happens after
   the app has quit, from a helper that restores the old bundle if the
@@ -27,6 +30,10 @@ import urllib.request
 from version import __version__
 
 REPO = "gBear97/StreamSync"
+# Releases are signed with this Developer ID team. An update whose bundle
+# is not signed by it is refused, so a tampered download cannot install
+# itself even if it somehow matched the published checksum.
+TEAM_ID = "52T7L6ZVY8"
 LATEST_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
 RELEASES_PAGE = f"https://github.com/{REPO}/releases/latest"
 SUMS_ASSET = "SHA256SUMS"
@@ -183,6 +190,50 @@ open -a "$APP"
 """
 
 
+def signing_team(app_path):
+    """The Team ID an .app is signed by, or None if it is unsigned."""
+    try:
+        r = subprocess.run(["codesign", "-dv", "--verbose=4", app_path],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # codesign writes its report to stderr.
+    for line in (r.stderr or "").splitlines():
+        if line.startswith("TeamIdentifier="):
+            team = line.split("=", 1)[1].strip()
+            return None if team in ("", "not set") else team
+    return None
+
+
+def verify_signature(app_path, team_id=TEAM_ID):
+    """Refuse anything not intact and signed by our own Developer ID.
+
+    Replaces stripping the quarantine flag, which is what this used to do:
+    that told macOS to stop checking, where this checks properly. The
+    quarantine flag can stay on the bundle - a valid Developer ID
+    signature satisfies Gatekeeper on its own.
+    """
+    try:
+        r = subprocess.run(
+            ["codesign", "--verify", "--strict", "--deep", "--verbose=2",
+             app_path],
+            capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise UpdateError(f"Could not run codesign: {e}") from e
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "").strip().splitlines()
+        raise UpdateError(
+            "The downloaded app's signature is not intact, so it was not "
+            "installed." + (f"\n\n{detail[-1]}" if detail else ""))
+
+    team = signing_team(app_path)
+    if team != team_id:
+        raise UpdateError(
+            f"The downloaded app is signed by {team or 'nobody'}, not by "
+            f"{team_id}. Refusing to install it.")
+    return True
+
+
 def stage(dmg_path, app_path, log=print):
     """Copy the new bundle out of the disk image, beside the installed one.
 
@@ -208,9 +259,16 @@ def stage(dmg_path, app_path, log=print):
                        capture_output=True, text=True)
 
     if not os.path.isdir(staged):
+        subprocess.run(["rm", "-rf", staged], check=False)
         raise UpdateError("The new version could not be copied out.")
-    # It arrived via a browser-style download, so macOS quarantines it.
-    subprocess.run(["xattr", "-dr", "com.apple.quarantine", staged], check=False)
+
+    log("Checking the signature...")
+    try:
+        verify_signature(staged)
+    except UpdateError:
+        # Never leave an unverified bundle sitting next to the real one.
+        subprocess.run(["rm", "-rf", staged], check=False)
+        raise
     return staged
 
 
