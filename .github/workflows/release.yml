@@ -129,12 +129,32 @@ jobs:
             -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
           rm -f "$RUNNER_TEMP/cert.p12"
-          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+          # Show what actually arrived before judging it. "No Developer ID
+          # identity" has two very different causes - a .p12 with no private
+          # key, and a .p12 holding the wrong certificate - and only the
+          # list distinguishes them. Certificate names and Team IDs are
+          # public, embedded in every signed app; the private key is never
+          # printed by find-identity.
+          FOUND=$(security find-identity -v -p codesigning "$KEYCHAIN")
+          IDENTITY=$(printf '%s\n' "$FOUND" \
             | grep "Developer ID Application" | head -1 \
             | sed -E 's/.*"(.*)"/\1/')
           if [ -z "$IDENTITY" ]; then
-            echo "No Developer ID Application identity in the imported .p12."
-            echo "Check MACOS_CERT_P12 was exported as an identity (cert + private key)."
+            echo "The .p12 in MACOS_CERT_P12 holds no \"Developer ID"
+            echo "Application\" identity. What it does hold:"
+            echo ""
+            printf '%s\n' "$FOUND"
+            echo ""
+            echo "If that lists an \"Apple Development\" certificate, that is"
+            echo "the wrong one - it signs builds for your own machines and"
+            echo "cannot sign a public release. In Keychain Access, under My"
+            echo "Certificates, export the row starting \"Developer ID"
+            echo "Application:\" instead. The two rows sit next to each other"
+            echo "and read almost alike."
+            echo ""
+            echo "If it lists nothing at all, the .p12 carries a certificate"
+            echo "without its private key - re-export from My Certificates,"
+            echo "not from All Items."
             exit 1
           fi
           echo "IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
