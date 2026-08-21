@@ -90,9 +90,21 @@ jobs:
       # carries no CA roots unless they were deliberately collected into
       # it, and without them every HTTPS call - the updater's above all -
       # fails to verify. Ask the built app itself, not this checkout.
+      #
+      # Twice, because the first run alone proves less than it appears to:
+      # this runner has a python.org Python, so OpenSSL's compiled-in CA
+      # path exists here and a user's Mac's does not. Blanking it out is
+      # what a user's machine actually looks like, and forces the roots
+      # inside the bundle to carry the request on their own.
       - name: Verify the built app can verify HTTPS
         timeout-minutes: 3
-        run: dist/StreamSync.app/Contents/MacOS/StreamSync --netcheck
+        run: |
+          APP=dist/StreamSync.app/Contents/MacOS/StreamSync
+          echo "--- as this runner is configured ---"
+          "$APP" --netcheck
+          echo "--- with OpenSSL's default CA paths taken away ---"
+          SSL_CERT_FILE=/nonexistent/cert.pem \
+          SSL_CERT_DIR=/nonexistent/certs "$APP" --netcheck
 
       # A disk image is how a Mac app is normally shipped. It keeps the
       # bundle's symlinks and execute bits (which upload-artifact's own

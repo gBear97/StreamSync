@@ -210,6 +210,10 @@ def selfcheck(url="https://api.github.com/", out=print):
     except Exception as e:
         out(f"FAIL: {type(e).__name__}: {e}")
         return 1
+    # Worth saying out loud: succeeding only after widening means the
+    # bundled roots were not enough by themselves on this machine.
+    if _widened:
+        out(f"  (needed the fallback roots; now {_ca_count(context())})")
     out("NETCHECK OK")
     return 0
 

@@ -152,9 +152,20 @@ jobs:
       # from, so prove the signed bundle completes a verified HTTPS request
       # before spending a notarization on it. Runs after signing because
       # the hardened runtime, not just the packaging, could break it.
+      #
+      # The second run blanks OpenSSL's default CA paths, which exist on
+      # this runner only because it has a python.org Python installed. A
+      # user's Mac has no such file, so this is the run that proves the
+      # bundle's own roots are enough.
       - name: Verify the signed app can verify HTTPS
         timeout-minutes: 3
-        run: dist/StreamSync.app/Contents/MacOS/StreamSync --netcheck
+        run: |
+          APP=dist/StreamSync.app/Contents/MacOS/StreamSync
+          echo "--- as this runner is configured ---"
+          "$APP" --netcheck
+          echo "--- with OpenSSL's default CA paths taken away ---"
+          SSL_CERT_FILE=/nonexistent/cert.pem \
+          SSL_CERT_DIR=/nonexistent/certs "$APP" --netcheck
 
       # Notarize the app itself first and staple the ticket into the
       # bundle, so it still validates once dragged out of the disk image
