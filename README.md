@@ -209,12 +209,16 @@ the installed copy, and only swapped in after the app quits - by a helper
 that puts the old bundle back if the move fails. A copy running from a
 source checkout never replaces itself; it tells you to `git pull`.
 
-To cut a release:
+To cut a release, bump `__version__` in `version.py`, commit it, then
+either push a tag or use the Actions tab:
 
 ```
-# 1. bump __version__ in version.py, commit it
 git tag v1.0.1 && git push origin v1.0.1
 ```
+
+or **Actions > Release > Run workflow**, entering `v1.0.1`. The manual
+route creates the tag as part of publishing, so a release can be cut
+without a local clone.
 
 The Release workflow refuses to build if the tag and `version.py`
 disagree - otherwise an update would install a build that reports a
