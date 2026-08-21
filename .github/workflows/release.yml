@@ -164,18 +164,53 @@ jobs:
       # Nested code must be signed before the bundle that contains it, so
       # walk inside-out rather than relying on --deep, which Apple
       # discourages and which silently misses some layouts.
+      #
+      # Every Mach-O file, not a list of extensions. This used to match
+      # only *.dylib and *.so, which misses executables that carry no
+      # extension at all - imageio_ffmpeg ships exactly that, an `ffmpeg`
+      # binary, and one unsigned executable anywhere inside the bundle is
+      # enough for Apple to refuse the whole submission. Asking `file`
+      # what each one is cannot go stale the way a list of suffixes does.
       - name: Sign the app
         run: |
           APP=dist/StreamSync.app
-          find "$APP" -type f \( -name "*.dylib" -o -name "*.so" \) -print0 \
-            | xargs -0 -I{} codesign --force --timestamp --options runtime \
-                --keychain "$KEYCHAIN" --sign "$IDENTITY" {}
+          count=0
+          while IFS= read -r -d '' f; do
+            case "$(file -b "$f")" in
+              *Mach-O*)
+                codesign --force --timestamp --options runtime \
+                  --keychain "$KEYCHAIN" --sign "$IDENTITY" "$f"
+                count=$((count + 1))
+                ;;
+            esac
+          done < <(find "$APP" -depth -type f -print0)
+          echo "Signed $count Mach-O file(s) inside the bundle."
+
           codesign --force --timestamp --options runtime \
             --entitlements entitlements.plist \
             --keychain "$KEYCHAIN" --sign "$IDENTITY" "$APP"
+
           echo "--- verifying ---"
           codesign --verify --strict --deep --verbose=2 "$APP"
           codesign -dv --verbose=4 "$APP" 2>&1 | grep -E "TeamIdentifier|Authority|Runtime"
+
+          # Apple refuses the submission if anything inside is unsigned, and
+          # says so only in the notarization log, minutes later. Catch it here.
+          echo "--- checking nothing inside is left unsigned ---"
+          unsigned=""
+          while IFS= read -r -d '' f; do
+            case "$(file -b "$f")" in
+              *Mach-O*)
+                codesign --verify --strict "$f" 2>/dev/null \
+                  || unsigned="$unsigned$f\n" ;;
+            esac
+          done < <(find "$APP" -depth -type f -print0)
+          if [ -n "$unsigned" ]; then
+            echo "Unsigned Mach-O file(s) remain:"
+            printf '%b' "$unsigned"
+            exit 1
+          fi
+          echo "All Mach-O files carry a valid signature."
 
       # A release whose updater cannot reach GitHub cannot be updated away
       # from, so prove the signed bundle completes a verified HTTPS request
@@ -217,11 +252,37 @@ jobs:
         run: |
           echo "$NOTARY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
           ditto -c -k --keepParent dist/StreamSync.app "$RUNNER_TEMP/notarize.zip"
-          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+
+          # notarytool --wait exits 0 even when Apple rejects the
+          # submission, so the status has to be read rather than inferred
+          # from the exit code. Without this the run carried on to stapler
+          # and died with "CloudKit ... Record not found" - which is just
+          # the ticket that was never issued, and says nothing about why.
+          # The reason lives in the notarization log, so fetch it.
+          set +e
+          SUBMIT=$(xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
             --key "$RUNNER_TEMP/notary.p8" \
             --key-id "$NOTARY_KEY_ID" \
             --issuer "$NOTARY_ISSUER_ID" \
-            --wait --timeout 30m
+            --wait --timeout 30m 2>&1)
+          set -e
+          printf '%s\n' "$SUBMIT"
+
+          if ! printf '%s\n' "$SUBMIT" | grep -q "status: Accepted"; then
+            ID=$(printf '%s\n' "$SUBMIT" | awk '/ id: /{print $2; exit}')
+            echo ""
+            echo "=== Apple refused this build. Its reasons: ==="
+            if [ -n "$ID" ]; then
+              xcrun notarytool log "$ID" \
+                --key "$RUNNER_TEMP/notary.p8" \
+                --key-id "$NOTARY_KEY_ID" \
+                --issuer "$NOTARY_ISSUER_ID" || true
+            else
+              echo "(no submission id in the output above)"
+            fi
+            exit 1
+          fi
+
           xcrun stapler staple dist/StreamSync.app
           xcrun stapler validate dist/StreamSync.app
 
@@ -239,11 +300,29 @@ jobs:
         run: |
           codesign --force --timestamp --keychain "$KEYCHAIN" \
             --sign "$IDENTITY" "$DMG"
-          xcrun notarytool submit "$DMG" \
+
+          # Same as above: --wait's exit code says nothing about whether
+          # Apple accepted it, so read the status and fetch the reasons.
+          set +e
+          SUBMIT=$(xcrun notarytool submit "$DMG" \
             --key "$RUNNER_TEMP/notary.p8" \
             --key-id "$NOTARY_KEY_ID" \
             --issuer "$NOTARY_ISSUER_ID" \
-            --wait --timeout 30m
+            --wait --timeout 30m 2>&1)
+          set -e
+          printf '%s\n' "$SUBMIT"
+
+          if ! printf '%s\n' "$SUBMIT" | grep -q "status: Accepted"; then
+            ID=$(printf '%s\n' "$SUBMIT" | awk '/ id: /{print $2; exit}')
+            echo ""
+            echo "=== Apple refused the disk image. Its reasons: ==="
+            [ -n "$ID" ] && xcrun notarytool log "$ID" \
+              --key "$RUNNER_TEMP/notary.p8" \
+              --key-id "$NOTARY_KEY_ID" \
+              --issuer "$NOTARY_ISSUER_ID" || true
+            exit 1
+          fi
+
           xcrun stapler staple "$DMG"
           rm -f "$RUNNER_TEMP/notary.p8"
 
