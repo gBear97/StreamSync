@@ -5,4 +5,4 @@ title, the built .app's Info.plist, and the names of the files CI
 publishes.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
