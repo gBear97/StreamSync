@@ -30,7 +30,12 @@ jobs:
   build:
     name: Build (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # Generous, because two notarizations happen here and each is allowed
+    # to wait 30m on Apple. This was 30 - the same as a single wait - so
+    # the job was cancelled at exactly 30 minutes with notarytool still
+    # running and nothing logged. A job budget has to exceed the sum of
+    # what its steps may take, not match one of them.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -259,14 +264,18 @@ jobs:
           # and died with "CloudKit ... Record not found" - which is just
           # the ticket that was never issued, and says nothing about why.
           # The reason lives in the notarization log, so fetch it.
-          set +e
-          SUBMIT=$(xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+          # Through tee, not into a variable: a plain capture buffers
+          # everything until the command ends, so a long wait looks like
+          # total silence and a killed process leaves no trace at all -
+          # which is exactly how the last attempt read. This streams
+          # Apple's progress live and still keeps it for the check below.
+          LOG="$RUNNER_TEMP/notarize-app.log"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
             --key "$RUNNER_TEMP/notary.p8" \
             --key-id "$NOTARY_KEY_ID" \
             --issuer "$NOTARY_ISSUER_ID" \
-            --wait --timeout 30m 2>&1)
-          set -e
-          printf '%s\n' "$SUBMIT"
+            --wait --timeout 30m 2>&1 | tee "$LOG" || true
+          SUBMIT=$(cat "$LOG")
 
           if ! printf '%s\n' "$SUBMIT" | grep -q "status: Accepted"; then
             ID=$(printf '%s\n' "$SUBMIT" | awk '/ id: /{print $2; exit}')
@@ -303,14 +312,13 @@ jobs:
 
           # Same as above: --wait's exit code says nothing about whether
           # Apple accepted it, so read the status and fetch the reasons.
-          set +e
-          SUBMIT=$(xcrun notarytool submit "$DMG" \
+          LOG="$RUNNER_TEMP/notarize-dmg.log"
+          xcrun notarytool submit "$DMG" \
             --key "$RUNNER_TEMP/notary.p8" \
             --key-id "$NOTARY_KEY_ID" \
             --issuer "$NOTARY_ISSUER_ID" \
-            --wait --timeout 30m 2>&1)
-          set -e
-          printf '%s\n' "$SUBMIT"
+            --wait --timeout 30m 2>&1 | tee "$LOG" || true
+          SUBMIT=$(cat "$LOG")
 
           if ! printf '%s\n' "$SUBMIT" | grep -q "status: Accepted"; then
             ID=$(printf '%s\n' "$SUBMIT" | awk '/ id: /{print $2; exit}')
