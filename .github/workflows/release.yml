@@ -30,12 +30,13 @@ jobs:
   build:
     name: Build (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    # Generous, because two notarizations happen here and each is allowed
-    # to wait 30m on Apple. This was 30 - the same as a single wait - so
-    # the job was cancelled at exactly 30 minutes with notarytool still
+    # Two notarizations happen in this job and each may wait 75m on
+    # Apple, so the budget has to clear 150m before the build is even
+    # counted. It was once 30 - the same as a single wait - and the job
+    # was duly cancelled at exactly 30 minutes with notarytool still
     # running and nothing logged. A job budget has to exceed the sum of
     # what its steps may take, not match one of them.
-    timeout-minutes: 120
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -257,56 +258,8 @@ jobs:
         run: |
           echo "$NOTARY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
           ditto -c -k --keepParent dist/StreamSync.app "$RUNNER_TEMP/notarize.zip"
-
-          # notarytool --wait exits 0 even when Apple rejects the
-          # submission, so the status has to be read rather than inferred
-          # from the exit code. Without this the run carried on to stapler
-          # and died with "CloudKit ... Record not found" - which is just
-          # the ticket that was never issued, and says nothing about why.
-          # The reason lives in the notarization log, so fetch it.
-          # Through tee, not into a variable: a plain capture buffers
-          # everything until the command ends, so a long wait looks like
-          # total silence and a killed process leaves no trace at all -
-          # which is exactly how the last attempt read. This streams
-          # Apple's progress live and still keeps it for the check below.
-          LOG="$RUNNER_TEMP/notarize-app.log"
-          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
-            --key "$RUNNER_TEMP/notary.p8" \
-            --key-id "$NOTARY_KEY_ID" \
-            --issuer "$NOTARY_ISSUER_ID" \
-            --wait --timeout 45m 2>&1 | tee "$LOG" || true
-          SUBMIT=$(cat "$LOG")
-
-          if ! printf '%s\n' "$SUBMIT" | grep -q "status: Accepted"; then
-            ID=$(printf '%s\n' "$SUBMIT" | awk '/ id: /{print $2; exit}')
-            echo ""
-            # A refusal and an unanswered submission are different things,
-            # and only one of them is about this build. Saying "Apple
-            # refused" after a timeout sends everyone hunting for a defect
-            # that was never reported - there is no log to fetch yet,
-            # because processing had not finished.
-            if printf '%s\n' "$SUBMIT" | grep -q "Timeout of"; then
-              echo "=== Apple did not answer within the wait. ==="
-              echo "The submission is still queued on Apple's side; nothing"
-              echo "here says the build is bad. Re-running usually clears it."
-              echo "To ask about this exact submission later:"
-              echo "  xcrun notarytool log $ID --key-id ... --issuer ..."
-              exit 1
-            fi
-            echo "=== Apple refused this build. Its reasons: ==="
-            if [ -n "$ID" ]; then
-              xcrun notarytool log "$ID" \
-                --key "$RUNNER_TEMP/notary.p8" \
-                --key-id "$NOTARY_KEY_ID" \
-                --issuer "$NOTARY_ISSUER_ID" || true
-            else
-              echo "(no submission id in the output above)"
-            fi
-            exit 1
-          fi
-
-          xcrun stapler staple dist/StreamSync.app
-          xcrun stapler validate dist/StreamSync.app
+          NOTARY_KEY_FILE="$RUNNER_TEMP/notary.p8" \
+            ci/notarize.sh "$RUNNER_TEMP/notarize.zip" dist/StreamSync.app
 
       - name: Package as a disk image
         run: |
@@ -322,34 +275,8 @@ jobs:
         run: |
           codesign --force --timestamp --keychain "$KEYCHAIN" \
             --sign "$IDENTITY" "$DMG"
-
-          # Same as above: --wait's exit code says nothing about whether
-          # Apple accepted it, so read the status and fetch the reasons.
-          LOG="$RUNNER_TEMP/notarize-dmg.log"
-          xcrun notarytool submit "$DMG" \
-            --key "$RUNNER_TEMP/notary.p8" \
-            --key-id "$NOTARY_KEY_ID" \
-            --issuer "$NOTARY_ISSUER_ID" \
-            --wait --timeout 45m 2>&1 | tee "$LOG" || true
-          SUBMIT=$(cat "$LOG")
-
-          if ! printf '%s\n' "$SUBMIT" | grep -q "status: Accepted"; then
-            ID=$(printf '%s\n' "$SUBMIT" | awk '/ id: /{print $2; exit}')
-            echo ""
-            if printf '%s\n' "$SUBMIT" | grep -q "Timeout of"; then
-              echo "=== Apple did not answer within the wait. ==="
-              echo "Still queued on Apple's side; submission $ID."
-              exit 1
-            fi
-            echo "=== Apple refused the disk image. Its reasons: ==="
-            [ -n "$ID" ] && xcrun notarytool log "$ID" \
-              --key "$RUNNER_TEMP/notary.p8" \
-              --key-id "$NOTARY_KEY_ID" \
-              --issuer "$NOTARY_ISSUER_ID" || true
-            exit 1
-          fi
-
-          xcrun stapler staple "$DMG"
+          NOTARY_KEY_FILE="$RUNNER_TEMP/notary.p8" \
+            ci/notarize.sh "$DMG" "$DMG"
           rm -f "$RUNNER_TEMP/notary.p8"
 
       # What a user's Mac will conclude on first launch, asserted here
