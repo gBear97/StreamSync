@@ -1,0 +1,108 @@
+name: Notarization status
+
+# Six release runs and no verdict: one Invalid whose log was never fetched,
+# and three submissions Apple simply did not answer inside the job's wait.
+# Those submissions did not disappear when the job was killed - they stayed
+# queued on Apple's side and have long since resolved. This asks Apple what
+# they resolved to, which is the one question the release runs never got to.
+#
+# Read-only. It submits nothing and changes nothing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      submission_id:
+        description: "Also fetch the log for this specific submission id (optional)"
+        required: false
+        default: ""
+
+jobs:
+  history:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check the notary secrets are present
+        env:
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          missing=""
+          for name in NOTARY_KEY_P8 NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+            eval "v=\${$name}"
+            [ -n "$v" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "Missing repository secret(s):$missing"
+            echo "These are the same three the release uses; the names above"
+            echo "are exactly what they are called under the repository's"
+            echo "Settings, so what is printed is what you paste."
+            exit 1
+          fi
+
+      - name: Ask Apple what happened to every submission on record
+        env:
+          NOTARY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+          EXTRA_ID: ${{ inputs.submission_id }}
+        run: |
+          KEY="$RUNNER_TEMP/notary.p8"
+          echo "$NOTARY_P8" | base64 --decode > "$KEY"
+          AUTH="--key $KEY --key-id $NOTARY_KEY_ID --issuer $NOTARY_ISSUER_ID"
+
+          echo "=== Submissions Apple has on record for this account ==="
+          # JSON rather than the table, so the statuses can be acted on
+          # below instead of only read.
+          xcrun notarytool history $AUTH --output-format json \
+            > "$RUNNER_TEMP/history.json" 2> "$RUNNER_TEMP/history.err" || true
+
+          if [ ! -s "$RUNNER_TEMP/history.json" ]; then
+            echo "notarytool history returned nothing. Its stderr:"
+            cat "$RUNNER_TEMP/history.err" || true
+            exit 1
+          fi
+
+          python3 - "$RUNNER_TEMP/history.json" "$RUNNER_TEMP/ids.txt" <<'PY'
+          import json, sys
+
+          with open(sys.argv[1]) as f:
+              rows = json.load(f).get("history") or []
+
+          if not rows:
+              print("  (none - Apple has no submissions for this account)")
+
+          for r in rows:
+              print(f"  {r.get('createdDate','?')}  "
+                    f"{r.get('status','?'):<12} {r.get('id','?')}  "
+                    f"{r.get('name','')}")
+
+          # A log exists for anything Apple finished looking at, and for an
+          # Accepted build it is the list of what it checked. The reasons we
+          # have been missing are in the ones that are not Accepted, so those
+          # are what get fetched.
+          unresolved = [r["id"] for r in rows
+                        if r.get("id") and r.get("status") != "Accepted"]
+          with open(sys.argv[2], "w") as f:
+              f.write("\n".join(unresolved))
+
+          accepted = sum(1 for r in rows if r.get("status") == "Accepted")
+          print("")
+          print(f"  {accepted} of {len(rows)} accepted")
+          PY
+
+          # An id passed in by hand takes priority: it may predate the
+          # history window, or simply be the one someone is asking about.
+          if [ -n "$EXTRA_ID" ]; then
+            printf '%s\n' "$EXTRA_ID" >> "$RUNNER_TEMP/ids.txt"
+          fi
+
+          while IFS= read -r id; do
+            [ -n "$id" ] || continue
+            echo ""
+            echo "=== $id ==="
+            xcrun notarytool info "$id" $AUTH || true
+            echo "--- log ---"
+            xcrun notarytool log "$id" $AUTH \
+              || echo "(no log: Apple produced none, or is still processing)"
+          done < "$RUNNER_TEMP/ids.txt"
