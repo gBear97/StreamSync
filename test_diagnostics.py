@@ -32,7 +32,8 @@ def ok(label, cond):
 def probe(candidates, **kw):
     """A probe_vlc() result, without needing VLC or a Mac."""
     info = {"candidates": candidates, "loadable": None, "import_error": None,
-            "libvlc_version": None, "plugins": None, "depcheck_found": None}
+            "libvlc_version": None, "plugins": None, "depcheck_found": None,
+            "instance": None, "plugin_path": None}
     info.update(kw)
     return info
 
@@ -73,8 +74,33 @@ ok("missing plugins are named",
 working = probe(
     [{"path": "/Applications/VLC.app/x", "exists": True, "loads": True}],
     loadable="/Applications/VLC.app/x", plugins="/x (400 plugins)")
-check("a working VLC is reported as working",
+check("a loadable VLC is reported as loading",
       diagnostics.vlc_summary(working), "VLC loads correctly here.")
+
+# The case the first field report got wrong: python-vlc imported and read
+# a version out of the real library, and the verdict still said VLC would
+# not load - because a shallower probe (a bare dlopen) had failed. Deeper
+# evidence must always win over shallower.
+field_report = probe(
+    [{"path": "/Applications/VLC.app/x", "exists": True, "loads": False,
+      "load_error": "Failed to load dynlib/dll ... frozen."}],
+    libvlc_version="3.0.23 Vetinari", instance="ok",
+    plugins="/x (400 plugins)")
+fr = diagnostics.vlc_summary(field_report)
+ok("a working instance outranks a failed load probe", "VLC works here" in fr)
+ok("and points the search past VLC itself", "after startup" in fr)
+
+# Library loads, instance does not: the plugins diagnosis, reached from
+# real evidence this time rather than from the load probe.
+no_instance = probe(
+    [{"path": "/Applications/VLC.app/x", "exists": True, "loads": True}],
+    libvlc_version="3.0.23 Vetinari",
+    instance="libvlc returned no instance",
+    plugins="missing: /Applications/VLC.app/Contents/MacOS/plugins")
+ni = diagnostics.vlc_summary(no_instance)
+ok("a version without an instance names the instance failure",
+   "no player could be started" in ni)
+ok("and names the plugins folder", "plugins" in ni)
 
 # VLC itself fine, bindings broken - a different fix from all of the above.
 bindings = probe(
