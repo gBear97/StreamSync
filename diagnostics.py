@@ -145,7 +145,7 @@ def _arch_of(path):
 
 
 def _signer_of(path):
-    out = _run(["/usr/bin/codesign", "-dv", path])
+    out = _run(["/usr/bin/codesign", "-dvv", path])
     if not out:
         return None
     for line in out.splitlines():
@@ -154,21 +154,57 @@ def _signer_of(path):
     return None
 
 
+def _dlopen_error(path):
+    """dyld's own reason a library will not load, from dlerror().
+
+    Needed because a frozen app's ctypes rewrites every load failure into
+    "Most likely this dynlib/dll was not found when the application was
+    frozen" - a guess, printed in place of the actual reason, which is
+    the exact disease this module exists to cure."""
+    try:
+        libsys = ctypes.CDLL(None)
+        libsys.dlopen.restype = ctypes.c_void_p
+        libsys.dlopen.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        libsys.dlerror.restype = ctypes.c_char_p
+        libsys.dlclose.argtypes = [ctypes.c_void_p]
+        libsys.dlerror()  # clear any stale message
+        handle = libsys.dlopen(path.encode(), 0x2)  # RTLD_NOW
+        if handle:
+            libsys.dlclose(handle)
+            return None
+        err = libsys.dlerror()
+        return err.decode() if err else "dlopen failed with no message"
+    except Exception as e:
+        return f"(could not ask dyld: {e})"
+
+
 def _try_load(path):
-    """The only test that settles it. Everything else is circumstantial:
-    a dylib can exist, be the right architecture and still refuse to load
-    into this particular process, and dlopen's message says why."""
+    """Whether this process can load the library the way the app does.
+
+    python-vlc pre-loads libvlccore before libvlc, because libvlc refers
+    to it in a form dyld can only satisfy once it is already in the
+    process - so a bare load of libvlc alone fails even on a perfectly
+    healthy machine, which is precisely the false alarm the first field
+    report of this module produced. Load it the same way the app will.
+    """
+    core = os.path.join(os.path.dirname(path), "libvlccore.dylib")
+    if os.path.isfile(core):
+        try:
+            ctypes.CDLL(core)
+        except Exception:
+            pass  # let libvlc's own failure tell the story
     try:
         ctypes.CDLL(path)
         return True, None
     except Exception as e:
-        return False, str(e)
+        return False, _dlopen_error(path) or str(e)
 
 
 def probe_vlc():
     """Everything that bears on whether libvlc will load here."""
     info = {"candidates": [], "loadable": None, "import_error": None,
-            "libvlc_version": None, "plugins": None, "depcheck_found": None}
+            "libvlc_version": None, "plugins": None, "depcheck_found": None,
+            "instance": None, "plugin_path": None}
 
     seen = set()
     for path in VLC_DYLIB_CANDIDATES + (_spotlight_vlc() if IS_MAC else []):
@@ -203,13 +239,38 @@ def probe_vlc():
             info["libvlc_version"] = vlc.libvlc_get_version().decode()
         except Exception as e:
             info["libvlc_version"] = f"(unavailable: {e})"
+        info["plugin_path"] = getattr(vlc, "plugin_path", None)
     except Exception:
         info["import_error"] = traceback.format_exc()
 
-    if info["loadable"]:
-        # libvlc without its plugins loads fine and then cannot build an
-        # instance, which surfaces later as a different, vaguer error.
-        base = info["loadable"].split("/Contents/MacOS/")[0]
+    # The report that prompted this module's first fix imported vlc and
+    # read a version out of the real library while the app still had no
+    # player - so loading is not the last question. Make the exact calls
+    # the app makes and record where they stop.
+    if not info["import_error"]:
+        try:
+            inst = vlc.Instance("--no-video-title-show", "--quiet")
+            if inst is None:
+                info["instance"] = "libvlc returned no instance"
+            else:
+                mp = inst.media_player_new()
+                info["instance"] = ("ok" if mp is not None
+                                    else "instance ok, but no media player")
+                for h in (mp, inst):
+                    try:
+                        h.release()
+                    except Exception:
+                        pass
+        except Exception as e:
+            info["instance"] = f"failed: {e!r}"
+
+    # libvlc without its plugins loads fine and then cannot build an
+    # instance, which surfaces later as a different, vaguer error - so
+    # locate them from any installed VLC, loadable or not.
+    installed = info["loadable"] or next(
+        (c["path"] for c in info["candidates"] if c.get("exists")), None)
+    if installed:
+        base = installed.split("/Contents/MacOS/")[0]
         pdir = os.path.join(base, "Contents/MacOS/plugins")
         if os.path.isdir(pdir):
             try:
@@ -225,21 +286,43 @@ def probe_vlc():
 
 def vlc_summary(info=None):
     """One sentence naming the actual cause, for a dialog that has room
-    for exactly one sentence."""
+    for exactly one sentence.
+
+    Ranked by depth of evidence: an instance actually starting beats the
+    import working, which beats a load probe, which beats file existence.
+    The first field report of this module got that order wrong and
+    declared VLC unloadable two lines above the version string it had
+    just read out of the loaded library.
+    """
     info = probe_vlc() if info is None else info
     present = [c for c in info["candidates"] if c.get("exists")]
+
+    # python-vlc imported and spoke to the real library - the level the
+    # app actually uses it at.
+    if not info.get("import_error") and info.get("libvlc_version"):
+        if info.get("instance") == "ok":
+            return ("VLC works here: its library loads and a player "
+                    "instance starts. A failure in the app is now after "
+                    "startup, not in loading VLC.")
+        if info.get("instance"):
+            detail = info.get("plugins") or "plugins were not located"
+            return ("VLC's library loads, but no player could be started "
+                    f"({info['instance']}). That is nearly always its "
+                    f"plugins folder: {detail}.")
+        return "VLC's library loads here."
+
+    if info.get("loadable"):
+        if info.get("plugins") and info["plugins"].startswith("missing"):
+            return ("VLC was found and loads, but its plugins folder is "
+                    "missing, so no media can be opened.")
+        if info.get("import_error"):
+            return ("VLC itself loads here, so the failure is in the "
+                    "python-vlc bindings rather than in VLC.")
+        return "VLC loads correctly here."
 
     if not present:
         return ("VLC does not appear to be installed - no libvlc.dylib "
                 "was found in /Applications or anywhere Spotlight knows.")
-    if info["loadable"]:
-        if info["plugins"] and info["plugins"].startswith("missing"):
-            return ("VLC was found and loads, but its plugins folder is "
-                    "missing, so no media can be opened.")
-        if info["import_error"]:
-            return ("VLC itself loads here, so the failure is in the "
-                    "python-vlc bindings rather than in VLC.")
-        return "VLC loads correctly here."
 
     # Present but unloadable is the interesting case, and dlopen has
     # already said why - so repeat what it said rather than guessing.
@@ -269,6 +352,8 @@ def report():
     lines.append(f"  verdict: {vlc_summary(info)}")
     lines.append(f"  depcheck found: {info['depcheck_found']}")
     lines.append(f"  libvlc version: {info['libvlc_version']}")
+    lines.append(f"  player instance: {info['instance']}")
+    lines.append(f"  plugin path (python-vlc): {info['plugin_path']}")
     lines.append(f"  plugins: {info['plugins']}")
     lines.append("")
 
@@ -287,14 +372,33 @@ def report():
         lines += ["", "  import vlc raised:"]
         lines += ["    " + ln for ln in info["import_error"].splitlines()]
 
-    lines += ["", "Audio / capture", "-" * 60]
-    for name, mod in (("numpy", "numpy"), ("sounddevice", "sounddevice"),
-                      ("mss", "mss"), ("PIL", "PIL")):
+    # The gate's own list, so this can never drift into probing packages
+    # the app does not use - the first field report flagged sounddevice
+    # as MISSING, a module this app never imports.
+    lines += ["", "Bundled packages", "-" * 60]
+    try:
+        from depcheck import REQUIRED_PKGS
+        needed = [imp for imp, _pip in REQUIRED_PKGS if imp != "vlc"]
+    except Exception:
+        needed = ["numpy", "PIL", "mss", "imageio_ffmpeg", "soundcard"]
+    for mod in needed:
         try:
             __import__(mod)
-            lines.append(f"  {name}: present")
+            lines.append(f"  {mod}: present")
         except Exception as e:
-            lines.append(f"  {name}: MISSING ({type(e).__name__}: {e})")
+            lines.append(f"  {mod}: MISSING ({type(e).__name__}: {e})")
+
+    # What the first-run gate will decide, since a blocked gate and a
+    # crashed app look identical from the outside: no app either way.
+    lines += ["", "First-run gate", "-" * 60]
+    try:
+        import depcheck
+        c = depcheck.collect()
+        for k in sorted(c):
+            lines.append(f"  {k}: {c[k]}")
+        lines.append(f"  gate lets the app start: {depcheck.all_ok(c)}")
+    except Exception as e:
+        lines.append(f"  gate unavailable: {e!r}")
 
     lines += ["", "Network", "-" * 60]
     try:
