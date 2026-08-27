@@ -121,7 +121,8 @@ ok("and is not reported as success", "loads correctly" not in odd_summary)
 
 # --- the report itself ---------------------------------------------------
 text = diagnostics.report()
-for section in ("StreamSync diagnostics", "VLC", "Network", "verdict:"):
+for section in ("StreamSync diagnostics", "VLC", "Video output", "Network",
+                "First-run gate", "verdict:"):
     ok(f"report contains {section!r}", section in text)
 ok("report names the log file", diagnostics.LOG_FILE in text)
 
@@ -197,6 +198,45 @@ try:
     ok("and still answers", bool(diagnostics.vlc_summary(live)))
 finally:
     diagnostics._run = saved_run
+
+# --- video embedding: the fix for sound-with-no-picture ------------------
+# The first Mac field test ran a whole session - launch, sync, "successful
+# match" - with playback into a window that did not exist, because libvlc's
+# macOS output renders nothing until handed an NSView. attach_tk is that
+# handoff; these pin its contract without needing a Mac or VLC.
+import types
+
+import players
+
+if sys.platform != "darwin":
+    ok("the NSView bridge answers None where the symbol cannot exist",
+       players._tk_nsview(0) is None)
+
+_calls = []
+_fake = types.SimpleNamespace(
+    embedded=False,
+    mp=types.SimpleNamespace(set_nsobject=_calls.append))
+
+_saved_nsview = players._tk_nsview
+try:
+    players._tk_nsview = lambda wid: None
+    ok("no NSView means no embedding, reported honestly",
+       players.EmbeddedPlayer.attach_tk(_fake, 42) is False)
+    ok("and the player is not marked embedded", _fake.embedded is False)
+    check("and libvlc was never handed a bogus view", _calls, [])
+
+    players._tk_nsview = lambda wid: 0xD0A
+    ok("a real NSView is handed to libvlc",
+       players.EmbeddedPlayer.attach_tk(_fake, 42) is True)
+    check("as the view the bridge resolved", _calls, [0xD0A])
+    ok("and the player is marked embedded", _fake.embedded is True)
+
+    _calls.clear()
+    ok("attaching twice is a cheap no-op",
+       players.EmbeddedPlayer.attach_tk(_fake, 42) is True)
+    check("that does not touch libvlc again", _calls, [])
+finally:
+    players._tk_nsview = _saved_nsview
 
 # --- a module used but never imported ------------------------------------
 # The diagnostics window called subprocess.run in a file that never

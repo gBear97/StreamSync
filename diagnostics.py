@@ -388,6 +388,19 @@ def report():
         except Exception as e:
             lines.append(f"  {mod}: MISSING ({type(e).__name__}: {e})")
 
+    # The video window's one precondition. The first Mac field test had
+    # audio, a match, and no picture, because libvlc was never handed an
+    # NSView - and the bridge that supplies one is this single symbol
+    # from Tk's own library.
+    lines += ["", "Video output", "-" * 60]
+    try:
+        import tkinter  # noqa: F401 - loads Tk's dylib into the process
+        has = hasattr(ctypes.CDLL(None), "TkMacOSXGetRootControl")
+    except Exception:
+        has = False
+    lines.append("  Tk NSView bridge (TkMacOSXGetRootControl): "
+                 + ("available" if has else "not found"))
+
     # What the first-run gate will decide, since a blocked gate and a
     # crashed app look identical from the outside: no app either way.
     lines += ["", "First-run gate", "-" * 60]

@@ -9,6 +9,7 @@ inaudible since the local copy is muted).
 """
 
 import base64
+import ctypes
 import json
 import math
 import os
@@ -81,11 +82,40 @@ def _why_no_instance():
         return "Could not create a VLC instance."
 
 
+def _tk_nsview(win_id):
+    """The NSView behind a Tk widget on macOS, or None.
+
+    Tk's own C library is already loaded into this process the moment
+    tkinter is imported, so the symbol is resolved from the process image
+    rather than from a guessed dylib path - the path differs between a
+    source checkout and a frozen app, and the loaded copy is by
+    definition the right one.
+    """
+    try:
+        lib = ctypes.CDLL(None)
+        f = lib.TkMacOSXGetRootControl
+    except (OSError, AttributeError):
+        return None
+    f.restype = ctypes.c_void_p
+    f.argtypes = [ctypes.c_void_p]
+    try:
+        return f(win_id)
+    except Exception:
+        return None
+
+
 class EmbeddedPlayer:
     def __init__(self, hwnd=None):
-        """hwnd: Tk window handle to render into (Windows). Pass None on
-        macOS - Tk can't host libvlc there, so libvlc opens its own video
-        window; playback control is identical either way."""
+        """hwnd: Tk window handle to render into (Windows). On macOS pass
+        None and call attach_tk() with a Tk widget id once one exists.
+
+        The first Mac field test shipped on the assumption that with no
+        drawable libvlc "opens its own video window". It does not: the
+        macOS vout needs an NSView it can render into, and without one
+        playback runs - audio, position, a successful sync - while no
+        window ever appears. python-vlc's own Tk example embeds via
+        TkMacOSXGetRootControl for exactly this reason, and attach_tk
+        below is that technique."""
         if vlc is None:
             # "Install VLC from videolan.org" was the whole message here,
             # which is wrong advice for every cause except the one where
@@ -101,12 +131,34 @@ class EmbeddedPlayer:
             # saying so.
             raise VLCError(_why_no_instance())
         self.mp = self.instance.media_player_new()
+        self.embedded = False
         if hwnd is not None:
             self.mp.set_hwnd(int(hwnd))
             # let Tk keep mouse/keyboard events, not the VLC child window
             self.mp.video_set_mouse_input(False)
             self.mp.video_set_key_input(False)
+            self.embedded = True
         self.has_media = False
+
+    def attach_tk(self, win_id):
+        """Render into the Tk widget with this winfo_id() (macOS).
+
+        Must happen before playback starts; safe to call once, cheap to
+        skip. Returns whether embedding actually took, because the
+        fallback - libvlc with no drawable - plays sound to an invisible
+        player, and the caller should say so rather than let anyone
+        watch a black nothing and doubt their film.
+        """
+        if self.embedded:
+            return True
+        # No platform gate: off macOS the symbol simply does not exist
+        # and _tk_nsview says None, which is also the honest answer.
+        view = _tk_nsview(int(win_id))
+        if not view:
+            return False
+        self.mp.set_nsobject(view)
+        self.embedded = True
+        return True
 
     def load(self, path):
         self.mp.set_media(self.instance.media_new(path))
