@@ -48,19 +48,58 @@ class VLCError(RuntimeError):
     pass
 
 
+def _why_no_vlc():
+    """The reason this machine cannot load libvlc, in the user's terms.
+
+    Falls back to the raw import error if the probe itself cannot run:
+    a vague message still beats a message about the diagnostics."""
+    try:
+        import diagnostics
+        summary = diagnostics.vlc_summary()
+        where = diagnostics.log_report("player failed to start")
+        return (f"{summary}\n\n"
+                f"Full details were written to:\n{where}\n\n"
+                f"Details: {_IMPORT_ERROR}")
+    except Exception:
+        return ("Could not load VLC (libvlc).\n\n"
+                "Install VLC from videolan.org (64-bit on Windows, "
+                f"matching your Python).\n\nDetails: {_IMPORT_ERROR}")
+
+
+def _why_no_instance():
+    """libvlc is loadable but produced no instance - say what is missing."""
+    try:
+        import diagnostics
+        info = diagnostics.probe_vlc()
+        where = diagnostics.log_report("libvlc gave no instance")
+        detail = info.get("plugins") or "could not locate VLC's plugins"
+        return ("VLC loaded, but would not start.\n\n"
+                "This is normally its plugins folder being missing or "
+                "unreadable; reinstalling VLC restores it.\n\n"
+                f"Plugins: {detail}\n\nFull details: {where}")
+    except Exception:
+        return "Could not create a VLC instance."
+
+
 class EmbeddedPlayer:
     def __init__(self, hwnd=None):
         """hwnd: Tk window handle to render into (Windows). Pass None on
         macOS - Tk can't host libvlc there, so libvlc opens its own video
         window; playback control is identical either way."""
         if vlc is None:
-            raise VLCError(
-                "Could not load VLC (libvlc).\n\n"
-                "Install VLC from videolan.org (64-bit on Windows, matching "
-                "your Python).\n\nDetails: %s" % _IMPORT_ERROR)
+            # "Install VLC from videolan.org" was the whole message here,
+            # which is wrong advice for every cause except the one where
+            # VLC is genuinely absent - and it reads the same when VLC is
+            # installed but built for the other processor. Ask what is
+            # actually on this machine and say that instead.
+            raise VLCError(_why_no_vlc())
         self.instance = vlc.Instance("--no-video-title-show", "--quiet")
         if self.instance is None:
-            raise VLCError("Could not create a VLC instance.")
+            # libvlc loaded but would not start. Nearly always its plugin
+            # directory: the library alone cannot decode anything, and it
+            # reports that by handing back a null instance rather than by
+            # saying so.
+            raise VLCError(_why_no_instance())
         self.mp = self.instance.media_player_new()
         if hwnd is not None:
             self.mp.set_hwnd(int(hwnd))

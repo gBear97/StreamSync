@@ -16,6 +16,7 @@ Platform notes:
 import json
 import os
 import queue
+import subprocess
 import sys
 import tempfile
 import threading
@@ -37,6 +38,7 @@ import matcher
 import session
 import updater
 from version import __version__
+import diagnostics
 from players import EmbeddedPlayer, ExternalPlayer, VLCError
 
 CONFIG_PATH = Path.home() / ".streamsync.json"
@@ -123,6 +125,10 @@ class MacApp:
                 # blocked dialog looks identical to a hung app.
                 print(f"SELFTEST: VLC unavailable - {e}", file=sys.stderr)
                 raise SystemExit(2)
+            # The Advanced menu is built further down, so it does not
+            # exist yet - this dialog is the entire user interface in
+            # this failure, and has to carry the diagnosis itself.
+            diagnostics.log(f"player failed to start: {e}")
             messagebox.showerror("StreamSync - VLC problem", str(e))
             raise SystemExit(1)
         self.active_player = self.player_backend
@@ -298,6 +304,8 @@ class MacApp:
         advm.add_command(label="Show Last Capture Preview",
                          command=self.preview_win.deiconify)
         advm.add_separator()
+        advm.add_command(label="Diagnostics...",
+                         command=self._show_diagnostics)
         advm.add_command(label="Check for Updates...",
                          command=lambda: self._check_updates(quiet=False))
         m.add_cascade(label="Advanced", menu=advm)
@@ -309,6 +317,71 @@ class MacApp:
         self.root.bind_all("<Command-p>", lambda e: self._toggle_pause())
         self.root.bind_all("<Shift-Command-f>",
                            lambda e: self._toggle_fullscreen())
+
+    # --------------------------------------------------------- diagnostics
+
+    def _show_diagnostics(self):
+        """The report in a window, with a button that copies it.
+
+        Reading a diagnosis off a screen and retyping it is how detail
+        gets lost, and detail is the entire point here - so the report is
+        selectable, copyable in one click, and already on disk.
+        """
+        win = tk.Toplevel(self.root)
+        win.title("StreamSync Diagnostics")
+        win.geometry("760x520")
+
+        frame = ttk.Frame(win, padding=8)
+        frame.pack(fill="both", expand=True)
+
+        text = tk.Text(frame, wrap="none", font=("Menlo", 11))
+        ybar = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        xbar = ttk.Scrollbar(frame, orient="horizontal", command=text.xview)
+        text.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        text.grid(row=0, column=0, sticky="nsew")
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        text.insert("1.0", "Collecting...")
+        text.config(state="disabled")
+
+        btns = ttk.Frame(win, padding=(8, 0, 8, 8))
+        btns.pack(fill="x")
+        status = ttk.Label(btns, text="")
+
+        def fill(body):
+            text.config(state="normal")
+            text.delete("1.0", "end")
+            text.insert("1.0", body)
+            text.config(state="disabled")
+
+        def copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text.get("1.0", "end-1c"))
+            status.config(text="Copied.")
+
+        def reveal():
+            subprocess.run(["open", "-R", diagnostics.LOG_FILE], check=False)
+
+        ttk.Button(btns, text="Copy to Clipboard",
+                   command=copy).pack(side="left")
+        ttk.Button(btns, text="Show Log in Finder",
+                   command=reveal).pack(side="left", padx=(8, 0))
+        status.pack(side="left", padx=(8, 0))
+
+        # Spotlight and codesign make this take a moment; collecting it on
+        # the UI thread would look like the app had hung.
+        def work():
+            try:
+                body = diagnostics.report()
+                diagnostics.log_report("opened from the Advanced menu")
+            except Exception as e:
+                body = f"Could not collect diagnostics: {e!r}"
+            self.root.after(0, lambda: fill(body))
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ------------------------------------------------------------- updates
 

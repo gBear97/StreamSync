@@ -110,6 +110,7 @@ jobs:
           python3 test_audio_matcher.py
           python3 test_updater.py
           python3 test_netcerts.py
+          python3 test_diagnostics.py
 
       - name: Build StreamSync.app
         run: sh build_app_mac.sh
@@ -246,6 +247,23 @@ jobs:
             *) echo "Expected the bundled certifi to supply the roots."
                exit 1 ;;
           esac
+
+      # The report exists so a user on a machine we cannot reach can send
+      # us one command's output. If it ever throws inside the bundle it
+      # would do so exactly when someone is already stuck, so run it here
+      # against the real .app rather than trusting the source checkout.
+      - name: Verify the built app can report its own diagnostics
+        timeout-minutes: 3
+        run: |
+          APP=dist/StreamSync.app/Contents/MacOS/StreamSync
+          out=$("$APP" --diagnose)
+          echo "$out"
+          for want in "StreamSync diagnostics" "verdict:" "process_arch"; do
+            case "$out" in
+              *"$want"*) ;;
+              *) echo "--diagnose output is missing: $want"; exit 1 ;;
+            esac
+          done
 
       # Notarize the app itself first and staple the ticket into the
       # bundle, so it still validates once dragged out of the disk image

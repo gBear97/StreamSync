@@ -10,12 +10,14 @@ import sys
 import traceback
 
 import depcheck
+import diagnostics
 
 ERROR_LOG = os.path.expanduser("~/.streamsync-error.log")
 
 
 def _report(details):
     """Surface a startup crash: a --windowed build has no console to print to."""
+    diagnostics.log_block("STARTUP FAILURE:", details)
     try:
         with open(ERROR_LOG, "w") as f:
             f.write(details)
@@ -45,6 +47,17 @@ def main():
     if "--netcheck" in sys.argv:
         import netcerts
         raise SystemExit(netcerts.selfcheck())
+
+    # The same question the app answers badly from inside a dialog, asked
+    # from a Terminal where the whole answer fits.
+    if "--diagnose" in sys.argv:
+        print(diagnostics.report())
+        raise SystemExit(0)
+
+    # Before anything else can fail: a windowed build has no console, so
+    # without this an uncaught exception leaves nothing behind at all.
+    diagnostics.install_excepthook()
+    diagnostics.log_session_start()
 
     try:
         ready = depcheck.ensure_ready()
