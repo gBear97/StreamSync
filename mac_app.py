@@ -132,6 +132,7 @@ class MacApp:
             messagebox.showerror("StreamSync - VLC problem", str(e))
             raise SystemExit(1)
         self.active_player = self.player_backend
+        self._build_video_window()
 
         self._load_config()
         self._build_menus()
@@ -257,6 +258,8 @@ class MacApp:
         playm.add_command(label="Toggle Fullscreen",
                           accelerator="Shift-Command-F",
                           command=self._toggle_fullscreen)
+        playm.add_command(label="Show Video Window",
+                          command=self._show_video_window)
         playm.add_checkbutton(label="Mute Local Audio", variable=self.mute_var,
                               command=self._on_mute_toggle)
         playm.add_separator()
@@ -382,6 +385,48 @@ class MacApp:
             self.root.after(0, lambda: fill(body))
 
         threading.Thread(target=work, daemon=True).start()
+
+    # ------------------------------------------------------------ video
+
+    def _build_video_window(self):
+        """The window the film renders into.
+
+        The first Mac field test proved playback runs fine with no window
+        at all: a sync matched, audio decoded, and there was simply
+        nothing to look at, because libvlc's macOS output needs to be
+        handed an NSView and had not been. So the app now owns the video
+        window - a Tk frame whose NSView is passed to libvlc - and shows
+        it when a film loads.
+        """
+        self.video_win = tk.Toplevel(self.root)
+        self.video_win.title("StreamSync - Video")
+        self.video_win.geometry("960x540")
+        self.video_win.configure(bg="black")
+        self.video_frame = tk.Frame(self.video_win, bg="black")
+        self.video_frame.pack(fill="both", expand=True)
+        # Closing the window hides it; the film (and the sync) carry on.
+        self.video_win.protocol("WM_DELETE_WINDOW", self.video_win.withdraw)
+        self.video_win.withdraw()
+
+    def _show_video_window(self):
+        """Show the video window and hand its view to libvlc, once.
+
+        winfo_id() is only meaningful after the widget really exists on
+        screen, so attachment happens here, at first show, rather than at
+        construction while the window is still withdrawn.
+        """
+        self.video_win.deiconify()
+        self.video_win.lift()
+        self.video_win.update_idletasks()
+        if not self.player_backend.embedded:
+            if not self.player_backend.attach_tk(self.video_frame.winfo_id()):
+                # The pre-1.0.5 behavior, named instead of silent: sound
+                # with no picture reads as a broken film otherwise.
+                self._set_status(
+                    "Video embedding is unavailable here - playback will "
+                    "be audio-only. Advanced > Diagnostics... has details.")
+                diagnostics.log("attach_tk failed: no NSView from Tk; "
+                                "playback continues without video")
 
     # ------------------------------------------------------------- updates
 
@@ -553,6 +598,7 @@ class MacApp:
         self.video_path = path
         self.file_lbl.config(text=Path(path).name)
         if self.player is self.player_backend:
+            self._show_video_window()
             try:
                 self.player_backend.load(path)
             except VLCError as e:
@@ -828,7 +874,14 @@ class MacApp:
     def _toggle_fullscreen(self):
         if self.player is self.player_backend:
             self.fullscreen = not self.fullscreen
-            self.player_backend.set_fullscreen(self.fullscreen)
+            if self.player_backend.embedded:
+                # The video lives in our own window now, so fullscreen is
+                # the window's, not libvlc's - set_fullscreen only works
+                # on a window libvlc itself owns.
+                self.video_win.deiconify()
+                self.video_win.attributes("-fullscreen", self.fullscreen)
+            else:
+                self.player_backend.set_fullscreen(self.fullscreen)
         else:
             self.external.fullscreen_toggle()
 
@@ -1175,6 +1228,10 @@ class MacApp:
         path = cfg.get("video_path")
         if path and Path(path).is_file():
             self.video_path = path
+            # The same show-then-load as _choose_file: this is the path a
+            # second launch takes, and it was the one that played films
+            # into a window that did not exist.
+            self._show_video_window()
             self.player_backend.load(path)
             self.file_lbl.config(text=Path(path).name)
         region = cfg.get("region")
