@@ -180,6 +180,29 @@ Embedded video window: **F11**/Fullscreen button toggles fullscreen,
 
 ## Tips & troubleshooting
 
+### When something fails, ask the app why
+
+StreamSync keeps a log at `~/Library/Logs/StreamSync/streamsync.log`
+(macOS) and can describe its own environment:
+
+```
+/Applications/StreamSync.app/Contents/MacOS/StreamSync --diagnose
+```
+
+That prints which libvlc it found, the architecture it was built for,
+who signed it, whether this process can actually load it, and what macOS
+said if it could not. **Advanced > Diagnostics...** shows the same report
+with a button that copies it. The report is also written to the log
+automatically whenever the player fails to start, so the evidence exists
+without anyone having to reproduce the failure on purpose.
+
+This matters most for one case that used to be invisible: a VLC built
+for a different processor than StreamSync. An Intel VLC will not load
+into an Apple Silicon build (or the reverse), and the old error said
+"Install VLC from videolan.org" - advice that cannot work, because VLC
+was already installed. The report names the mismatch instead.
+
+
 - Audio sync assumes the stream is the *loudest thing* on that playback
   device. Pause your music first, or route the stream to its own device
   and pick it under **Listen on**.
