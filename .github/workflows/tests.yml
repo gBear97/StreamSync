@@ -45,7 +45,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          for t in test_audio_capture test_controller test_matcher \
+          for t in test_audio_capture test_players test_controller test_matcher \
                    test_audio_matcher test_fingerprint test_relay \
                    test_session test_updater test_netcerts test_diagnostics \
                    test_windowctl; do

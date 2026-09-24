@@ -107,6 +107,7 @@ jobs:
       - name: Run tests
         run: |
           python3 test_audio_capture.py
+          python3 test_players.py
           python3 test_controller.py
           python3 test_matcher.py
           python3 test_audio_matcher.py

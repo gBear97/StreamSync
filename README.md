@@ -51,13 +51,14 @@ check when done; the Start button unlocks once everything passes.
 
 1. **Video file...** - pick your local copy of the film.
 2. Pick a **Player**:
-   - *Embedded* (default): video renders in StreamSync's own window with
-     millisecond-precise seeking. Subtitle picker included.
+   - *Embedded* (default): video renders in StreamSync's own window.
+     Every sync is checked once playback has restarted and any remainder
+     is trimmed away - lands within ~10 ms. Subtitle picker included.
    - *External VLC app*: your normal VLC opens and StreamSync drives it
      remotely. Its remote interface only seeks on whole seconds, so
-     StreamSync times each seek to fire at exactly the right instant, and
-     does sub-second nudges as brief smooth speed pulses. Use VLC's own
-     menus for subtitles/audio tracks in this mode.
+     StreamSync times each seek to fire at exactly the right instant, then
+     checks and trims it the same way. Use VLC's own menus for
+     subtitles/audio tracks in this mode.
 3. Leave **Sync by: Audio** selected. Check the **Listen on** device is
    the one the stream plays through.
 4. Type a rough **Position hint** (e.g. `1:23:00`) and hit
@@ -71,7 +72,9 @@ check when done; the Start button unlocks once everything passes.
    once the film has a position, a weak Resync leaves it where it is
    and says so, rather than throwing it somewhere random.
 5. Fine-tune with the **nudge buttons** until motion matches the voice
-   track. Nudges accumulate into an offset reapplied on every later sync.
+   track. A nudge runs the film 5% fast or slow until it has moved by
+   exactly that much - smooth, no seek, no freeze. Nudges accumulate into
+   an offset reapplied on every later sync.
 
 ## Auto mode
 
@@ -206,7 +209,13 @@ Embedded video window: **F11**/Fullscreen button toggles fullscreen,
   dated by its position in the recording, not by when a recording was
   asked for - so the matched moment is corrected by exactly how long ago
   it was heard (the stream kept playing meanwhile), plus your accumulated
-  nudge offset. Every match decision (window, score, z, drift, applied or
+  nudge offset. VLC's own position only updates every 250-500 ms, so
+  StreamSync dates each update as it arrives (within ~1 ms of the frame
+  on screen). A seek stalls playback for an amount that depends on the
+  file and the CPU (75 ms to over half a second), so after every seek
+  StreamSync measures where playback really landed, trims the rest with a
+  5% speed change, and learns the stall for next time: syncs land within
+  about 10 ms, measured against the frames actually displayed. Every match decision (window, score, z, drift, applied or
   not) is written to the log, so a session that went wrong leaves the
   evidence behind.
 
