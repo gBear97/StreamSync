@@ -162,13 +162,19 @@ jobs:
           echo "Mounted OK:"; ls -l "$MNT/StreamSync.app/Contents/MacOS/" | head
           hdiutil detach "$MNT"
 
+      # Pull requests prove the app builds, packages and mounts; only
+      # pushes and manual runs publish a disk image, so PR runs cannot
+      # fill the account's artifact storage (which fails the run).
       - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
         with:
           name: ${{ env.ARTIFACT }}
           path: ${{ env.DMG }}
           if-no-files-found: error
+          retention-days: 30
 
       - name: Write run summary
+        if: github.event_name != 'pull_request'
         run: |
           {
             echo "### StreamSync $VERSION (${{ matrix.arch }})"

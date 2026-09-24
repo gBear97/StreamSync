@@ -6,6 +6,13 @@ machine does. The monitor must date a recording by that true clock -
 not by whenever its read happened to return - slice exactly the samples
 asked for, and refuse a recording that spans a delivery stall (WASAPI
 loopback sends nothing at all while nothing plays).
+
+No stamp can beat the promptest block delivery the machine manages, and
+that floor is the host's, not the monitor's: a few tenths of a ms on
+one box, 3-12 ms on a macOS CI runner whose sleeps all overshoot. So the
+test checks what the monitor promises - never earlier than the truth,
+and within a hair of the best bound its blocks allow - rather than an
+absolute figure that only holds on a quiet machine.
 """
 
 import threading
@@ -28,6 +35,7 @@ class FakeDevice:
         self.n = 0
         self.lost = 0.0
         self.lock = threading.Lock()
+        self.delivered = []           # (end_frame, perf_counter at return)
 
     def true_time(self, frame):
         """When `frame` was really captured (perf_counter)."""
@@ -50,7 +58,14 @@ class FakeDevice:
             time.sleep(delay)
         data = (np.arange(self.n, end, dtype=np.float32) % 1000) / 1000.0 + 0.01
         self.n = end
+        self.delivered.append((end, time.perf_counter()))
         return data
+
+    def best_bound(self, frame, by, span=2.0):
+        """The earliest time the blocks delivered before `by` prove
+        `frame` existed by - all a stamp taken at `by` could know."""
+        return min(t - (end - frame) / SR for end, t in self.delivered
+                   if frame <= end <= frame + span * SR and t <= by)
 
 
 def monitor_for(dev):
@@ -58,30 +73,36 @@ def monitor_for(dev):
 
 
 def main():
-    # 1. dating: error vs the true sample clock, over several recordings
+    # 1. dating: vs the true sample clock, and vs the best bound the
+    # delivered blocks allow, over several recordings
     dev = FakeDevice(jitter=0.03)
     mon = monitor_for(dev)
-    errs = []
+    marks = []
     try:
         for _ in range(4):
             mark = mon.mark()
             data, sr, t0 = mon.capture(0.6, start=mark)
+            returned = time.perf_counter()
             assert sr == SR and data.size == int(0.6 * SR)
             # samples are contiguous and in order
             want = (np.arange(data.size) + (mark % 1000)) % 1000 / 1000.0 + 0.01
             assert np.allclose(data, want, atol=1e-4), "slice is not contiguous"
-            errs.append(t0 - dev.true_time(mark))
+            marks.append((mark, t0, returned))
         # instant capture of already-buffered audio
         time.sleep(0.2)
         data, _, t0 = mon.capture(1.0)
         assert data.size == SR
     finally:
         mon.stop()
-    errs_ms = [1000 * e for e in errs]
-    print("stamp error vs true clock (ms): " + ", ".join(f"{e:+.1f}" for e in errs_ms))
-    # the bound can only err late, and by little more than the gentlest
-    # delivery delay in the next couple of seconds
-    assert all(-1.0 < e < 6.0 for e in errs_ms), errs_ms
+    vs_truth = [1000 * (t0 - dev.true_time(m)) for m, t0, _ in marks]
+    vs_best = [1000 * (t0 - dev.best_bound(m, by)) for m, t0, by in marks]
+    print("stamp vs true clock (ms): " + ", ".join(f"{e:+.1f}" for e in vs_truth))
+    print("stamp vs best possible (ms): " + ", ".join(f"{e:+.2f}" for e in vs_best))
+    # never early (a sample cannot be dated before it existed)...
+    assert all(e > -1.0 for e in vs_truth), vs_truth
+    # ...and as tight as the deliveries allow: the monitor reads the clock
+    # a moment after the device returns, so it may trail the bound slightly
+    assert all(-0.5 < e < 2.0 for e in vs_best), vs_best
 
     # 2. a delivery stall inside the recording is refused
     dev = FakeDevice(jitter=0.005, stall_at=int(0.5 * SR), stall_s=0.6)

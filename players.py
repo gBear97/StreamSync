@@ -94,7 +94,9 @@ def _tk_nsview(win_id):
     try:
         lib = ctypes.CDLL(None)
         f = lib.TkMacOSXGetRootControl
-    except (OSError, AttributeError):
+    except (OSError, AttributeError, TypeError):
+        # TypeError: Windows' CDLL cannot open "the process image" at all
+        # (it tests the name for path separators, and None has none)
         return None
     f.restype = ctypes.c_void_p
     f.argtypes = [ctypes.c_void_p]

@@ -83,8 +83,14 @@ jobs:
         shell: pwsh
         run: ./build_exe.ps1
 
+      # Pull requests prove the build works; only main publishes it. The
+      # account's artifact storage is finite (it once filled up and failed
+      # an otherwise green run), and a 1,100-file build per PR push is
+      # the quickest way to fill it.
       - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
         with:
           name: StreamSync-windows-${{ github.sha }}
           path: dist/StreamSync
           if-no-files-found: error
+          retention-days: 14
