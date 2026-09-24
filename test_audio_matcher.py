@@ -4,7 +4,16 @@ Renders 3 minutes of film-like audio (random note segments plus
 envelope-modulated noise -- rich temporal structure, like music and
 effects), AAC-encodes it, simulates a loopback capture at a known moment
 with louder 'commentary' noise mixed over it, and checks that
-find_match_audio recovers the timestamp.
+find_match_audio recovers the timestamp. Also covers:
+
+- a capture recorded at 48 kHz (the loopback rate) against the 16 kHz
+  file path;
+- the same film remuxed with container timestamps starting at 5 s and at
+  600 s (.m2ts-style), which once shifted every match by the start time;
+- a quiet scene inside a loud search window, where uncentered scoring once
+  pushed the right answer under the trust gates.
+
+bench_audio.py measures real-world accuracy; this only guards regressions.
 """
 
 import os
@@ -84,7 +93,69 @@ def main():
         assert err < 0.12, f"match error too large: {err:.3f}s"
         assert score >= audio_matcher.SCORE_OK, f"score too low: {score:.3f}"
         assert z >= audio_matcher.Z_OK, f"peak z too low: {z:.1f}"
+    # the loopback records at 48 kHz, not the file path's 16 kHz
+    x48 = audio_matcher.resample(x + noise.astype(np.float32), audio_matcher.SR, 48000)
+    t, score, z = audio_matcher.find_match_audio(
+        clip, audio_matcher.prep_capture(x48, 48000), TRUTH - 30, TRUTH + 30)
+    print(f"48 kHz capture: matched {t:.3f}s (err {abs(t - TRUTH) * 1000:.0f} ms, "
+          f"score {score:.3f}, z {z:.1f})")
+    assert abs(t - TRUTH) < 0.12 and score >= audio_matcher.SCORE_OK
+
+    # container timestamps that do not start at zero
+    for name, off in (("offset5.mp4", 5), ("offset600.mkv", 600)):
+        shifted = os.path.join(tmp, name)
+        subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-y",
+                        "-i", clip, "-c", "copy", "-output_ts_offset", str(off),
+                        shifted], check=True, capture_output=True)
+        t, score, z = audio_matcher.find_match_audio(shifted, feats,
+                                                     TRUTH - 30, TRUTH + 30)
+        err = abs(t - TRUTH)
+        print(f"{name}: start {matcher.probe(shifted)[1]:.2f}s, matched {t:.3f}s "
+              f"(err {err * 1000:.0f} ms)")
+        # AAC priming puts the container start ~64 ms before the audio
+        assert err < 0.12, f"{name}: start time mishandled, err {err:.3f}s"
+
+    quiet_scene(tmp)
     print("AUDIO MATCHER TEST PASSED")
+
+
+def quiet_scene(tmp):
+    """A capture from a quiet stretch, searched inside a loud window."""
+    rng = np.random.default_rng(3)
+    n = int(DUR * SR)
+    x = np.zeros(n)
+    seg = int(0.25 * SR)
+    tt = np.arange(seg) / SR
+    for s in range(n // seg):
+        for f in np.exp(rng.uniform(np.log(120.0), np.log(5500.0), size=2)):
+            x[s * seg:(s + 1) * seg] += 0.35 * np.sin(2 * np.pi * f * tt)
+    env = rng.uniform(0.0, 1.0, size=int(DUR * 20)) ** 2
+    x += 0.4 * rng.standard_normal(n) * np.interp(
+        np.arange(n), np.linspace(0, n, env.size), env)
+    x[int(60 * SR):int(150 * SR)] *= 0.03          # a -30 dB scene
+    x *= 0.7 / np.abs(x).max()
+    wav, clip = os.path.join(tmp, "quiet.wav"), os.path.join(tmp, "quiet.m4a")
+    with wave.open(wav, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(SR)
+        f.writeframes((x * 32767).astype(np.int16).tobytes())
+    subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-y",
+                    "-i", wav, "-c:a", "aac", "-b:a", "128k", clip],
+                   check=True, capture_output=True)
+    for truth in (80.0, 100.0, 120.0):
+        c = audio_matcher.decode_audio(clip, truth, CAPTURE_S)
+        noise = np.convolve(np.random.default_rng(int(truth)).standard_normal(c.size),
+                            np.hamming(65), "same")
+        noise *= 3.0 * np.sqrt((c * c).mean()) / np.sqrt((noise * noise).mean())
+        feats = audio_matcher.prep_capture((c + noise).astype(np.float32),
+                                           audio_matcher.SR)
+        t, score, z = audio_matcher.find_match_audio(clip, feats, None, None)
+        print(f"quiet scene @{truth:.0f}s: matched {t:.3f}s "
+              f"(score {score:.3f}, z {z:.1f})")
+        assert abs(t - truth) < 0.12, f"quiet scene: wrong match {t:.3f}s"
+        assert score >= audio_matcher.SCORE_OK and z >= audio_matcher.Z_OK, \
+            f"quiet scene: correct match not trusted (score {score:.3f}, z {z:.1f})"
 
 
 if __name__ == "__main__":

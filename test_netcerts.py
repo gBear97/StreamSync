@@ -133,17 +133,46 @@ def _reset(widened=False):
     netcerts._widened = widened
 
 
+# Used when no openssl CLI is at hand (Windows has none on PATH): a
+# self-signed root made once for this test, in no real trust store either.
+# Only loaded and counted, never used to verify, so its age is irrelevant.
+EMBEDDED_ROOT = """\
+-----BEGIN CERTIFICATE-----
+MIIDNjCCAh6gAwIBAgITDY+NasOALKrkTCH3I/7ivSLMvTANBgkqhkiG9w0BAQsF
+ADAqMSgwJgYDVQQDDB9TdHJlYW1TeW5jIHRlc3Qgcm9vdCAoZW1iZWRkZWQpMCAX
+DTI2MDkyNDA1MTkzOVoYDzIxMjYwODMxMDUxOTM5WjAqMSgwJgYDVQQDDB9TdHJl
+YW1TeW5jIHRlc3Qgcm9vdCAoZW1iZWRkZWQpMIIBIjANBgkqhkiG9w0BAQEFAAOC
+AQ8AMIIBCgKCAQEA0RHN/5WPbNwydbjSF/GIstu3F/b3U0+0F2lcQTfkIp3CARtI
+vEzDmtaurIUzLgxHlhf5/21/b1uM1pq4mRdynEpaCc9Y/Kx45SVWeCPRhk7yP7ds
+JA5b+foubHl2K3K9Y6nyn/N5Nn1thdgxi4MELzTWtXr5BGLQ/ET10LvQKSsFDvgM
+e0kqPQuq9gOHhd//qc1ZLKpnsgGH69xJLPvrdyNbf+BPepRcGOZjaW1Urtt7HzjV
+8xZEscWZDBIHqP6dE8WolAyLqZ6GRientZ2/jUYVJokCqUbC6Joo4926zlQgB4Po
+9LzWuBQl3ISPIgKCgXbewJr1U3RfpXkoj2VkYwIDAQABo1MwUTAdBgNVHQ4EFgQU
+G/oBIYu0lYHeJ0B+kRew6aeC3EEwHwYDVR0jBBgwFoAUG/oBIYu0lYHeJ0B+kRew
+6aeC3EEwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAbf1FbDS3
+6GyMI69fy32YnNqETZYh8+ecm0mfbTprXJ4KWtFjHJ33eR9aCg8nwXk9jc/qkOrT
+6Ac3h1rFYptXF1lt8I+818EhuvYIT4e1iF16sOcJ8quEXnxC6TaMsAyY84qgso4e
+tCC8JzdH2QSqJ9iEScTLYb2u1RHxVoPwaAnYdoe/+giBZYj1V1ULswYwYIcxBX9q
+Jpqc0hC/KvELCp3kMbuLIlEAuawiXeH48qkSAleHWK7hUP8SC3Ls6+rxN/xCr9mx
+1RDWai9Cau8Xk7iO0zwuH7v8Mar0yjionnRQUDm/qq7P4ie6hc/8LWU1ky/RLkBM
+3J7bUGM7MAsIDA==
+-----END CERTIFICATE-----
+"""
+
+
 def throwaway_root():
     """A CA certificate that is certainly not in any real trust store."""
     try:
         r = subprocess.run(
             ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
-             "-keyout", "/dev/null", "-days", "1", "-subj",
+             "-keyout", os.devnull, "-days", "1", "-subj",
              "/CN=StreamSync test root"],
             capture_output=True, text=True, timeout=60)
+        if "BEGIN CERTIFICATE" in (r.stdout or ""):
+            return r.stdout
     except (OSError, subprocess.SubprocessError):
-        return None
-    return r.stdout if "BEGIN CERTIFICATE" in (r.stdout or "") else None
+        pass
+    return EMBEDDED_ROOT
 
 
 try:

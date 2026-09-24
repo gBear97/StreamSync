@@ -1,8 +1,13 @@
 """Fingerprint + session-math tests, no network or audio devices needed.
 
 Covers: hash robustness across re-encodes, rejection of wrong media,
-verify_media offset detection, and stream-delay measurement from chunked
-voice fingerprints.
+verify_media offset detection, stream-delay measurement from chunked
+voice fingerprints, and the listen-mode host's pause bookkeeping.
+
+Delays and offsets are deliberately NOT multiples of the 250 ms
+fingerprint hop: the first version of this test used 7.25 s, which the
+hop-quantized alignment of the time happened to hit exactly, and so it
+never saw errors of up to 125 ms everywhere else.
 """
 
 import os
@@ -66,8 +71,16 @@ def main():
     # 1. same media verifies, offset ~0
     delta, ber = session.verify_media(host_words, rel_b)
     print(f"same media: verified, delta {delta:+.3f}s, worst ber {ber:.3f}")
-    assert abs(delta) < 0.6, delta
+    assert abs(delta) < 0.05, delta
     assert ber < fingerprint.VERIFY_BER
+
+    # 1b. a release with 1.37 s of extra lead-in (another studio logo)
+    shifted = os.path.join(tmp, "release_c.m4a")
+    lead = np.zeros(int(1.37 * SR), np.float32)
+    encode(np.concatenate([lead, film * 0.9]), shifted, "96k")
+    delta, ber = session.verify_media(host_words, shifted)
+    print(f"shifted release: delta {delta:+.3f}s (true +1.370s), ber {ber:.3f}")
+    assert abs(delta - 1.37) < 0.04, delta
 
     # 2. wrong media is rejected
     other = os.path.join(tmp, "other.m4a")
@@ -78,32 +91,36 @@ def main():
     except matcher.MatchError as e:
         print(f"wrong media: correctly rejected ({str(e)[:60]}...)")
 
-    # 3. voice delay measurement from chunked fingerprints
+    # 3. voice delay measurement: host words cut on the UTC grid, as
+    # HostSession sends them
     voice = synth(120, seed=42)
     buf = session.VoiceBuffer()
-    base_utc = 1_000_000.0
-    chunk = int(session.VOICE_CHUNK * SR)
-    for i in range(0, len(voice) - chunk, chunk):
-        words = fingerprint.fingerprint_samples(voice[i:i + chunk], SR)
+    base_utc = 1_000_000.0                  # a multiple of the hop
+    n = int(round(session.VOICE_CHUNK / fingerprint.FP_HOP))
+    hop = int(fingerprint.FP_HOP * SR)
+    span = int((session.VOICE_CHUNK + fingerprint.FP_WIN) * SR)
+    for i in range(0, len(voice) - span, n * hop):
+        words = fingerprint.fingerprint_samples(voice[i:i + span], SR)[:n]
         buf.add(base_utc + i / SR, words)
 
-    true_delay = 7.25
     # late enough that the 90 s correlation window is inside the buffer
     # (in production the voice buffer runs continuously, so this is the
     # normal situation after ~90 s of session)
-    probe_start_media = 95.0
-    seg = voice[int(probe_start_media * SR):
-                int((probe_start_media + session.MEASURE_SECONDS) * SR)]
     rng = np.random.default_rng(5)
-    degraded = np.clip(seg * 0.9 + 0.15 * np.convolve(
-        rng.standard_normal(seg.size), np.hamming(33), "same").astype(np.float32),
-        -1, 1)
-    probe = fingerprint.fingerprint_samples(degraded, SR)
-    probe_t0 = base_utc + probe_start_media + true_delay  # heard this late
-    d = session.measure_delay(buf, probe, probe_t0)
-    assert d is not None, "delay measurement was inconclusive"
-    print(f"delay measurement: true {true_delay}s, measured {d:.2f}s")
-    assert abs(d - true_delay) < 0.3, d
+    errs = []
+    for true_delay in (7.25, 7.10, 7.375, 7.40, 7.61, 12.93):
+        start = 95.0 - (true_delay - 7.25)      # keep the probe in range
+        seg = voice[int(start * SR):int((start + session.MEASURE_SECONDS) * SR)]
+        degraded = np.clip(seg * 0.9 + 0.15 * np.convolve(
+            rng.standard_normal(seg.size), np.hamming(33), "same").astype(np.float32),
+            -1, 1)
+        probe_t0 = base_utc + start + true_delay       # heard this late
+        d = session.measure_delay(buf, degraded, SR, probe_t0)
+        assert d is not None, f"delay {true_delay}: inconclusive"
+        errs.append(d - true_delay)
+        print(f"delay measurement: true {true_delay:.3f}s, measured {d:.3f}s "
+              f"(err {1000 * (d - true_delay):+.0f} ms)")
+    assert max(abs(e) for e in errs) < 0.04, errs
 
     # 4. timeline math: delayed rendering delays pauses too
     tl = session.StateTimeline()
@@ -115,7 +132,60 @@ def main():
     assert not playing and abs(pos - 130.0) < 0.01, (pos, playing)
     print("timeline math: delayed pause lands correctly")
 
+    listen_mode_pause()
+
     print("FINGERPRINT TEST PASSED")
+
+
+def listen_mode_pause():
+    """A listen-mode host pauses at utc 1012 (film 112) after a good match
+    at utc 1000 (film 100); checks run every 4 s.
+
+    The old code relabelled the 1000/100 anchor "paused", so viewers were
+    sent back to 100 and paused ~12 s early. Now: one miss is not a pause,
+    two are, the pause lands where the audio stopped, and the resume is
+    dated to when playback restarted.
+    """
+    tr = session.ListenTracker()
+    tl = session.StateTimeline()
+
+    def publish(state):
+        if state is not None:
+            pos, utc, playing = state
+            tl.add({"pos": pos, "utc": utc, "playing": playing,
+                    "default_delay": 10})
+
+    publish(tr.hit(100.0, 1000.0))
+    publish(tr.hit(104.0, 1004.0))
+    publish(tr.hit(108.0, 1008.0))
+    # the 1012 recording is silent from its start; so is the 1016 one
+    publish(tr.miss(1012.0, stopped_utc=1012.0))
+    assert tr.anchor[2], "one miss must not count as a pause"
+    publish(tr.miss(1016.0, stopped_utc=1012.0))
+    pos, at, playing = tr.anchor
+    assert not playing and abs(pos - 112.0) < 1e-6 and at == 1012.0, tr.anchor
+    for wall, want_pos, want_play in ((1018.0, 108.0, True), (1021.9, 111.9, True),
+                                      (1024.0, 112.0, False)):
+        p, pl = tl.at(wall - 10.0)
+        assert pl == want_play and abs(p - want_pos) < 1e-6, (wall, p, pl)
+    print("listen-mode pause: viewers pause at 112 when it reaches them, "
+          "not back at 100")
+
+    # host resumes at utc 1030; the 1032 recording finds film 114
+    publish(tr.hit(114.0, 1032.0))
+    pos, at, playing = tr.anchor
+    assert playing and abs(pos - 112.0) < 1e-6 and abs(at - 1030.0) < 1e-6, tr.anchor
+    p, pl = tl.at(1031.0)
+    assert pl and abs(p - 113.0) < 1e-6, (p, pl)
+    print("listen-mode resume: dated to when playback restarted (1030), "
+          "not when it was heard (1032)")
+
+    # a host who jumps elsewhere while paused is not back-dated
+    tr2 = session.ListenTracker()
+    tr2.hit(100.0, 1000.0)
+    tr2.miss(1004.0, 1004.0)
+    tr2.miss(1008.0, 1004.0)
+    assert tr2.hit(900.0, 1020.0) == (900.0, 1020.0, True)
 
 
 if __name__ == "__main__":

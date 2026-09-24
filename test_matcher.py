@@ -63,6 +63,15 @@ def main():
         assert err < 0.35, f"match error too large: {err:.3f}s"
         assert score > 0.6, f"confidence too low: {score:.3f}"
 
+    # container timestamps starting at 600 s (.m2ts-style)
+    shifted = os.path.join(tmp, "offset600.mkv")
+    subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-y",
+                    "-i", clip, "-c", "copy", "-output_ts_offset", "600", shifted],
+                   check=True, capture_output=True)
+    t, score = matcher.find_match(shifted, burst, TRUTH - 20, TRUTH + 20)
+    print(f"start-offset file: matched {t:.3f}s (err {abs(t - TRUTH) * 1000:.0f} ms)")
+    assert abs(t - TRUTH) < 0.35, f"start time mishandled: {t:.3f}s"
+
     # mechanical check of the keyframes-only decode used for whole-file scans
     # (clip has -g 48 at 24 fps -> a keyframe every <= 2 s)
     frames, pts = matcher._decode(clip, 0, 180, keyframes_only=True)

@@ -2,7 +2,6 @@
 
 import sys
 import time
-import tkinter as tk
 
 import numpy as np
 import mss
@@ -55,6 +54,7 @@ class RegionSelector:
         self.root = root
 
     def select(self):
+        import tkinter as tk  # here, so the engine imports without a display
         result = {}
         top = tk.Toplevel(self.root)
         top.overrideredirect(True)

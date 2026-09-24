@@ -26,6 +26,7 @@ REQUIRED_PKGS = [
     ("imageio_ffmpeg", "imageio-ffmpeg"),
     ("vlc", "python-vlc"),
     ("soundcard", "soundcard"),
+    ("websockets", "websockets"),   # watch parties
 ]
 OPTIONAL_PKGS = [("keyboard", "keyboard")] if sys.platform == "win32" else []
 

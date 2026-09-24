@@ -13,89 +13,43 @@ Platform notes:
 - The facecam swap activates/hides the browser app via AppleScript.
 """
 
-import json
 import os
 import queue
 import subprocess
 import sys
 import tempfile
 import threading
-import time
 from pathlib import Path
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-import numpy as np
 from PIL import Image, ImageTk
 
 import audio_capture
-import audio_matcher
 import capture
+import controller
 import depcheck
 import macwindowctl
-import matcher
-import session
 import updater
 from version import __version__
 import diagnostics
-from players import EmbeddedPlayer, ExternalPlayer, VLCError
+from controller import fmt_time
+from players import EmbeddedPlayer, VLCError
 
-CONFIG_PATH = Path.home() / ".streamsync.json"
-BURST_FRAMES = 4
-BURST_SPACING = 1 / 3
-AUDIO_SYNC_SECONDS = 6.0
-AUTO_RECORD_SECONDS = 4.0
-LOW_CONFIDENCE = 0.55
 BROWSERS = ("Safari", "Google Chrome", "Firefox", "Arc", "Brave Browser",
             "Microsoft Edge", "Opera", "Vivaldi")
-
-
-def fmt_time(s):
-    s = max(0.0, float(s))
-    h, rem = divmod(int(s), 3600)
-    m, sec = divmod(rem, 60)
-    frac = s - int(s)
-    if h:
-        return f"{h}:{m:02d}:{sec + frac:04.1f}"
-    return f"{m}:{sec + frac:04.1f}"
-
-
-def parse_time(text):
-    text = text.strip()
-    if not text:
-        return None
-    parts = text.split(":")
-    if len(parts) > 3 or not all(p.strip() for p in parts):
-        raise ValueError(f"Cannot parse time '{text}' (use h:mm:ss, m:ss or seconds)")
-    total = 0.0
-    for p in parts:
-        total = total * 60 + float(p)
-    return total
 
 
 class MacApp:
     def __init__(self, root):
         self.root = root
         self.q = queue.Queue()
-        self.region = None
-        self.video_path = None
-        self.busy = False
-        self.offset = 0.0
         self.fullscreen = False
-        self.facecam_rect = None
-        self.audio_device = ""
         self.stream_app = ""
-        self.auto_enabled = False
-        self.auto_follow = True
-        self.auto_interval = 30
-        self._closing = False
         self._swapped = False
         self._was_fullscreen = False
         self._preview_photo = None
-        self.external = None
-        self.session = None          # active HostSession / ViewerSession
-        self.relay_url = "ws://localhost:8765"
 
         root.title(f"StreamSync {__version__}")
         root.resizable(False, False)
@@ -131,14 +85,14 @@ class MacApp:
             diagnostics.log(f"player failed to start: {e}")
             messagebox.showerror("StreamSync - VLC problem", str(e))
             raise SystemExit(1)
-        self.active_player = self.player_backend
+        self.ctl = controller.SyncController(self.q, self.player_backend)
         self._build_video_window()
 
         self._load_config()
         self._build_menus()
         self._populate_audio_devices()
 
-        threading.Thread(target=self._auto_loop, daemon=True).start()
+        self.ctl.start()
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         root.after(80, self._poll_queue)
@@ -505,10 +459,14 @@ class MacApp:
                 updater.swap_and_relaunch(app_path, staged)
                 self.root.after(300, self._on_close)
             except Exception as e:
+                # Bound now: Python deletes `e` when this block ends, and the
+                # dialog runs later - it used to die with a NameError instead
+                # of saying why the update failed.
+                why = str(e)
                 self.root.after(0, dlg.destroy)
                 self.root.after(0, lambda: messagebox.showerror(
                     "StreamSync - update failed",
-                    f"{e}\n\nYour installed copy has not been changed. You "
+                    f"{why}\n\nYour installed copy has not been changed. You "
                     f"can download it yourself from:\n{updater.RELEASES_PAGE}"))
 
         threading.Thread(target=work, daemon=True).start()
@@ -550,39 +508,21 @@ class MacApp:
 
     @property
     def player(self):
-        return self.active_player
+        return self.ctl.player
+
+    @property
+    def external(self):
+        return self.ctl.external
 
     def _apply_player_choice(self):
-        kind = self.player_var.get()
-        if kind == "external":
-            try:
-                if self.external is None:
-                    self.external = ExternalPlayer()
-            except VLCError as e:
-                messagebox.showerror("StreamSync", str(e))
+        if self.player_var.get() == "external":
+            err = self.ctl.use_external(self.mute_var.get())
+            if err:
+                messagebox.showerror("StreamSync", err)
                 self.player_var.set("embedded")
                 return
-            self.player_backend.pause()
-            self.active_player = self.external
-            if self.video_path:
-                t = self.player_backend.time()
-
-                def spawn():
-                    try:
-                        self.external.load(self.video_path)
-                        if t:
-                            self.external.seek(t)
-                        self.external.set_mute(self.mute_var.get())
-                        self.q.put(("status", "Loaded in VLC.app - use "
-                                              "Sync/Resync to line it up."))
-                    except Exception as e:
-                        self.q.put(("status", f"External VLC: {e}"))
-                self._set_status("Starting VLC.app...")
-                threading.Thread(target=spawn, daemon=True).start()
         else:
-            if self.external is not None:
-                self.external.pause()
-            self.active_player = self.player_backend
+            self.ctl.use_embedded()
         self._on_mute_toggle()
         self._save_config()
 
@@ -595,35 +535,27 @@ class MacApp:
                        ("All files", "*.*")])
         if not path:
             return
-        self.video_path = path
         self.file_lbl.config(text=Path(path).name)
         if self.player is self.player_backend:
             self._show_video_window()
-            try:
-                self.player_backend.load(path)
-            except VLCError as e:
-                messagebox.showerror("StreamSync", str(e))
-                return
+        try:
+            self.ctl.load_file(path)
+        except VLCError as e:
+            messagebox.showerror("StreamSync", str(e))
+            return
+        if self.player is self.player_backend:
             self._set_status("Loaded. Playback starts on first sync.")
-        else:
-            def spawn():
-                try:
-                    self.external.load(path)
-                    self.q.put(("status", f"Loaded {Path(path).name} in VLC.app."))
-                except Exception as e:
-                    self.q.put(("status", f"External VLC: {e}"))
-            threading.Thread(target=spawn, daemon=True).start()
         self._save_config()
 
     def _select_region(self):
         region = capture.RegionSelector(self.root).select()
         if region:
-            self.region = region
+            self.ctl.region = region
             self._set_status(f"Capture region set ({region[2]}x{region[3]} px).")
             self._save_config()
 
     def _select_facecam_rect(self):
-        if not self.region:
+        if not self.ctl.region:
             messagebox.showinfo("StreamSync", "Set the capture region first "
                                               "(Advanced menu).")
             self.facecam_var.set("none")
@@ -632,233 +564,70 @@ class MacApp:
         if not rect:
             self.facecam_var.set("none")
             return
-        left, top, w, h = self.region
-        x0 = max(0.0, min((rect[0] - left) / w, 1.0))
-        y0 = max(0.0, min((rect[1] - top) / h, 1.0))
-        x1 = max(0.0, min((rect[0] + rect[2] - left) / w, 1.0))
-        y1 = max(0.0, min((rect[1] + rect[3] - top) / h, 1.0))
-        if x1 - x0 < 0.02 or y1 - y0 < 0.02:
+        zone = controller.zone_in_region(self.ctl.region, rect)
+        if zone is None:
             messagebox.showinfo("StreamSync", "That zone is outside the "
                                               "capture region - try again.")
             self.facecam_var.set("none")
             return
-        self.facecam_rect = (x0, y0, x1, y1)
+        self.ctl.facecam_rect = zone
         self._save_config()
 
-    def _build_mask(self):
-        mode = self.facecam_var.get()
-        if mode in ("tl", "tr", "bl", "br"):
-            return matcher.corner_mask(mode)
-        if mode == "custom" and self.facecam_rect:
-            return matcher.rect_mask(*self.facecam_rect)
-        return None
-
     def _ready(self, need_region):
-        if not self.video_path:
+        if not self.ctl.video_path:
             messagebox.showinfo("StreamSync", "Open a film first (Cmd-O).")
             return False
-        if need_region and not self.region:
+        if need_region and not self.ctl.region:
             messagebox.showinfo("StreamSync", "Select the capture region "
                                               "first (Advanced menu).")
             return False
         return True
 
-    def _sync(self):
-        if self.busy:
+    def _sync(self, resync=False):
+        if self.ctl.busy:
             return
         method = self.method_var.get()
         if not self._ready(need_region=(method == "video")):
             return
-        try:
-            center = parse_time(self.hint_var.get())
-            window = parse_time(self.window_var.get()) or 120.0
-        except ValueError as e:
-            messagebox.showerror("StreamSync", str(e))
-            return
-        if center is None:
-            self._start_search(None, None)
-        else:
-            self._start_search(center - window, center + window)
-
-    def _resync(self):
-        if self.busy:
-            return
-        method = self.method_var.get()
-        if not self._ready(need_region=(method == "video")):
-            return
-        t = self.player.time()
-        if t is None:
-            self._sync()
-            return
-        try:
-            window = parse_time(self.window_var.get()) or 120.0
-        except ValueError:
-            window = 120.0
-        self._start_search(t - window, t + 30.0)
-
-    def _start_search(self, a, b):
-        self.busy = True
-        self.sync_btn.state(["disabled"])
-        self.resync_btn.state(["disabled"])
-        player = self.player
-        offset = self.offset
-        mute = self.mute_var.get()
-        if self.method_var.get() == "audio":
-            device = self.audio_device
-            threading.Thread(
-                target=self._audio_search_worker,
-                args=(a, b, player, offset, mute, device), daemon=True).start()
-        else:
+        video = {"mute": self.mute_var.get()}
+        if method == "video":
             self._set_status("Capturing stream frames...")
             self.root.withdraw()  # our window must not cover the stream
             self.root.update()
-            mask = self._build_mask()
-            mirror = self.mirror_var.get()
-            threading.Thread(
-                target=self._video_search_worker,
-                args=(a, b, player, offset, mute, mask, mirror),
-                daemon=True).start()
-
-    # ------------------------------------------------------------- workers
-
-    def _audio_search_worker(self, a, b, player, offset, mute, device):
+            video.update(mask=controller.build_mask(self.facecam_var.get(),
+                                                    self.ctl.facecam_rect),
+                         mirror=self.mirror_var.get(),
+                         hidden=[self.root])
+        run = self.ctl.resync if resync else self.ctl.sync
         try:
-            self.q.put(("status",
-                        f"Listening to the stream ({AUDIO_SYNC_SECONDS:.0f} s)..."))
-            samples, sr, t0 = audio_capture.record_loopback(
-                AUDIO_SYNC_SECONDS, speaker_name=device)
-            feats = audio_matcher.prep_capture(samples, sr)
-            match_t, score, z = audio_matcher.find_match_audio(
-                self.video_path, feats, a, b,
-                progress=lambda m: self.q.put(("status", m)))
-            self.q.put(("status", "Seeking..."))
-            player.sync_seek(match_t, t0, offset)
-            player.set_mute(mute)
-            self.q.put(("swap", False))
-            self.q.put(("adone", match_t, score, z))
-        except Exception as e:
-            self.q.put(("error", str(e)))
-        finally:
-            self.q.put(("busy_off", None))
+            started = run(self.hint_var.get(), self.window_var.get(), method,
+                          **video)
+        except ValueError as e:
+            self.root.deiconify()
+            messagebox.showerror("StreamSync", str(e))
+            return
+        if not started:
+            for win in video.get("hidden") or ():
+                win.deiconify()      # a sync was already running
+        if started:
+            self.sync_btn.state(["disabled"])
+            self.resync_btn.state(["disabled"])
 
-    def _video_search_worker(self, a, b, player, offset, mute, mask, mirror):
-        try:
-            time.sleep(0.3)  # let our window leave the screen
-            burst_raw, t0 = capture.grab_burst(self.region, BURST_FRAMES,
-                                               BURST_SPACING)
-            self.q.put(("showroot", None))
-            self.q.put(("preview", burst_raw[0][0]))
-            burst = []
-            for img, dt in burst_raw:
-                if mirror:
-                    img = np.fliplr(img)
-                burst.append((matcher.prep_gray(img, mask), dt))
-            match_t, score = matcher.find_match(
-                self.video_path, burst, a, b,
-                progress=lambda m: self.q.put(("status", m)), mask=mask)
-            self.q.put(("status", "Seeking..."))
-            player.sync_seek(match_t, t0, offset)
-            player.set_mute(mute)
-            self.q.put(("swap", False))
-            self.q.put(("vdone", match_t, score))
-        except Exception as e:
-            self.q.put(("showroot", None))
-            self.q.put(("error", str(e)))
-        finally:
-            self.q.put(("busy_off", None))
+    def _resync(self):
+        self._sync(resync=True)
 
     # ------------------------------------------------------------ auto mode
 
     def _on_auto_toggle(self):
-        self.auto_enabled = self.auto_var.get()
-        self.auto_follow = self.follow_var.get()
-        self.auto_interval = max(10, int(self.interval_var.get()))
-        if self.auto_enabled:
-            self._set_status(f"Auto re-sync on: every {self.auto_interval} s"
-                             + (", following pauses." if self.auto_follow
-                                else "."))
+        self.ctl.set_auto(self.auto_var.get(), self.follow_var.get(),
+                          self.interval_var.get())
         self._save_config()
-
-    def _auto_probe(self, lo, hi):
-        try:
-            samples, sr, t0 = audio_capture.record_loopback(
-                AUTO_RECORD_SECONDS, speaker_name=self.audio_device)
-            feats = audio_matcher.prep_capture(samples, sr)
-            t, score, z = audio_matcher.find_match_audio(
-                self.video_path, feats, lo, hi)
-        except (RuntimeError, matcher.MatchError):
-            return None
-        if z >= audio_matcher.Z_OK and score >= audio_matcher.SCORE_OK:
-            return t, score, z, t0
-        return None
-
-    def _auto_loop(self):
-        mode = "normal"
-        failures = 0
-        pause_point = None
-        next_at = 0.0
-        while not self._closing:
-            time.sleep(1.0)
-            if (not self.auto_enabled or self.busy or not self.video_path
-                    or self._session_running()):  # sessions own the playhead
-                mode, failures = "normal", 0
-                continue
-            if time.monotonic() < next_at:
-                continue
-            player = self.active_player
-            try:
-                if mode == "normal":
-                    t_ref = player.time() if player.is_playing() else None
-                    if t_ref is None:
-                        next_at = time.monotonic() + 5
-                        continue
-                    hit = self._auto_probe(t_ref - 45, t_ref + 50)
-                    if hit:
-                        t, score, z, t0 = hit
-                        failures = 0
-                        drift = t - t_ref
-                        if abs(drift) > 0.35 and not self.busy:
-                            player.sync_seek(t, t0, self.offset)
-                            self.q.put(("status",
-                                        f"Auto: corrected {drift:+.2f}s drift "
-                                        f"(score {score:.2f}, z {z:.0f})."))
-                        next_at = time.monotonic() + self.auto_interval
-                    else:
-                        failures += 1
-                        if self.auto_follow and failures >= 2:
-                            player.pause()
-                            pause_point = t_ref
-                            mode = "probe"
-                            self.q.put(("swap", True))
-                            self.q.put(("status",
-                                        "Auto: film audio not found - assuming "
-                                        "pause. Watching for resume..."))
-                            next_at = time.monotonic() + 8
-                        else:
-                            next_at = time.monotonic() + 10
-                else:
-                    hit = self._auto_probe(pause_point - 25, pause_point + 40)
-                    if hit:
-                        t, score, z, t0 = hit
-                        if not self.busy:
-                            player.sync_seek(t, t0, self.offset)
-                            self.q.put(("swap", False))
-                            self.q.put(("status",
-                                        "Auto: stream resumed - resynced."))
-                        mode, failures = "normal", 0
-                        next_at = time.monotonic() + self.auto_interval
-                    else:
-                        next_at = time.monotonic() + 8
-            except Exception as e:
-                self.q.put(("status", f"Auto-resync check failed: {e}"))
-                next_at = time.monotonic() + max(self.auto_interval, 20)
 
     # ------------------------------------------------------------- playback
 
     def _nudge(self, delta):
-        self.player.nudge(delta)
-        self.offset += delta
-        self.offset_lbl.config(text=f"  {self.offset:+.2f}s")
+        offset = self.ctl.nudge(delta)
+        self.offset_lbl.config(text=f"  {offset:+.2f}s")
 
     def _toggle_pause(self):
         try:
@@ -869,7 +638,7 @@ class MacApp:
         self._stream_swap(was_playing)
 
     def _on_mute_toggle(self):
-        self.player.set_mute(self.mute_var.get())
+        self.ctl.set_mute(self.mute_var.get())
 
     def _toggle_fullscreen(self):
         if self.player is self.player_backend:
@@ -888,7 +657,7 @@ class MacApp:
     # ---------------------------------------------------- hosted sessions
 
     def _session_running(self):
-        return self.session is not None and not self.session.stop_flag.is_set()
+        return self.ctl.session_running()
 
     def _set_leave_enabled(self, enabled):
         self.session_menu.entryconfig(3, state="normal" if enabled else "disabled")
@@ -897,7 +666,7 @@ class MacApp:
         if self._session_running():
             messagebox.showinfo("StreamSync", "Leave the current session first.")
             return
-        if not self.video_path:
+        if not self.ctl.video_path:
             messagebox.showinfo("StreamSync", "Open the film first (Cmd-O).")
             return
         dlg = tk.Toplevel(self.root)
@@ -907,7 +676,7 @@ class MacApp:
         frm.grid()
 
         ttk.Label(frm, text="Relay server").grid(row=0, column=0, sticky="w")
-        relay_var = tk.StringVar(value=self.relay_url)
+        relay_var = tk.StringVar(value=self.ctl.relay_url)
         ttk.Entry(frm, textvariable=relay_var, width=32).grid(
             row=0, column=1, sticky="w", padx=(8, 0))
         ttk.Label(frm, text="Password (optional)").grid(row=1, column=0,
@@ -952,19 +721,12 @@ class MacApp:
                                   padx=(8, 0), pady=(6, 0))
 
         def start():
-            self.relay_url = relay_var.get().strip()
-            src = None
-            if src_var.get() == "player":
-                player = self.player
-                src = lambda: (player.time(), player.is_playing())
-            self.session = session.HostSession(
-                self.relay_url, self.video_path, self.q,
-                password=pw_var.get().strip() or None,
-                position_source=src, mic_name=mic_var.get() or None,
-                speaker_name=self.audio_device,
-                default_delay=float(delay_var.get()),
-                title=Path(self.video_path).stem)
-            self.session.start()
+            self.ctl.host(relay_var.get().strip(),
+                          pw_var.get().strip() or None,
+                          from_player=src_var.get() == "player",
+                          mic_name=mic_var.get() or None,
+                          delay_hint=float(delay_var.get()),
+                          title=Path(self.ctl.video_path).stem)
             self._set_leave_enabled(True)
             self._save_config()
             dlg.destroy()
@@ -977,7 +739,7 @@ class MacApp:
         if self._session_running():
             messagebox.showinfo("StreamSync", "Leave the current session first.")
             return
-        if not self.video_path:
+        if not self.ctl.video_path:
             messagebox.showinfo("StreamSync", "Open your copy of the film first "
                                               "(Cmd-O).")
             return
@@ -988,7 +750,7 @@ class MacApp:
         frm.grid()
 
         ttk.Label(frm, text="Relay server").grid(row=0, column=0, sticky="w")
-        relay_var = tk.StringVar(value=self.relay_url)
+        relay_var = tk.StringVar(value=self.ctl.relay_url)
         ttk.Entry(frm, textvariable=relay_var, width=32).grid(
             row=0, column=1, sticky="w", padx=(8, 0))
         ttk.Label(frm, text="Session code").grid(row=1, column=0, sticky="w",
@@ -1003,14 +765,8 @@ class MacApp:
             row=2, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
 
         def start():
-            self.relay_url = relay_var.get().strip()
-            self.session = session.ViewerSession(
-                self.relay_url, code_var.get().strip().upper(),
-                self.video_path, self.player, self.q,
-                password=pw_var.get().strip() or None,
-                speaker_name=self.audio_device)
-            self.session.start()
-            self.player.set_mute(self.mute_var.get())
+            self.ctl.join(relay_var.get().strip(), code_var.get().strip().upper(),
+                          pw_var.get().strip() or None, self.mute_var.get())
             self._set_leave_enabled(True)
             self._save_config()
             dlg.destroy()
@@ -1020,9 +776,7 @@ class MacApp:
         dlg.grab_set()
 
     def _leave_session(self):
-        if self.session is not None:
-            self.session.stop()
-            self.session = None
+        self.ctl.leave()
         self._set_leave_enabled(False)
         self._set_status("Left the session.")
 
@@ -1043,7 +797,7 @@ class MacApp:
         self._save_config()
 
     def _stream_swap(self, show):
-        if not self.swap_var.get() or show == self._swapped or not self.video_path:
+        if not self.swap_var.get() or show == self._swapped or not self.ctl.video_path:
             return
         app_name = self.stream_app
         if not app_name:
@@ -1119,8 +873,9 @@ class MacApp:
                     self._set_status(payload[0])
                 elif kind == "swap":
                     self._stream_swap(payload[0])
-                elif kind == "showroot":
-                    self.root.deiconify()
+                elif kind == "show":
+                    for win in payload[0] or ():
+                        win.deiconify()
                 elif kind == "devices":
                     self._rebuild_device_menu(payload[0])
                     if not self.device_var.get() and payload[0]:
@@ -1139,25 +894,7 @@ class MacApp:
                 elif kind == "update_err":
                     messagebox.showwarning(
                         "StreamSync - update check failed", payload[0])
-                elif kind == "adone":
-                    match_t, score, z = payload
-                    msg = (f"Matched at {fmt_time(match_t)} "
-                           f"(score {score:.2f}, z {z:.0f}).")
-                    if score < audio_matcher.SCORE_OK or z < audio_matcher.Z_OK:
-                        msg += (" Weak - check BlackHole routing, or try a "
-                                "louder scene.")
-                    self._set_status(msg)
-                elif kind == "vdone":
-                    match_t, score = payload
-                    msg = (f"Matched at {fmt_time(match_t)} "
-                           f"(confidence {score:.2f}).")
-                    if score < LOW_CONFIDENCE:
-                        msg += " Low confidence - check region/facecam zone."
-                    self._set_status(msg)
-                elif kind == "error":
-                    self._set_status(f"Sync failed: {payload[0]}")
                 elif kind == "busy_off":
-                    self.busy = False
                     self.sync_btn.state(["!disabled"])
                     self.resync_btn.state(["!disabled"])
         except queue.Empty:
@@ -1175,7 +912,7 @@ class MacApp:
         threading.Thread(target=work, daemon=True).start()
 
     def _on_device_pick(self):
-        self.audio_device = self.device_var.get()
+        self.ctl.audio_device = self.device_var.get()
         self._save_config()
 
     def _show_preview(self, gray_img):
@@ -1199,85 +936,48 @@ class MacApp:
         self.root.after(700, self._tick_time)
 
     def _save_config(self):
-        try:
-            CONFIG_PATH.write_text(json.dumps({
-                "video_path": self.video_path,
-                "region": self.region,
-                "window": self.window_var.get(),
-                "hint": self.hint_var.get(),
-                "method": self.method_var.get(),
-                "player": self.player_var.get(),
-                "audio_device": self.audio_device,
-                "facecam": self.facecam_var.get(),
-                "facecam_rect": self.facecam_rect,
-                "mirror": self.mirror_var.get(),
-                "auto_interval": self.auto_interval,
-                "auto_follow": self.follow_var.get(),
-                "swap": self.swap_var.get(),
-                "stream_app": self.stream_app,
-                "relay_url": self.relay_url,
-            }))
-        except OSError:
-            pass
+        self.ctl.save_config({
+            "window": self.window_var.get(),
+            "hint": self.hint_var.get(),
+            "method": self.method_var.get(),
+            "player": self.player_var.get(),
+            "facecam": self.facecam_var.get(),
+            "mirror": self.mirror_var.get(),
+            "swap": self.swap_var.get(),
+            "stream_app": self.stream_app,
+        })
 
     def _load_config(self):
-        try:
-            cfg = json.loads(CONFIG_PATH.read_text())
-        except (OSError, ValueError):
-            return
-        path = cfg.get("video_path")
-        if path and Path(path).is_file():
-            self.video_path = path
+        cfg = self.ctl.load_config()
+        path = self.ctl.film_to_restore(cfg)
+        if path:
             # The same show-then-load as _choose_file: this is the path a
             # second launch takes, and it was the one that played films
             # into a window that did not exist.
             self._show_video_window()
-            self.player_backend.load(path)
+            self.ctl.load_file(path)
             self.file_lbl.config(text=Path(path).name)
-        region = cfg.get("region")
-        if region and len(region) == 4:
-            self.region = tuple(int(v) for v in region)
         if cfg.get("window"):
             self.window_var.set(cfg["window"])
         if cfg.get("hint"):
             self.hint_var.set(cfg["hint"])
         if cfg.get("method") in ("audio", "video"):
             self.method_var.set(cfg["method"])
-        self.audio_device = cfg.get("audio_device", "")
-        if self.audio_device:
-            self.device_var.set(self.audio_device)
+        if self.ctl.audio_device:
+            self.device_var.set(self.ctl.audio_device)
         if cfg.get("facecam"):
             self.facecam_var.set(cfg["facecam"])
-        rect = cfg.get("facecam_rect")
-        if rect and len(rect) == 4:
-            self.facecam_rect = tuple(float(v) for v in rect)
         self.mirror_var.set(bool(cfg.get("mirror", False)))
-        try:
-            self.auto_interval = max(10, int(cfg.get("auto_interval", 30)))
-        except (TypeError, ValueError):
-            self.auto_interval = 30
-        self.interval_var.set(self.auto_interval)
-        self.follow_var.set(bool(cfg.get("auto_follow", True)))
-        self.auto_follow = self.follow_var.get()
+        self.interval_var.set(self.ctl.auto_interval)
+        self.follow_var.set(self.ctl.auto_follow)
         self.swap_var.set(bool(cfg.get("swap", True)))
         self.stream_app = cfg.get("stream_app", "")
         if self.stream_app:
             self.streamapp_var.set(self.stream_app)
-        if cfg.get("relay_url"):
-            self.relay_url = cfg["relay_url"]
 
     def _on_close(self):
-        self._closing = True
-        if self.session is not None:
-            try:
-                self.session.stop()
-            except Exception:
-                pass
         self._save_config()
-        try:
-            self.player_backend.stop()
-        except Exception:
-            pass
+        self.ctl.close()
         self.root.destroy()
 
 

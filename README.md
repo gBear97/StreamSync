@@ -51,35 +51,49 @@ check when done; the Start button unlocks once everything passes.
 
 1. **Video file...** - pick your local copy of the film.
 2. Pick a **Player**:
-   - *Embedded* (default): video renders in StreamSync's own window with
-     millisecond-precise seeking. Subtitle picker included.
+   - *Embedded* (default): video renders in StreamSync's own window.
+     Every sync is checked once playback has restarted and any remainder
+     is trimmed away - lands within ~10 ms. Subtitle picker included.
    - *External VLC app*: your normal VLC opens and StreamSync drives it
      remotely. Its remote interface only seeks on whole seconds, so
-     StreamSync times each seek to fire at exactly the right instant, and
-     does sub-second nudges as brief smooth speed pulses. Use VLC's own
-     menus for subtitles/audio tracks in this mode.
+     StreamSync times each seek to fire at exactly the right instant, then
+     checks and trims it the same way. Use VLC's own menus for
+     subtitles/audio tracks in this mode.
 3. Leave **Sync by: Audio** selected. Check the **Listen on** device is
    the one the stream plays through.
 4. Type a rough **Position hint** (e.g. `1:23:00`) and hit
-   **Sync to stream**. It records ~6 s of stream audio, finds the moment,
-   and starts playback there. Local audio is muted by default - the
-   stream provides the sound.
+   **Sync to stream**. It takes the last ~6 s of stream audio, finds the
+   moment, and starts playback there. Local audio is muted by default -
+   the stream provides the sound. (StreamSync keeps listening once it has
+   started, so after the first sync the audio is usually already there
+   and a sync starts searching immediately.)
+   If the match is weak it listens longer - 12 s, then 18 s - before
+   giving up. A weak result is only ever used for the very first sync;
+   once the film has a position, a weak Resync leaves it where it is
+   and says so, rather than throwing it somewhere random.
 5. Fine-tune with the **nudge buttons** until motion matches the voice
-   track. Nudges accumulate into an offset reapplied on every later sync.
+   track. A nudge runs the film 5% fast or slow until it has moved by
+   exactly that much - smooth, no seek, no freeze. Nudges accumulate into
+   an offset reapplied on every later sync.
 
 ## Auto mode
 
 Tick **Auto re-sync (audio) every N s** and StreamSync quietly re-checks
 sync in the background:
 
-- Each check records 4 s of audio and scans ±45 s around where the film
-  *should* be - roughly one second of CPU work per check, then it sleeps.
-  Raise the interval if you want it even lighter.
-- Drift beyond 0.35 s is corrected automatically.
+- Each check records 4 s of audio (8 s if the first look is weak) and
+  scans ±45 s around where the film *should* be - roughly one second of
+  CPU work per check, then it sleeps. Raise the interval if you want it
+  even lighter.
+- Drift beyond 0.35 s is corrected automatically. Your nudge offset is
+  part of where the film *should* be, so a nudge is kept, not
+  "corrected" away.
 - With **follow stream pauses** on: when the film's audio disappears from
   the stream for two consecutive checks (streamer paused, or is talking
   over a black screen), your copy pauses too. When the film's audio comes
-  back, it resyncs and resumes automatically. Fully hands-free.
+  back, it resyncs and resumes automatically. Fully hands-free. If the
+  stream was actually still playing (a stretch too quiet to hear), the
+  resume search widens with every check until it finds it again.
 
 ## See the streamer during pauses
 
@@ -127,15 +141,31 @@ your copy pauses at the moment the commentary about it reaches you.
 
 Under the hood: both ends sync to internet time (NTP) so "position X at
 time T" means the same instant everywhere - machine clocks are often
-off by hundreds of milliseconds (this machine: 404 ms). The host
-broadcasts a delay hint that applies immediately; each viewer's client
-then refines it automatically by finding the host's voice fingerprints
-in their own incoming stream audio.
+off by hundreds of milliseconds (this machine: 404 ms). The correction
+is re-measured every 10 minutes and is immune to the OS stepping its own
+clock mid-film. The host broadcasts a delay hint that applies
+immediately; each viewer's client then refines it automatically by
+finding the host's voice fingerprints in their own incoming stream
+audio - to within about 10 ms, well below the fingerprints' 250 ms
+spacing, by re-aligning its own audio at sub-step offsets. Nudges work
+for viewers too: they shift your copy against the host's timeline.
+
+A host playing the film in another player ("listening" mode) is
+followed by its sound: a pause is placed where the audio actually
+stopped, and it takes two silent checks in a row, so a quiet scene does
+not pause everyone. For frame-exact pauses and seeks, host from
+StreamSync's own player.
+
+If a connection drops, both ends reconnect on their own. The relay holds
+a host's room for a minute (viewers see "host away") and gives it back
+only to that host.
 
 **Relay server**: `python relay_server.py --port 8765` on any machine
 both sides can reach (a $5 VPS or small AWS instance serves thousands of
-viewers - traffic is a few tiny messages per second per room). Point
-both clients at `ws://your-server:8765`.
+viewers - traffic is a few tiny messages per second per room, and a
+slow viewer never holds up the others). Point both clients at
+`ws://your-server:8765`. `--host-grace N` sets how long a dropped
+host's room waits for it (default 60 s).
 
 ## Video sync (experimental fallback)
 
@@ -165,18 +195,29 @@ Embedded video window: **F11**/Fullscreen button toggles fullscreen,
 - **Audio**: 26 log-spaced band energies every 16 ms, level-normalized,
   matched by normalized cross-correlation against the file's audio track
   (decoded by a bundled ffmpeg - audio-only decode is fast, so even
-  whole-file scans take well under a minute). Commentary over the film is
-  fine: in testing, the matcher stayed millisecond-accurate with talk
-  noise 1.2x louder than the film audio. Every match reports a score and
-  a peak-sharpness value (z); weak matches are flagged rather than
-  trusted.
+  whole-file scans take well under a minute). Each candidate moment is
+  normalized against its own loudness, so a quiet dialogue scene scores
+  as well as a loud one. Every match reports a score and a
+  peak-sharpness value (z); weak matches are flagged rather than trusted.
+  Files whose timestamps do not start at zero (.m2ts, .ts, some MP4s)
+  are handled.
 - **Video**: small grayscale thumbnails, black bars auto-cropped, facecam
   zones masked out, compared by zero-normalized cross-correlation. A
   burst of 4 frames is matched as a sequence at 12 fps (~83 ms
   resolution). Windows over 12 minutes use a keyframes-only prepass.
-- **Timing**: the matched moment is corrected by exactly how long the
-  capture + search took (the stream kept playing meanwhile), plus your
-  accumulated nudge offset.
+- **Timing**: stream audio is recorded continuously and every sample is
+  dated by its position in the recording, not by when a recording was
+  asked for - so the matched moment is corrected by exactly how long ago
+  it was heard (the stream kept playing meanwhile), plus your accumulated
+  nudge offset. VLC's own position only updates every 250-500 ms, so
+  StreamSync dates each update as it arrives (within ~1 ms of the frame
+  on screen). A seek stalls playback for an amount that depends on the
+  file and the CPU (75 ms to over half a second), so after every seek
+  StreamSync measures where playback really landed, trims the rest with a
+  5% speed change, and learns the stall for next time: syncs land within
+  about 10 ms, measured against the frames actually displayed. Every match decision (window, score, z, drift, applied or
+  not) is written to the log, so a session that went wrong leaves the
+  evidence behind.
 
 ## Tips & troubleshooting
 
@@ -375,5 +416,12 @@ redistributes it.
 
 ```
 python test_matcher.py        # video: synthetic clip, expects <0.35 s error
-python test_audio_matcher.py  # audio: film-like audio + loud commentary noise
+python test_audio_matcher.py  # audio: commentary noise, quiet scenes, offset files
+python test_controller.py     # sync decisions against a simulated stream
+python test_session.py        # a whole watch party on localhost
 ```
+
+Every test runs on Windows, macOS and Linux for each pull request (the
+Tests workflow). Those tests guard against regressions; for how well the
+audio matcher does on real film audio under real commentary, see
+`bench_audio.py`.

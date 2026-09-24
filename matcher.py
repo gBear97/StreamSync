@@ -51,19 +51,24 @@ def probe(path):
     return duration, start
 
 
-def _decode(path, seek_abs, end_abs, keyframes_only=False, fps=None,
+def _decode(path, t0, t1, start=0.0, keyframes_only=False, fps=None,
             progress=None, label=""):
-    """Decode grayscale thumbnails between two absolute source timestamps.
+    """Decode grayscale thumbnails between two player-timeline times.
 
-    Returns (frames, pts): frames as float32 (N, H, W) in 0..1, pts as each
-    frame's absolute source timestamp (-copyts keeps original pts, showinfo
-    reports them on stderr).
+    Returns (frames, pts): frames as uint8 (N, H, W), pts as each frame's
+    time on the player timeline. -copyts keeps the source timestamps so
+    showinfo can report them, which puts the container start time back in:
+    input -ss is relative to that start (ffmpeg adds it), but -to and the
+    reported pts are absolute - so `start` is added to -to and taken off
+    the pts, and nothing else. Adding it to -ss as well, as this once did,
+    scanned the wrong stretch of any file whose timestamps do not begin
+    at zero.
     """
     cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-nostats"]
     if keyframes_only:
         cmd += ["-skip_frame", "nokey"]
-    cmd += ["-ss", f"{max(seek_abs, 0.0):.3f}", "-copyts", "-i", path,
-            "-to", f"{end_abs:.3f}", "-an", "-sn"]
+    cmd += ["-ss", f"{max(t0, 0.0):.3f}", "-copyts", "-i", path,
+            "-to", f"{start + t1:.3f}", "-an", "-sn"]
     vf = ([f"fps={fps}"] if fps else []) + [f"scale={DECODE_W}:{DECODE_H}", "showinfo"]
     cmd += ["-vf", ",".join(vf), "-fps_mode", "passthrough",
             "-f", "rawvideo", "-pix_fmt", "gray", "-"]
@@ -105,7 +110,7 @@ def _decode(path, seek_abs, end_abs, keyframes_only=False, fps=None,
     n = min(len(chunks), len(pts))
     frames = np.frombuffer(b"".join(chunks[:n]), dtype=np.uint8)
     frames = frames.reshape(n, DECODE_H, DECODE_W)  # uint8 keeps memory low
-    times = np.array(pts[:n], dtype=np.float64)
+    times = np.array(pts[:n], dtype=np.float64) - start
     good = ~np.isnan(times)
     return frames[good], times[good]
 
@@ -176,9 +181,9 @@ def _thumb_matrix(frames, mask=None):
                      for f in frames])
 
 
-def _fine_scan(path, burst, a_abs, b_abs, progress=None, mask=None):
-    """Dense scan of [a_abs, b_abs]; returns (absolute_pts, score)."""
-    frames, pts = _decode(path, a_abs, b_abs, fps=FINE_FPS,
+def _fine_scan(path, burst, a, b, start, progress=None, mask=None):
+    """Dense scan of [a, b]; returns (time on the player timeline, score)."""
+    frames, pts = _decode(path, a, b, start, fps=FINE_FPS,
                           progress=progress, label="Scanning")
     V = _thumb_matrix(frames, mask)
     total = np.zeros(len(V), np.float32)
@@ -216,10 +221,10 @@ def _pick_candidates(scores, times, min_sep, max_n):
     return cands
 
 
-def _keyframe_search(path, burst, a_abs, b_abs, progress, mask=None):
+def _keyframe_search(path, burst, a, b, start, progress, mask=None):
     """Keyframes-only prepass for very wide windows, then refine the peaks."""
     progress("Coarse scan (keyframes only)...")
-    frames, kf_pts = _decode(path, a_abs, b_abs, keyframes_only=True,
+    frames, kf_pts = _decode(path, a, b, start, keyframes_only=True,
                              progress=progress, label="Coarse scan")
     V = _thumb_matrix(frames, mask)
     scores = V @ burst[0][0]
@@ -230,11 +235,11 @@ def _keyframe_search(path, burst, a_abs, b_abs, progress, mask=None):
     for rank, i in enumerate(cands, 1):
         prev_gap = kf_pts[i] - kf_pts[i - 1] if i > 0 else 5.0
         next_gap = kf_pts[i + 1] - kf_pts[i] if i < len(kf_pts) - 1 else 5.0
-        a = kf_pts[i] - min(prev_gap, 20.0) - 1.5
-        b = kf_pts[i] + min(next_gap, 20.0) + 1.5
+        lo = kf_pts[i] - min(prev_gap, 20.0) - 1.5
+        hi = kf_pts[i] + min(next_gap, 20.0) + 1.5
         progress(f"Refining candidate {rank}/{len(cands)}...")
         try:
-            pts, score = _fine_scan(path, burst, a, b, mask=mask)
+            pts, score = _fine_scan(path, burst, lo, hi, start, mask=mask)
         except MatchError:
             continue
         if score > best_score:
@@ -269,17 +274,15 @@ def find_match(path, burst, t0=None, t1=None, progress=None, mask=None):
     # guarantees the true moment is scored, never skipped by a prepass.
     if span <= KEYFRAME_SPAN:
         progress("Scanning window...")
-        pts, score = _fine_scan(path, burst, start + t0, start + t1, progress,
-                                mask=mask)
-        return pts - start, score
+        return _fine_scan(path, burst, t0, t1, start, progress, mask=mask)
 
     # Very wide windows (whole file): keyframes-only prepass, which can be
     # fooled if the true moment sits between keyframes of a fast scene --
     # fall back to a dense scan when the result looks weak.
-    pts, score = _keyframe_search(path, burst, start + t0, start + t1, progress,
+    pts, score = _keyframe_search(path, burst, t0, t1, start, progress,
                                   mask=mask)
     if score < 0.72 and span <= 1200.0:
         progress("Weak match - rescanning window densely...")
-        pts, score = _fine_scan(path, burst, start + t0, start + t1, progress,
+        pts, score = _fine_scan(path, burst, t0, t1, start, progress,
                                 mask=mask)
-    return pts - start, score
+    return pts, score
