@@ -12,17 +12,28 @@ ignore-zones for streamers who overlay a camera on the film.
 
 ## Requirements
 
-- Windows, Python 3.9+ (64-bit)
+- Windows (64-bit), or macOS - see [macOS](#macos)
 - VLC 64-bit installed
-- `pip install -r requirements.txt`
+- To run from source: Python 3.9+ (64-bit) and
+  `pip install -r requirements.txt`
 
 ## Run
+
+**Download**: every [release](https://github.com/gBear97/StreamSync/releases)
+from 1.0.7 on has a Windows build, `StreamSync-<version>-windows-x64-<commit>.zip`.
+Unzip it anywhere and run `StreamSync\StreamSync.exe` - no Python needed.
+It is not code-signed, so the first run shows SmartScreen's "unknown
+publisher" warning (**More info > Run anyway**), and it does not update
+itself: download the next release's zip when you want it. Its checksum is
+in the release's `SHA256SUMS`.
+
+**From source**:
 
 ```
 python streamsync.py
 ```
 
-Or build a double-clickable exe (no console window):
+Or build the double-clickable exe yourself (no console window):
 
 ```
 powershell -File build_exe.ps1     # produces dist\StreamSync\StreamSync.exe
@@ -322,8 +333,12 @@ different version and be offered again forever. It signs the app with a
 Developer ID, has Apple notarize it, staples the ticket into both the app
 and the disk image, and checks `spctl` accepts the result before
 publishing - so a release that would trip Gatekeeper fails the build
-rather than reaching anyone. It publishes one `.dmg` per architecture
-plus the `SHA256SUMS` the updater verifies against.
+rather than reaching anyone. It publishes one `.dmg` per architecture,
+a zipped Windows build (`build-windows.yml`, unsigned), and the
+`SHA256SUMS` the updater verifies against. A release that went out
+without a Windows build can get one afterwards: **Actions > Windows
+release build > Run workflow** with its tag rebuilds it from that tag,
+attaches the zip and adds its line to `SHA256SUMS`.
 
 Signing needs five repository secrets - `MACOS_CERT_P12`,
 `MACOS_CERT_PASSWORD`, `NOTARY_KEY_P8`, `NOTARY_KEY_ID` and
@@ -396,11 +411,11 @@ on the Mac that runs it.
 - StreamSync never downloads and runs executables itself - VLC installs
   go through winget (verified) or your own browser. That avoids the
   classic "program fetched an exe and ran it" heuristic.
-- The packaged `StreamSync.exe` is an unsigned PyInstaller build. On
-  *your* machine (where you built it) Defender is normally fine. If you
-  copy it to another PC, SmartScreen may show "unknown publisher" -
-  expected for any unsigned exe; "More info -> Run anyway" or run from
-  source instead.
+- The packaged `StreamSync.exe` - the release zip, or one you built -
+  is an unsigned PyInstaller build. SmartScreen may show "unknown
+  publisher" for a downloaded or copied exe - expected for any unsigned
+  exe; "More info -> Run anyway" or run from source instead. On the
+  machine that built it, Defender is normally fine.
 - The optional `keyboard` package installs a global keyboard hook for
   the hotkeys. Some aggressive AV/anticheat tools flag global hooks as
   keylogger-like. If yours complains, uninstall `keyboard` - the app
