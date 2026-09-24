@@ -331,7 +331,7 @@ class SyncController:
                 player.set_mute(mute)
                 self.q.put(("swap", False))
             msg = (f"Matched stream audio at {fmt_time(match_t)} "
-                   f"(score {score:.2f}, peak z {z:.0f}).")
+                   f"(score {score:.1f}, peak z {z:.0f}).")
             if ok:
                 msg += " Nudge if the picture leads/lags the voice track."
             elif apply:
@@ -453,7 +453,7 @@ class SyncController:
                 if drift is not None and abs(drift) > DRIFT_TOLERANCE:
                     player.sync_seek(t, t0, self.offset)
                     self._say(f"Auto: corrected {drift:+.2f}s drift "
-                              f"(score {score:.2f}, z {z:.0f}).")
+                              f"(score {score:.1f}, z {z:.0f}).")
                 return self.auto_interval
             if hit:
                 return 1     # a manual sync overtook this one
