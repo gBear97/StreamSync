@@ -149,10 +149,10 @@ jobs:
       # zipping strips) and it mounts on double-click - so the download
       # doesn't have to survive a second trip through Archive Utility, which
       # is where the previous zip-inside-a-zip broke.
+      # ci/make_dmg.sh retries hdiutil's intermittent "Resource busy"
+      # on the runners instead of failing the whole build on it.
       - name: Package as a disk image
-        run: |
-          hdiutil create -volname "StreamSync $VERSION" \
-            -srcfolder dist/StreamSync.app -fs HFS+ -ov -format UDZO "$DMG"
+        run: ci/make_dmg.sh dist/StreamSync.app "StreamSync $VERSION" "$DMG"
 
       - name: Verify the disk image mounts and the app is intact
         run: |
