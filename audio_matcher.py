@@ -7,7 +7,10 @@ is audible under the voice - correlation only needs a fraction of the
 spectrum to line up.
 """
 
+import collections
+import os
 import subprocess
+import threading
 
 import numpy as np
 import imageio_ffmpeg
@@ -21,6 +24,8 @@ N_BANDS = 26
 F_LO, F_HI = 80.0, 7200.0
 CHUNK_S = 900.0       # decode long windows in chunks this big
 OVERLAP_S = 8.0
+
+CACHE_CHUNKS = 12     # decoded feature chunks kept (~6 MB each at 900 s)
 
 # gates used by callers to decide whether a peak is trustworthy
 Z_OK = 6.0            # peak must stand this many sigmas above the score curve
@@ -104,6 +109,34 @@ def prep_capture(samples, sr):
     return features(resample(samples, sr, SR), SR)
 
 
+_cache = collections.OrderedDict()
+_cache_lock = threading.Lock()
+
+
+def _file_features(path, seg0, seg1):
+    """features() of the file's audio over [seg0, seg1], cached.
+
+    A weak match is retried with a longer recording over the same window,
+    and decoding is most of a search's cost - a whole film takes tens of
+    seconds - so the second and third look reuse the first one's decode.
+    """
+    try:
+        stamp = os.path.getmtime(path)
+    except OSError:
+        stamp = None
+    key = (path, stamp, round(seg0, 3), round(seg1, 3))
+    with _cache_lock:
+        if key in _cache:
+            _cache.move_to_end(key)
+            return _cache[key]
+    W = features(decode_audio(path, seg0, seg1 - seg0), SR)
+    with _cache_lock:
+        _cache[key] = W
+        while len(_cache) > CACHE_CHUNKS:
+            _cache.popitem(last=False)
+    return W
+
+
 def _corr_scores(W, C):
     """Normalized correlation of capture C (L,B) at every lag inside W (T,B).
 
@@ -157,8 +190,7 @@ def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None):
         if seg1 - seg0 >= 4.0:
             progress(f"Listening through {int(seg0) // 60}:{int(seg0) % 60:02d}"
                      f" - {int(seg1) // 60}:{int(seg1) % 60:02d}...")
-            x = decode_audio(path, seg0, seg1 - seg0)
-            W = features(x, SR)
+            W = _file_features(path, seg0, seg1)
             try:
                 scores = _corr_scores(W, capture_feats)
             except MatchError:
