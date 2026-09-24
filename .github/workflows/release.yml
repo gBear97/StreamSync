@@ -3,7 +3,9 @@ name: Release
 # Publishes a GitHub Release, which is what the in-app updater reads. Its
 # shape matters: one .dmg per architecture, named the way CI names every
 # other build, plus a SHA256SUMS the updater checks each download against
-# before installing anything.
+# before installing anything. A zipped Windows build rides along
+# (build-windows.yml) and is checksummed with the rest; the updater only
+# ever picks a .dmg.
 #
 # Two ways in, both requiring the tag to agree with version.py:
 #   - push a tag:  git tag v1.0.1 && git push origin v1.0.1
@@ -369,33 +371,40 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$TAG" "$DMG" --repo "$GITHUB_REPOSITORY" --clobber
 
+  windows:
+    name: Windows
+    needs: prepare
+    uses: ./.github/workflows/build-windows.yml
+    with:
+      version: ${{ inputs.version || github.ref_name }}
+
   publish:
     name: Publish the release
-    needs: build
+    needs: [build, windows]
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch the disk images from the draft
+      - name: Fetch the builds from the draft
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ inputs.version || github.ref_name }}"
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern "*.dmg" --dir dist
-          # One per architecture - never publish half a release.
-          for arch in arm64 x86_64; do
-            n=$(find dist -maxdepth 1 -name "*-$arch-*.dmg" | wc -l)
+            --pattern "*.dmg" --pattern "*-windows-x64-*.zip" --dir dist
+          # One per platform - never publish half a release.
+          for want in "*-arm64-*.dmg" "*-x86_64-*.dmg" "*-windows-x64-*.zip"; do
+            n=$(find dist -maxdepth 1 -name "$want" | wc -l)
             if [ "$n" -ne 1 ]; then
-              echo "Expected one $arch disk image on the draft, found $n."
+              echo "Expected one $want on the draft, found $n."
               exit 1
             fi
           done
 
       # The updater refuses any download it cannot match here, so a
       # release without this file installs nothing.
-      - name: Checksum the disk images
+      - name: Checksum the builds
         working-directory: dist
         run: |
-          sha256sum *.dmg | tee SHA256SUMS
+          sha256sum *.dmg *.zip | tee SHA256SUMS
           ls -lh
 
       # SHA256SUMS goes up before the draft is published, so there is no

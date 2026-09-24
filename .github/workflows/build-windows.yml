@@ -1,0 +1,140 @@
+name: Windows release build
+
+# Builds StreamSync.exe for a release and attaches it, zipped, to that
+# release. The Release workflow calls this for every new version, and it
+# can be run by hand (Actions > Windows release build > Run workflow) to
+# add a Windows build to a release that went out without one.
+#
+# The exe is not code-signed - there is no Windows signing certificate -
+# so SmartScreen warns on first run, and Windows has no in-app updater:
+# the zip is a download from the release page. The Mac updater only ever
+# picks a .dmg, so the zip on a release never reaches it.
+#
+# A pull request that changes this build runs it without attaching
+# anything, so a broken Windows build shows up before a release needs it.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release to attach a Windows build to, e.g. v1.0.7"
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - .github/workflows/build-windows.yml
+      - build_exe.ps1
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Build (windows-x64)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # tags too, to rebuild a published release
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # A new release has no tag yet - it is created when the draft is
+      # published - so it builds the commit the Release workflow runs on.
+      # A release that is already out is rebuilt from its own tag, not
+      # from whatever main has become since.
+      - name: Check out the release's commit
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT" != "pull_request" ] &&
+             git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            git checkout -q "refs/tags/$TAG"
+          fi
+          FILE=$(python -c 'from version import __version__; print(__version__)')
+          if [ "$EVENT" = "pull_request" ]; then
+            TAG="v$FILE"
+          elif [ "$FILE" != "${TAG#v}" ]; then
+            echo "Tag $TAG means ${TAG#v}, but version.py says $FILE."
+            exit 1
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "ZIP=StreamSync-$FILE-windows-x64-$(git rev-parse --short HEAD).zip" >> "$GITHUB_ENV"
+          echo "Building StreamSync $FILE from $(git rev-parse --short HEAD)"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Build StreamSync.exe
+        shell: pwsh
+        run: ./build_exe.ps1
+
+      # Python's zipfile writes forward-slash entry names; Windows
+      # PowerShell's Compress-Archive has written backslashes, which
+      # other unzippers turn into one flat directory of odd file names.
+      - name: Zip the build
+        run: |
+          python - <<'EOF'
+          import os, shutil, zipfile
+          zip_name = os.environ["ZIP"]
+          shutil.make_archive(zip_name[:-4], "zip", "dist", "StreamSync")
+          names = zipfile.ZipFile(zip_name).namelist()
+          if "StreamSync/StreamSync.exe" not in names:
+              raise SystemExit(f"StreamSync.exe missing from the zip: {names[:5]}")
+          size = os.path.getsize(zip_name) / 2**20
+          print(f"{zip_name}: {len(names)} entries, {size:.0f} MB")
+          EOF
+
+      # --clobber: a re-run replaces what an earlier, failed run attached.
+      - name: Attach the zip to the release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "$ZIP" --repo "$GITHUB_REPOSITORY" --clobber
+
+      # A draft gets its SHA256SUMS from the Release workflow's publish
+      # job, which checksums everything attached. A release that is
+      # already published keeps its disk images' lines exactly as they are
+      # and gains one for the zip.
+      - name: Add the zip to a published release's SHA256SUMS
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft -q .isDraft)
+          if [ "$draft" != "false" ]; then
+            echo "$TAG is a draft; its publish job writes SHA256SUMS."
+            exit 0
+          fi
+          mkdir -p sums
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern SHA256SUMS --dir sums --clobber
+          # In Python, not print-and-redirect: text-mode stdout on Windows
+          # would end the new line in \r\n, and sha256sum -c elsewhere
+          # would then look for a file whose name ends in \r.
+          python - <<'EOF'
+          import hashlib, os
+          zip_name = os.environ["ZIP"]
+          old = open("sums/SHA256SUMS", encoding="utf-8").read().splitlines()
+          keep = [l for l in old if l.strip() and "-windows-x64-" not in l]
+          digest = hashlib.sha256(open(zip_name, "rb").read()).hexdigest()
+          new = keep + [f"{digest}  {zip_name}"]
+          if [l for l in new if ".dmg" in l] != [l for l in old if ".dmg" in l]:
+              raise SystemExit("The disk images' checksums changed; not uploading.")
+          with open("SHA256SUMS", "w", encoding="utf-8", newline="\n") as f:
+              f.write("\n".join(new) + "\n")
+          print("\n".join(new))
+          EOF
+          gh release upload "$TAG" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
