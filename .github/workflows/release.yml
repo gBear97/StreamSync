@@ -11,6 +11,14 @@ name: Release
 #
 # The manual route exists because creating the release also creates the
 # tag, so a release can be cut without a local clone or push rights.
+#
+# The disk images travel from the build jobs to the publish job on a
+# draft release, not as Actions artifacts: artifacts count against the
+# account's storage quota, which once filled up and would have failed a
+# release after it had been signed and notarized. Drafts are invisible to
+# the updater (it reads /releases/latest), so users never see a release
+# until it is complete, and a failed run leaves a draft the next run
+# picks up again.
 
 on:
   push:
@@ -27,8 +35,46 @@ permissions:
   contents: write
 
 jobs:
+  prepare:
+    name: Open a draft release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Checked here as well as in each build, so a mismatched tag never
+      # leaves a stray draft behind.
+      - name: Check the tag matches version.py
+        run: |
+          TAG="${{ inputs.version || github.ref_name }}"
+          FILE=$(python3 -c 'from version import __version__; print(__version__)')
+          if [ "$FILE" != "${TAG#v}" ]; then
+            echo "Tag $TAG means ${TAG#v}, but version.py says $FILE."
+            echo "Bump version.py to match, or use a different tag."
+            exit 1
+          fi
+
+      - name: Create the draft, or reuse one an earlier run left
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ inputs.version || github.ref_name }}"
+          if draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+                       --json isDraft -q .isDraft 2>/dev/null); then
+            if [ "$draft" != "true" ]; then
+              echo "$TAG is already published. Bump version.py and use a new tag."
+              exit 1
+            fi
+            echo "Reusing the draft $TAG left by an earlier run."
+          else
+            # --target pins the tag to this commit; the tag itself is
+            # created when the draft is published.
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
+              --target "$GITHUB_SHA" --title "StreamSync $TAG" --generate-notes
+          fi
+
   build:
     name: Build (${{ matrix.arch }})
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     # Two notarizations happen in this job and each may wait 75m on
     # Apple, so the budget has to clear 150m before the build is even
@@ -65,6 +111,7 @@ jobs:
             echo "Bump version.py to match, or use a different tag."
             exit 1
           fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
           echo "VERSION=$FILE" >> "$GITHUB_ENV"
           echo "DMG=StreamSync-$FILE-${{ matrix.arch }}-$(git rev-parse --short HEAD).dmg" >> "$GITHUB_ENV"
           echo "Publishing $TAG as StreamSync $FILE"
@@ -316,24 +363,32 @@ jobs:
           spctl --assess --type execute --verbose=4 "$MNT/StreamSync.app"
           hdiutil detach "$MNT"
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: dmg-${{ matrix.arch }}
-          path: ${{ env.DMG }}
-          if-no-files-found: error
+      # --clobber: a re-run replaces what an earlier, failed run attached.
+      - name: Attach the disk image to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" "$DMG" --repo "$GITHUB_REPOSITORY" --clobber
 
   publish:
     name: Publish the release
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: dmg-*
-          merge-multiple: true
-          path: dist
+      - name: Fetch the disk images from the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ inputs.version || github.ref_name }}"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "*.dmg" --dir dist
+          # One per architecture - never publish half a release.
+          for arch in arm64 x86_64; do
+            n=$(find dist -maxdepth 1 -name "*-$arch-*.dmg" | wc -l)
+            if [ "$n" -ne 1 ]; then
+              echo "Expected one $arch disk image on the draft, found $n."
+              exit 1
+            fi
+          done
 
       # The updater refuses any download it cannot match here, so a
       # release without this file installs nothing.
@@ -343,17 +398,15 @@ jobs:
           sha256sum *.dmg | tee SHA256SUMS
           ls -lh
 
-      # --target pins the tag to this commit, so the manual route creates
-      # the tag as part of publishing rather than needing one up front.
+      # SHA256SUMS goes up before the draft is published, so there is no
+      # moment when the updater can see the release without it.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ inputs.version || github.ref_name }}"
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "StreamSync $TAG" \
-            --generate-notes \
-            dist/*.dmg dist/SHA256SUMS
+          gh release upload "$TAG" dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --draft=false --latest
           echo "Published: $(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url -q .url)"
