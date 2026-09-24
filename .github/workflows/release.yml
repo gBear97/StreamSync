@@ -106,8 +106,13 @@ jobs:
 
       - name: Run tests
         run: |
+          python3 test_audio_capture.py
+          python3 test_controller.py
           python3 test_matcher.py
           python3 test_audio_matcher.py
+          python3 test_fingerprint.py
+          python3 test_relay.py
+          python3 test_session.py
           python3 test_updater.py
           python3 test_netcerts.py
           python3 test_diagnostics.py
