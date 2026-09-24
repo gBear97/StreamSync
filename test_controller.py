@@ -134,15 +134,18 @@ def install_fakes(stream):
     def prep(samples, sr):
         return samples
 
+    # scores relative to the matcher's own gates, whatever scale they use
+    S, Z = controller.audio_matcher.SCORE_OK, controller.audio_matcher.Z_OK
+
     def find(path, feats, lo=None, hi=None, progress=None):
         t0, seconds = feats
         true = stream.pos(t0)
         inside = (lo is None or lo <= true) and (hi is None or true <= hi)
         if not stream.audible or not stream.playing or not inside:
-            return (lo or 0.0) + 7.0, 0.05, 3.0          # noise
+            return (lo or 0.0) + 7.0, 0.2 * S, 0.6 * Z    # noise
         if seconds < stream.weak_until:
-            return true, 0.08, 5.0                        # right but weak
-        return true, 0.6, 15.0
+            return true, 0.4 * S, Z                       # right but weak
+        return true, 3.0 * S, 2.5 * Z
     controller.audio_matcher.prep_capture = prep
     controller.audio_matcher.find_match_audio = find
 

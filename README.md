@@ -197,10 +197,15 @@ Embedded video window: **F11**/Fullscreen button toggles fullscreen,
   (decoded by a bundled ffmpeg - audio-only decode is fast, so even
   whole-file scans take well under a minute). Each candidate moment is
   normalized against its own loudness, so a quiet dialogue scene scores
-  as well as a loud one. Every match reports a score and a
-  peak-sharpness value (z); weak matches are flagged rather than trusted.
-  Files whose timestamps do not start at zero (.m2ts, .ts, some MP4s)
-  are handled.
+  as well as a loud one. Under loud commentary the film survives mostly
+  in the gaps between the streamer's words, where ducking also lets it
+  back up - so the recording's quiet moments count for more, and it is
+  also compared in 128 ms pieces, keeping at each moment the half that
+  line up best. Every match reports how far it stands above everything
+  else in the search (peak z) and above the best other candidate
+  (score), both in standard deviations; weak matches are flagged rather
+  than trusted. Files whose timestamps do not start at zero (.m2ts, .ts,
+  some MP4s) are handled.
 - **Video**: small grayscale thumbnails, black bars auto-cropped, facecam
   zones masked out, compared by zero-normalized cross-correlation. A
   burst of 4 frames is matched as a sequence at 12 fps (~83 ms
@@ -247,8 +252,9 @@ was already installed. The report names the mismatch instead.
 - Audio sync assumes the stream is the *loudest thing* on that playback
   device. Pause your music first, or route the stream to its own device
   and pick it under **Listen on**.
-- Quiet dialog scenes under loud commentary are the hard case. If a match
-  comes back weak, wait for music/action, or narrow the search window.
+- A streamer who talks without a pause over a quiet scene is the hard
+  case: the film is only heard in the gaps. If a match comes back weak,
+  try again when they pause, or narrow the search window.
 - 4K HEVC HDR / Dolby Vision copies: audio sync doesn't care about the
   video format at all (it never touches the video track), so prefer it
   there - video-method scans of HEVC are slower and HDR tone curves can
