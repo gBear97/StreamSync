@@ -69,14 +69,17 @@ class FakeMP:
             time.sleep(self.rng.choice((0.25, 0.25, 0.25, 0.5)))
             if not self.playing or self._frozen():
                 continue            # libvlc reports nothing mid-seek
-            value = int(self.truth() * 1000)
-            if value <= 0:
-                continue
-            self.last_report = value
+            # Delivered `late` after the change it reports. Simulated by
+            # reporting the value from `late` ago rather than by sleeping,
+            # so the lateness is exactly this and not also however far a
+            # CI runner's sleep overshoots (5-12 ms on macOS runners).
             late = self.rng.uniform(0, 0.004)
             if self.rng.random() < 0.08:
                 late = self.rng.uniform(0.05, 0.15)
-            time.sleep(late)
+            value = int(self.truth(time.perf_counter() - late) * 1000)
+            if value <= 0:
+                continue
+            self.last_report = value
             self._emit(value)
 
     def _frozen(self, at=None):
