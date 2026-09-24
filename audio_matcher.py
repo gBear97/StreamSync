@@ -73,7 +73,10 @@ RUNNER_EXCL = 32      # hops (0.5 s) around the best peak that are its own
 # leaves the true moment out (or the other film, whole). Wrong peaks
 # with the truth in the window reached z 4.9; with the truth left out,
 # z >= 7 passed 4 of ~1050 searches, all at places where the film's
-# soundtrack itself repeats (the current matcher's own gates passed 17).
+# soundtrack itself repeats (the previous matcher's gates passed 17).
+# Confirmed on held-out seeds 14-16 (864 trials: loud, all ratios, whole
+# film): 96.4-98.6% trusted and right, no false accepts, closest wrong
+# peak z 5.2.
 Z_OK = 7.0
 SCORE_OK = 1.0
 
