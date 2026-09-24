@@ -202,6 +202,18 @@ class EmbeddedPlayer:
         t = self.mp.get_time()
         return None if t is None or t < 0 else t / 1000.0
 
+    def clock(self):
+        """(position, perf_counter when it was true) while playing, else
+        None - a position is only useful for timing if it is dated."""
+        if not self.mp.is_playing():
+            return None
+        t = self.time()
+        return None if t is None else (t, time.perf_counter())
+
+    def clock_state(self):
+        """(position, playing, perf_counter) for a watch-party host."""
+        return self.time(), self.is_playing(), time.perf_counter()
+
     def length(self):
         n = self.mp.get_length()
         return None if n is None or n <= 0 else n / 1000.0
@@ -370,7 +382,9 @@ class ExternalPlayer:
             pass
 
     def time(self):
-        st = self._status()
+        return self._position(self._status())
+
+    def _position(self, st):
         if not st:
             return None
         length = st.get("length") or 0
@@ -379,6 +393,24 @@ class ExternalPlayer:
             return float(pos) * float(length)  # sub-second-ish precision
         t = st.get("time")
         return float(t) if isinstance(t, (int, float)) and t >= 0 else None
+
+    def clock(self):
+        """(position, perf_counter when it was true) while playing."""
+        before = time.perf_counter()
+        st = self._status()
+        after = time.perf_counter()
+        if not st or st.get("state") != "playing":
+            return None
+        t = self._position(st)
+        return None if t is None else (t, (before + after) / 2)
+
+    def clock_state(self):
+        before = time.perf_counter()
+        st = self._status()
+        after = time.perf_counter()
+        if not st:
+            return None, False, after
+        return self._position(st), st.get("state") == "playing", (before + after) / 2
 
     def length(self):
         st = self._status()
