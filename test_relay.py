@@ -1,15 +1,20 @@
 """End-to-end relay test on localhost: rooms, passwords, caching for late
-joiners, host->viewer broadcast, viewer->host routing, session teardown."""
+joiners, host->viewer broadcast, viewer->host routing, malformed input,
+a host reconnecting with its token, and both ways a session ends."""
 
 import json
 import subprocess
 import sys
 import time
 
-from websockets.sync.client import connect
+from websockets.sync.client import connect as _connect
 
 PORT = 8899
 URL = f"ws://127.0.0.1:{PORT}"
+
+
+def connect(url):
+    return _connect(url).__enter__()   # as session.Link does
 
 
 def send(ws, obj):
@@ -22,7 +27,7 @@ def recv(ws, timeout=5):
 
 def main():
     relay = subprocess.Popen([sys.executable, "relay_server.py",
-                              "--port", str(PORT)])
+                              "--port", str(PORT), "--host-grace", "2"])
     try:
         time.sleep(1.5)
 
@@ -31,7 +36,7 @@ def main():
                     "meta": {"title": "test film", "duration": 5400}})
         created = recv(host)
         assert created["type"] == "created", created
-        code = created["code"]
+        code, token = created["code"], created["token"]
         print(f"room created: {code}")
 
         # host publishes fingerprint + first state BEFORE anyone joins
@@ -80,11 +85,71 @@ def main():
         assert routed["type"] == "verified" and routed["ok"] is True
         print("viewer->host routing: verified message delivered")
 
-        # host leaving ends the session for viewers
+        # malformed input is ignored, not fatal to the host's handler
+        host.send("[1, 2, 3]")
+        send(host, {"no": "type"})
+        send(host, {"type": 7})
+        send(host, {"type": "fp_chunk", "ck": "anything-at-all", "i": 0,
+                    "data": ""})
+        send(host, {"type": "state", "ck": "state", "seq": 2, "pos": 131.0,
+                    "utc": 154.0, "playing": True, "default_delay": 9})
+        got = recv(viewer)
+        while got["type"] != "state":        # the junk chunk still relays
+            got = recv(viewer)
+        assert got["seq"] == 2
+        print("malformed messages: ignored; the room keeps working")
+
+        # a dropped host is 'away', not gone, and can resume with its token
         host.close()
-        assert recv(viewer)["type"] == "ended"
+        assert recv(viewer)["type"] == "host_away"
+        thief = connect(URL)
+        send(thief, {"type": "resume", "code": code, "token": "guess"})
+        assert recv(thief)["type"] == "error"
+        thief.close()
+        host = connect(URL)
+        send(host, {"type": "resume", "code": code, "token": token})
+        assert recv(host)["type"] == "resumed"
+        assert recv(viewer)["type"] == "host_back"
+        assert recv(host) == {"type": "viewers", "n": 1}
+        send(host, {"type": "state", "ck": "state", "seq": 3, "pos": 140.0,
+                    "utc": 163.0, "playing": True, "default_delay": 9})
+        assert recv(viewer)["seq"] == 3
+        print("host reconnect: away -> resumed with token (not without)")
+
+        # a late joiner after all that: cache holds only the known keys
+        late = connect(URL)
+        send(late, {"type": "join", "code": code, "password": "swordfish"})
+        kinds = sorted(recv(late)["type"] for _ in range(4))
+        assert kinds == ["fp_chunk", "fp_meta", "joined", "state"], kinds
+        try:
+            extra = recv(late, timeout=0.5)
+            raise AssertionError(f"unexpected cached message: {extra}")
+        except TimeoutError:
+            pass
+        late.close()
+        recv(host)                           # viewers: 2
+        recv(host)                           # viewers: 1
+        print("cache: only state / fp_meta / fp_chunk_N are kept")
+
+        # a host that leaves without coming back ends it after the grace
+        host.close()
+        assert recv(viewer)["type"] == "host_away"
+        assert recv(viewer, timeout=6)["type"] == "ended"
         viewer.close()
-        print("teardown: viewers told the session ended")
+        print("teardown: grace period expired -> viewers told it ended")
+
+        # a host that says "end" ends it immediately
+        host = connect(URL)
+        send(host, {"type": "create", "password": None, "meta": {}})
+        code2 = recv(host)["code"]
+        v2 = connect(URL)
+        send(v2, {"type": "join", "code": code2, "password": None})
+        assert recv(v2)["type"] == "joined"
+        send(host, {"type": "end"})
+        assert recv(v2, timeout=2)["type"] == "ended"
+        v2.close()
+        host.close()
+        print("explicit end: viewers told at once")
 
         print("RELAY TEST PASSED")
     finally:
