@@ -27,6 +27,7 @@ curve: how many sigmas a lag stands above the search as a whole.
 """
 
 import collections
+import math
 import os
 import subprocess
 import threading
@@ -44,7 +45,14 @@ F_LO, F_HI = 80.0, 7200.0
 CHUNK_S = 900.0       # decode long windows in chunks this big
 OVERLAP_S = 20.0      # chunks overlap by at least this (see find_match_audio)
 
-CACHE_CHUNKS = 12     # decoded feature chunks kept (~6 MB each at 900 s)
+# Decoded feature chunks kept (see _file_features): as many as a whole-film
+# search of a LONG_FILM_S film cuts, so the weak-match retries over it
+# reuse the first look's decode. The search visits its chunks in order,
+# so a cache even one chunk short misses on every one of them. A 900 s
+# chunk is 56,247 frames x 26 bands of float32, 5.85 MB: 17 of them, about
+# 100 MB at most, cover films up to 4 h 9 m.
+LONG_FILM_S = 4 * 3600.0
+CACHE_CHUNKS = 1 + math.ceil((LONG_FILM_S - CHUNK_S) / (CHUNK_S - OVERLAP_S))
 
 # Voice-activity weights (see voice_weights).
 VOICE_REF_PCT = 20.0  # the capture's quietest fifth sets the reference level
