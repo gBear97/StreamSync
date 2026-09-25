@@ -12,8 +12,9 @@ thread each System Events round trip ran on. What is tested:
   window, so the swap used to leave the film fullscreen over the
   browser and the next Cmd-Shift-F took two presses;
 - a swap that fails hands back the fullscreen it took away, and does
-  not latch: the next pause tries again, and a resume after a failed
-  pause has no browser to hide;
+  not latch: nobody knows what is in front after a failure, so the next
+  swap runs whichever way it goes - a pause after a failed resume used
+  to be skipped, leaving the film fullscreen over the stream;
 - the osascript round trips never run on the Tk thread (each can block
   for seconds - the first waits on the Automation prompt - and pausing
   used to freeze the UI for that long), and the browser is looked up
@@ -330,13 +331,17 @@ def test_failed_swap_gives_fullscreen_back():
     assert pump(app, lambda: "App swap failed" in status(app)
                 and app.fullscreen), (status(app), fullscreen(app))
     assert fullscreen(app) == (True, True) and not app._was_fullscreen
-    # ...and the failure does not latch: the stream's resume finds no
-    # browser to hide, and its next pause tries again
+    # ...and the failure does not latch. Nobody knows what is in front
+    # after it - activate_app may have unhidden the browser before it
+    # failed - so the stream's resume still hides the browser and brings
+    # the film forward, leaving its fullscreen alone, and the next pause
+    # tries again
     mac.fail = set()
     app._stream_swap(False)
+    assert pump(app, lambda: "activate_self" in mac.names()), \
+        f"the resume after a failed pause was skipped: {mac.names()}"
     idle(app)
-    assert mac.names() == ["list_gui_apps", "activate_app"], \
-        f"a resume after a failed pause hid the browser: {mac.names()}"
+    assert fullscreen(app) == (True, True) and not app._was_fullscreen
     app._stream_swap(True)
     assert pump(app, lambda: app._swapped), mac.names()
     assert mac.names().count("activate_app") == 2
@@ -366,6 +371,28 @@ def test_failed_swap_gives_fullscreen_back():
     assert pump(app, lambda: "App swap failed" in status(app)
                 and app.fullscreen), (status(app), fullscreen(app))
     assert fullscreen(app) == (True, True) and not app._was_fullscreen
+    # ...and the stream's next pause is not skipped as a repeat of the
+    # one before: the film is fullscreen again, over the stream it has
+    # to make way for
+    mac.fail = set()
+    app._stream_swap(True)
+    assert pump(app, lambda: mac.names().count("activate_app") == 2), \
+        f"the pause after a failed resume never ran: {mac.names()}"
+    assert fullscreen(app) == (False, False) and app._was_fullscreen, \
+        f"the film stayed fullscreen over the stream: {fullscreen(app)}"
+
+    # a resume after a failed one tries the hide again
+    app, mac = make()
+    app._stream_swap(True)
+    assert pump(app, lambda: app._swapped)
+    mac.fail = {"hide_app"}
+    app._stream_swap(False)
+    assert pump(app, lambda: "App swap failed" in status(app)), status(app)
+    mac.fail = set()
+    app._stream_swap(False)
+    assert pump(app, lambda: not app._swapped), \
+        f"the resume after a failed one never ran: {mac.names()}"
+    assert mac.names().count("hide_app") == 2, mac.names()
 
     # no browser running at all
     app, mac = make(apps=("Finder",))
@@ -374,7 +401,7 @@ def test_failed_swap_gives_fullscreen_back():
     assert pump(app, lambda: "Pick the stream's browser" in status(app)
                 and app.fullscreen), (status(app), fullscreen(app))
     assert fullscreen(app) == (True, True) and not app._was_fullscreen
-    print("failed swap: fullscreen given back, next pause tries again")
+    print("failed swap: fullscreen given back, the next swap runs either way")
 
 
 def idle(app, seconds=0.3):

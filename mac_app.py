@@ -49,6 +49,7 @@ class MacApp:
         self.stream_app = ""
         self._swapped = False        # what the swap worker last applied
         self._swap_target = False    # what the last dispatched swap aims at
+                                     # (None after a failure: run the next)
         self._swap_seq = 0
         self._swap_app = ""          # resolved browser, cached across swaps
         self._swap_q = queue.Queue()
@@ -910,8 +911,14 @@ class MacApp:
             # a browser that is about to be raised.
             return
         if not ok:
-            # Let the next pause try again instead of latching on a failure.
-            self._swap_target = self._swapped
+            # Nobody knows what is in front after a failure: activate_app
+            # may have got as far as unhiding the browser, a hide that
+            # failed leaves it up, and fullscreen is about to be handed
+            # back over whatever is there. So the next swap runs whichever
+            # way it goes instead of being skipped as a repeat - a pause
+            # after a failed resume would leave the film fullscreen over
+            # the stream.
+            self._swap_target = None
         if not show or not ok:
             # The film is back, or the swap failed - a browser that never
             # came up, or one that would not hide again: either way
