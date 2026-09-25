@@ -45,6 +45,12 @@ MISSES_FOR_PAUSE = 2        # listen mode: misses in a row that mean paused
 MEASURE_INTERVAL = 25.0     # viewer stream-delay measurement
 MEASURE_SECONDS = 10.0
 MEASURE_LOOKBACK = 90.0     # longest stream delay looked for
+MEASURE_EARLY = 1.0         # a near-zero delay can align this far under 0
+# The host sends a voice block only once its whole span is recorded, and
+# fingerprinting and the relay hop add a little more: the voice a probe
+# ends on (and MEASURE_EARLY past it) has reached the viewer this long
+# after the probe ends.
+VOICE_SETTLE = VOICE_CHUNK + fingerprint.FP_WIN + 1.5
 VERIFY_WINDOW = 45.0        # seconds fingerprinted per verification sample
 DRIFT_TOLERANCE = 0.35
 RECONNECT_FOR = 60.0        # keep retrying a dropped relay this long
@@ -178,9 +184,16 @@ def measure_delay(voice_buf, samples, sr, probe_t0):
     samples: loopback audio whose first sample was heard at probe_t0
     (shared-clock UTC). Aligned against the host's voice timeline below
     the fingerprint hop. Returns delay seconds, or None when inconclusive.
+
+    A probe heard D late holds host voice up to its own end minus D, and
+    the alignment needs all of it inside the reference - so the reference
+    runs past the probe's end. One that stopped 5 s after a 10 s probe
+    began could only align streams 5 s or more behind. Callers wait
+    VOICE_SETTLE after the probe first, or that tail has not arrived.
     """
+    probe_end = probe_t0 + len(samples) / sr
     ref, base, cov = voice_buf.timeline(probe_t0 - MEASURE_LOOKBACK,
-                                        probe_t0 + 5.0)
+                                        probe_end + MEASURE_EARLY)
     probe_words = int(len(samples) / sr / FP_HOP)
     if cov < 0.8 or len(ref) < probe_words + 20:
         return None
@@ -191,9 +204,11 @@ def measure_delay(voice_buf, samples, sr, probe_t0):
     if ber > fingerprint.DELAY_BER or median - ber < fingerprint.DELAY_MARGIN:
         return None
     delay = probe_t0 - (base + spoken)
-    if not (0.0 <= delay <= MEASURE_LOOKBACK):
+    # clock sync and device latency put a stream with next to no delay a
+    # little either side of 0
+    if not (-MEASURE_EARLY <= delay <= MEASURE_LOOKBACK):
         return None
-    return float(delay)
+    return float(max(0.0, delay))
 
 
 class ListenTracker:
@@ -782,8 +797,11 @@ class ViewerSession:
             try:
                 samples, sr, t0, _ = mon.capture_span(MEASURE_SECONDS,
                                                       start=mon.mark())
-                d = measure_delay(self.voice, samples, sr,
-                                  self.clock.perf_to_utc(t0))
+                probe_t0 = self.clock.perf_to_utc(t0)
+                # the host is still recording the voice this probe ends on
+                if self.stop_flag.wait(VOICE_SETTLE):
+                    break
+                d = measure_delay(self.voice, samples, sr, probe_t0)
                 if d is not None:
                     first = self.delay is None
                     self.delay = d if first else 0.7 * self.delay + 0.3 * d
@@ -793,4 +811,5 @@ class ViewerSession:
                 pass        # silence on loopback - stream muted, keep default
             except Exception:
                 pass
-            self.stop_flag.wait(max(0.0, MEASURE_INTERVAL - MEASURE_SECONDS))
+            self.stop_flag.wait(max(0.0, MEASURE_INTERVAL - MEASURE_SECONDS
+                                    - VOICE_SETTLE))

@@ -94,33 +94,75 @@ def main():
     # 3. voice delay measurement: host words cut on the UTC grid, as
     # HostSession sends them
     voice = synth(120, seed=42)
-    buf = session.VoiceBuffer()
     base_utc = 1_000_000.0                  # a multiple of the hop
     n = int(round(session.VOICE_CHUNK / fingerprint.FP_HOP))
     hop = int(fingerprint.FP_HOP * SR)
     span = int((session.VOICE_CHUNK + fingerprint.FP_WIN) * SR)
-    for i in range(0, len(voice) - span, n * hop):
-        words = fingerprint.fingerprint_samples(voice[i:i + span], SR)[:n]
-        buf.add(base_utc + i / SR, words)
+    # a block reaches a viewer this long after it starts: the host sends
+    # it once its span is in, then fingerprinting and the relay hop
+    arrives = session.VOICE_CHUNK + fingerprint.FP_WIN + 0.5
 
+    def held(by=None):
+        """The voice buffer a viewer holds at UTC `by` (None: all of it)."""
+        b = session.VoiceBuffer()
+        for i in range(0, len(voice) - span, n * hop):
+            if by is not None and base_utc + i / SR + arrives > by:
+                break
+            words = fingerprint.fingerprint_samples(voice[i:i + span], SR)[:n]
+            b.add(base_utc + i / SR, words)
+        return b
+
+    rng = np.random.default_rng(5)
+
+    def heard(start):
+        """MEASURE_SECONDS of the host's voice from `start`, as a viewer's
+        stream delivers it."""
+        seg = voice[int(start * SR):int((start + session.MEASURE_SECONDS) * SR)]
+        return np.clip(seg * 0.9 + 0.15 * np.convolve(
+            rng.standard_normal(seg.size), np.hamming(33), "same").astype(np.float32),
+            -1, 1)
+
+    buf = held()
     # late enough that the 90 s correlation window is inside the buffer
     # (in production the voice buffer runs continuously, so this is the
     # normal situation after ~90 s of session)
-    rng = np.random.default_rng(5)
     errs = []
     for true_delay in (7.25, 7.10, 7.375, 7.40, 7.61, 12.93):
         start = 95.0 - (true_delay - 7.25)      # keep the probe in range
-        seg = voice[int(start * SR):int((start + session.MEASURE_SECONDS) * SR)]
-        degraded = np.clip(seg * 0.9 + 0.15 * np.convolve(
-            rng.standard_normal(seg.size), np.hamming(33), "same").astype(np.float32),
-            -1, 1)
         probe_t0 = base_utc + start + true_delay       # heard this late
-        d = session.measure_delay(buf, degraded, SR, probe_t0)
+        d = session.measure_delay(buf, heard(start), SR, probe_t0)
         assert d is not None, f"delay {true_delay}: inconclusive"
         errs.append(d - true_delay)
         print(f"delay measurement: true {true_delay:.3f}s, measured {d:.3f}s "
               f"(err {1000 * (d - true_delay):+.0f} ms)")
     assert max(abs(e) for e in errs) < 0.04, errs
+
+    # 3a. short delays. A probe heard D late holds host voice up to D
+    # before its own end, so a reference stopping 5 s into a 10 s probe
+    # could never align a stream under 5 s behind - those viewers sat on
+    # the host's default_delay hint all party. A stream with next to no
+    # delay can also align a little under 0 (clock sync, device latency);
+    # that reads as 0.
+    for true_delay in (0.0, 0.96, 2.07, 3.96, -0.37):
+        probe_t0 = base_utc + 95.0 + true_delay
+        d = session.measure_delay(buf, heard(95.0), SR, probe_t0)
+        assert d is not None, f"delay {true_delay}: inconclusive"
+        print(f"short delay: true {true_delay:.3f}s, measured {d:.3f}s")
+        assert abs(d - max(0.0, true_delay)) < 0.04, (true_delay, d)
+
+    # 3b. when the probe ends, the host is still recording the voice it
+    # ends on. VOICE_SETTLE later, wherever the probe falls against the
+    # host's blocks, a viewer holds all of that voice (and MEASURE_EARLY
+    # past it), and one with no delay at all measures.
+    for phase in (0.0, 1.1, 2.3, 3.6):
+        probe_t0 = base_utc + 95.0 + phase
+        probe_end = probe_t0 + session.MEASURE_SECONDS
+        have = held(by=probe_end + session.VOICE_SETTLE)
+        cov = have.timeline(probe_t0, probe_end + session.MEASURE_EARLY)[2]
+        assert cov == 1.0, (phase, cov)
+        d = session.measure_delay(have, heard(95.0 + phase), SR, probe_t0)
+        assert d is not None and d < 0.04, (phase, d)
+    print("short delay: the voice a probe ends on has arrived when it is measured")
 
     # 4. timeline math: delayed rendering delays pauses too
     tl = session.StateTimeline()
