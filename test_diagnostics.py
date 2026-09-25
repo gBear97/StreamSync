@@ -14,10 +14,12 @@ import io
 import logging
 import os
 import platform
+import queue
 import sys
 import tempfile
 import threading
 import types
+from pathlib import Path
 
 import diagnostics
 
@@ -334,6 +336,47 @@ for shell in ("app.py", "mac_app.py"):
     for hook in ("diagnostics.install_excepthook",
                  "diagnostics.install_tk_hook"):
         ok(f"{shell} main() calls {hook}", hook in called)
+
+# --- config saves leave a trace ------------------------------------------
+# Settings are saved on the way out, when nobody is watching: a save that
+# failed used to look, in the log, exactly like one that worked.
+import controller
+
+
+def read_log():
+    try:
+        with open(diagnostics.LOG_FILE) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+saved = diagnostics.LOG_DIR, diagnostics.LOG_FILE, controller.CONFIG_PATH
+try:
+    diagnostics.LOG_DIR = tmp
+    diagnostics.LOG_FILE = os.path.join(tmp, "config-saves.log")
+    ctl = controller.SyncController(queue.Queue(), None)
+    ctl.auto_enabled, ctl.auto_follow = True, False
+
+    controller.CONFIG_PATH = Path(tmp) / "streamsync.json"
+    ctl.save_config({"method": "audio"})
+    ok("the settings were written",
+       controller.CONFIG_PATH.read_text().startswith("{"))
+    ok("a config save is logged, with the auto arming flags",
+       "config saved (auto=True follow=False)" in read_log())
+
+    controller.CONFIG_PATH = Path(tmp) / "no-such-folder" / "streamsync.json"
+    try:
+        ctl.save_config({"method": "audio"})
+    except Exception as e:
+        fails.append(f"a failed config save raised: {e!r}")
+    failed = read_log().partition("config save FAILED:")[2]
+    ok("a failed save is logged as one", bool(failed))
+    ok("with its traceback and the path it could not write",
+       "Traceback (most recent call last)" in failed
+       and "no-such-folder" in failed)
+finally:
+    diagnostics.LOG_DIR, diagnostics.LOG_FILE, controller.CONFIG_PATH = saved
 
 # --- probing must never be what breaks the app ---------------------------
 # It runs while diagnosing an already-broken machine, so every part of it

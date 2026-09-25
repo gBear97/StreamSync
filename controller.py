@@ -675,7 +675,13 @@ class SyncController:
         try:
             CONFIG_PATH.write_text(json.dumps(cfg))
         except OSError:
-            pass
+            # The log is the only witness: a save that fails silently on
+            # exit looks identical to one that worked.
+            diagnostics.log_block("config save FAILED:",
+                                  traceback.format_exc())
+            return
+        diagnostics.log(f"config saved (auto={self.auto_enabled} "
+                        f"follow={self.auto_follow})")
 
     def load_config(self):
         """Apply the controller's saved settings; return the whole dict so
