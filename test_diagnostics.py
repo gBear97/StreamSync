@@ -308,14 +308,15 @@ try:
        os.path.getsize(diagnostics.LOG_FILE) < 1000)
     ok("each log may reach 2 MB", diagnostics.MAX_LOG_BYTES >= 2_000_000)
 
-    # On Windows a file another program holds open cannot be renamed -
-    # `Get-Content -Wait` tailing the log is enough. A rotation that
-    # cannot finish must lose none of the old logs, and must not be tried
+    # On Windows a file another program holds open without delete sharing
+    # - a Python open() of it, or .NET's File.OpenRead - cannot be renamed,
+    # nor replaced by a rename. A rotation that cannot finish must lose
+    # none of the old logs, whichever one is held, and must not be tried
     # again on every line. A stand-in os.replace refuses the held file.
     held, tried, real_replace = set(), [], os.replace
 
     def replace(src, dst):
-        tried.append(src)
+        tried.extend((src, dst))
         if src in held or dst in held:
             raise PermissionError(13, "in use by another process", src)
         real_replace(src, dst)
@@ -349,19 +350,48 @@ try:
         check("then rotates, one generation down",
               backups(), ["generation 6", "generation 5", "generation 4"])
 
-        # A backup that will not move must not be written over either.
-        held.add(diagnostics.LOG_FILE + ".2")
+        # Nor may an old log that will not move cost any of them, whichever
+        # it is: the newest, the one after it, or the oldest. The rotation
+        # that just worked has cleared the wait the failed one set: this
+        # log is no bigger than that one was, so without that none of
+        # these would even be tried, and "nothing moved" would prove
+        # nothing.
         with open(diagnostics.LOG_FILE, "w") as f:
             f.write("generation 7\n" + "x" * diagnostics.MAX_LOG_BYTES)
-        diagnostics.log("while an old log is held open")
-        check("an old log that will not move is not written over",
-              backups(), ["generation 6", "generation 5", "generation 4"])
-        check("and the live log stays where it was",
-              generation(diagnostics.LOG_FILE), "generation 7")
-        check("with nothing left half-moved",
-              sorted(os.listdir(tmp)),
-              ["streamsync.log", "streamsync.log.1", "streamsync.log.2",
-               "streamsync.log.3"])
+        for n in (1, 2, 3):
+            for k in (1, 2, 3):  # each case starts from the same old logs
+                with open(diagnostics.LOG_FILE + f".{k}", "w") as f:
+                    f.write(f"generation {7 - k}\n")
+            old = diagnostics.LOG_FILE + f".{n}"
+            held.clear()
+            held.add(old)
+            tried.clear()
+            diagnostics.log(f"while .{n} is held open")
+            ok(f"with .{n} held, a full log still tries to rotate",
+               old in tried)
+            check(f"with .{n} held, no old log is lost or moved",
+                  backups(), ["generation 6", "generation 5", "generation 4"])
+            check(f"with .{n} held, the live log stays where it was",
+                  generation(diagnostics.LOG_FILE), "generation 7")
+            check(f"with .{n} held, nothing is left half-moved",
+                  sorted(os.listdir(tmp)),
+                  ["streamsync.log", "streamsync.log.1", "streamsync.log.2",
+                   "streamsync.log.3"])
+            with open(diagnostics.LOG_FILE, "a") as f:  # past the wait
+                f.write("x" * getattr(diagnostics, "ROTATE_RETRY_BYTES", 0))
+        held.clear()
+        diagnostics.log("all let go")
+        check("once let go, it rotates one generation down",
+              backups(), ["generation 7", "generation 6", "generation 5"])
+
+        # A missing old log is a gap the rotation fills: the ones beyond
+        # it stay, rather than the oldest being dropped to make room.
+        os.remove(diagnostics.LOG_FILE + ".1")
+        with open(diagnostics.LOG_FILE, "w") as f:
+            f.write("generation 8\n" + "x" * diagnostics.MAX_LOG_BYTES)
+        diagnostics.log("after .1 was deleted")
+        check("a gap in the old logs is filled, and none beyond it dropped",
+              backups(), ["generation 8", "generation 6", "generation 5"])
     finally:
         os.replace = real_replace
 
