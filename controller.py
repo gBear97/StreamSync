@@ -132,6 +132,7 @@ class SyncController:
         self.external = None
         self.player = embedded
         self.video_path = None
+        self._embedded_path = None   # the film the built-in player holds
         self.offset = 0.0            # user's accumulated nudge, seconds
         self.audio_device = ""       # substring of the capture device name
         self.region = None           # video method: screen box
@@ -189,6 +190,7 @@ class SyncController:
         self.video_path = path
         if self.player is self.embedded:
             self.embedded.load(path)
+            self._embedded_path = path
             return
         name = Path(path).name
 
@@ -229,9 +231,23 @@ class SyncController:
         return None
 
     def use_embedded(self):
+        """Switch playback back to the built-in player. VLCError
+        propagates, as from load_file.
+
+        A film opened while external VLC had playback went to VLC alone,
+        so it is loaded here: the built-in player would otherwise play
+        nothing, or the film it had before, and Sync would fail with "No
+        video file loaded.". A film it already holds is not reloaded, so
+        it keeps its place and its subtitles. A new one waits at its start
+        for the first sync, as it does when opened with this player active
+        (libvlc ignores a seek before playback starts, so VLC's position
+        cannot be carried over the way use_external carries this one's)."""
         if self.external is not None:
             self.external.pause()
         self.player = self.embedded
+        if self.video_path and self._embedded_path != self.video_path:
+            self.embedded.load(self.video_path)
+            self._embedded_path = self.video_path
 
     def set_mute(self, mute):
         self.player.set_mute(mute)

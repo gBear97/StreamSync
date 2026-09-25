@@ -35,7 +35,9 @@ to leave playback alone:
   thread froze for the websocket's closing handshake), though quitting
   gives a goodbye still going out - even one from a Leave just before -
   a moment before the player stops;
-- the time readout carries its rounding (119.96 s once read "1:60.0").
+- the time readout carries its rounding (119.96 s once read "1:60.0");
+- switching back from external VLC hands the built-in player a film
+  opened meanwhile, and leaves one it already holds where it is.
 """
 
 import queue
@@ -844,6 +846,90 @@ def test_fmt_time_carries():
             assert abs(controller.parse_time(out) - s) <= 0.05 + 1e-9, out
     print("clock: 119.96 s reads 2:00.0, and no minute mark shows :60")
 
+class FilmPlayer(Player):
+    """A player that has to be given the film first, as EmbeddedPlayer
+    and ExternalPlayer do: until then a sync fails the way theirs does."""
+    def __init__(self, clock):
+        super().__init__(clock)
+        self.films = []
+
+    def load(self, path):
+        self.films.append(path)
+        self.anchor, self.playing = None, False
+
+    def seek(self, t):
+        self.anchor = (t, self.now())
+
+    def sync_seek(self, match_t, t0, offset):
+        if not self.films:
+            raise controller.VLCError("No video file loaded.")
+        super().sync_seek(match_t, t0, offset)
+
+
+def switchable():
+    """A controller whose players both need the film loaded, with
+    external VLC standing by."""
+    clock = Clock()
+    stream = Stream(clock)
+    install_fakes(stream)
+    embedded, external = FilmPlayer(clock), FilmPlayer(clock)
+    q = queue.Queue()
+    ctl = controller.SyncController(q, embedded,
+                                    monitor_factory=lambda name: Monitor(clock))
+    ctl._now = clock
+    ctl._log = lambda *a, **k: None
+    ctl.external = external             # no real VLC to start
+    return ctl, stream, embedded, external, q
+
+
+def test_switch_back_loads_the_film():
+    # the usual way: a film opened in the built-in player, synced and
+    # paused, is neither reloaded nor restarted by a trip to VLC and back
+    ctl, stream, embedded, external, q = switchable()
+    ctl.load_file("film.mkv")
+    run_sync(ctl, ctl.sync, "", "", "audio")
+    assert embedded.seeks, statuses(q)
+    embedded.pause()
+    here = embedded.pos()
+    run_sync(ctl, ctl.use_external, False)
+    assert external.films == ["film.mkv"]
+    ctl.use_embedded()
+    assert embedded.films == ["film.mkv"] and embedded.pos() == here, \
+        f"switching back reloaded the film opened in the built-in " \
+        f"player: {embedded.films}, at {embedded.pos()} not {here}"
+
+    ctl, stream, embedded, external, q = switchable()
+    # a film opened while external VLC has playback goes to VLC alone...
+    run_sync(ctl, ctl.use_external, False)
+    run_sync(ctl, ctl.load_file, "film.mkv")
+    assert external.films == ["film.mkv"] and embedded.films == []
+    # ...and reaches the built-in player when that takes over again
+    ctl.use_embedded()
+    assert ctl.player is embedded
+    assert embedded.films == ["film.mkv"], \
+        "switching back left the built-in player without the film"
+    statuses(q)
+    run_sync(ctl, ctl.sync, "", "", "audio")
+    msgs = statuses(q)
+    assert embedded.seeks and abs(embedded.pos() - stream.pos()) < 1e-6, msgs
+
+    # a film it already holds is not reloaded: it keeps its place
+    embedded.pause()
+    here = embedded.pos()
+    run_sync(ctl, ctl.use_external, False)
+    ctl.use_embedded()
+    ctl.use_embedded()                  # the menu item picked again
+    assert embedded.films == ["film.mkv"] and embedded.pos() == here, \
+        f"switching back reloaded the film: {embedded.films}"
+
+    # a film opened in VLC meanwhile replaces the one it had
+    run_sync(ctl, ctl.use_external, False)
+    run_sync(ctl, ctl.load_file, "sequel.mkv")
+    ctl.use_embedded()
+    assert embedded.films == ["film.mkv", "sequel.mkv"], \
+        f"the built-in player kept the film it had before: {embedded.films}"
+    print("player switch: the built-in player keeps its film, gets VLC's")
+
 
 def main():
     test_nudged_film_left_alone()
@@ -864,6 +950,7 @@ def main():
     test_session_start_mid_listen_wins()
     test_session_teardown_does_not_block()
     test_fmt_time_carries()
+    test_switch_back_loads_the_film()
     print("CONTROLLER TEST PASSED")
 
 
