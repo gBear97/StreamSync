@@ -24,6 +24,7 @@ where the environment is already broken.
 """
 
 import ctypes
+import logging
 import os
 import platform
 import subprocess
@@ -41,7 +42,10 @@ else:
     LOG_DIR = os.path.expanduser("~/.streamsync")
 LOG_FILE = os.path.join(LOG_DIR, "streamsync.log")
 
-MAX_LOG_BYTES = 1_000_000
+# Room for the detail a field run needs: the live log up to 2 MB, and
+# three older ones beside it (streamsync.log.1 is the newest).
+MAX_LOG_BYTES = 2_000_000
+LOG_BACKUPS = 3
 
 VLC_DYLIB_CANDIDATES = [
     "/Applications/VLC.app/Contents/MacOS/lib/libvlc.dylib",
@@ -63,32 +67,46 @@ def _run(cmd, timeout=10):
 
 # --- the log ------------------------------------------------------------
 
+_write_lock = threading.Lock()
+
+
 def _rotate():
     try:
         if os.path.getsize(LOG_FILE) < MAX_LOG_BYTES:
             return
     except OSError:
         return
+    # .2 -> .3 before .1 -> .2, so only the oldest is ever overwritten
+    for n in range(LOG_BACKUPS - 1, 0, -1):
+        try:
+            os.replace(f"{LOG_FILE}.{n}", f"{LOG_FILE}.{n + 1}")
+        except OSError:
+            pass  # no such backup yet
     try:
         os.replace(LOG_FILE, LOG_FILE + ".1")
     except OSError:
         pass
 
 
-def log(message):
-    """Append one timestamped line. Also to stderr, which a `open -a`
-    launch discards but a Terminal launch shows."""
+def log(message, echo=True):
+    """Append one timestamped line. Also to stderr (unless echo is
+    False), which a `open -a` launch discards but a Terminal launch
+    shows."""
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"{stamp}  {message}"
+    if echo:
+        try:
+            sys.stderr.write(line + "\n")
+        except Exception:
+            pass
     try:
-        sys.stderr.write(line + "\n")
-    except Exception:
-        pass
-    try:
-        os.makedirs(LOG_DIR, exist_ok=True)
-        _rotate()
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        # Worker threads log too, and two of them rotating at once would
+        # push every backup down twice.
+        with _write_lock:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            _rotate()
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
     except OSError:
         pass  # a log we cannot write is not worth crashing over
 
@@ -97,6 +115,39 @@ def log_block(title, text):
     """Log a multi-line block, indented so it reads as one entry."""
     body = "\n".join("    " + ln for ln in str(text).splitlines())
     log(f"{title}\n{body}")
+
+
+class LogHandler(logging.Handler):
+    """Python logging, into this same file.
+
+    log() is the app's own voice, one line at a time; a module that wants
+    levels, logger names and exc_info tracebacks reaches for `logging`
+    instead. Both land here - one file, one rotation - rather than in a
+    second log nobody knows to look for. DEBUG goes to the file only: it
+    is what a field run needs, and noise on a Terminal."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFormatter(logging.Formatter(
+            "%(levelname)s %(name)s: %(message)s"))
+
+    def emit(self, record):
+        try:
+            first, *rest = self.format(record).splitlines() or [""]
+            log("\n".join([first] + ["    " + ln for ln in rest]),
+                echo=record.levelno >= logging.INFO)
+        except Exception:
+            self.handleError(record)
+
+
+def install_log_handler():
+    """Send the "streamsync" logger family (streamsync.controller and
+    the like) to this log, DEBUG and up. Safe to call more than once."""
+    logger = logging.getLogger("streamsync")
+    if not any(isinstance(h, LogHandler) for h in logger.handlers):
+        logger.addHandler(LogHandler())
+    logger.setLevel(logging.DEBUG)
+    return logger
 
 
 # --- what this build is -------------------------------------------------
@@ -455,7 +506,10 @@ def install_excepthook():
 
     Each hook passes the exception on to the one it replaced, and a
     second call changes nothing: streamsync.py installs these before the
-    dependency gate, and each shell again for a direct launch."""
+    dependency gate, and each shell again for a direct launch. Python
+    logging's "streamsync" loggers are routed into the log here too, so
+    the tracebacks they carry are not lost either."""
+    install_log_handler()
     if not getattr(sys.excepthook, "_streamsync", False):
         previous = sys.excepthook
 

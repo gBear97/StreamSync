@@ -10,6 +10,8 @@ that was never the problem.
 """
 
 import ast
+import io
+import logging
 import os
 import sys
 import tempfile
@@ -240,6 +242,61 @@ try:
        "UNCAUGHT EXCEPTION in a Tk callback" in body
        and "KeyError: 'tk boom'" in body)
     ok("with its full traceback", "in on_click" in body)
+
+    # Python logging lands in the same file (install_excepthook, above,
+    # routed it there): a module that wants levels and exc_info gets
+    # them without a second log nobody knows to look for.
+    logger = logging.getLogger("streamsync.test")
+    saved_err, sys.stderr = sys.stderr, io.StringIO()
+    try:
+        logger.info("film loaded")
+        logger.debug("frame detail")
+        try:
+            raise OSError("disk gone")
+        except OSError:
+            logger.warning("save FAILED", exc_info=True)
+        echoed = sys.stderr.getvalue()
+    finally:
+        sys.stderr = saved_err
+    with open(diagnostics.LOG_FILE) as f:
+        body = f.read()
+    ok("a module logger's line reaches the log",
+       "INFO streamsync.test: film loaded" in body)
+    check("once, though the handler was installed twice",
+          body.count("film loaded"), 1)
+    ok("with exc_info's traceback, indented as one entry",
+       "WARNING streamsync.test: save FAILED\n    Traceback" in body
+       and "\n    OSError: disk gone" in body)
+    ok("DEBUG detail reaches the file",
+       "DEBUG streamsync.test: frame detail" in body)
+    ok("but not the Terminal", "frame detail" not in echoed)
+    ok("where INFO still echoes, as log() does", "film loaded" in echoed)
+
+    # More detail needs more room, and still a bound: three old logs of
+    # up to 2 MB beside the live one, the oldest dropped. Through the
+    # handler, which writes with log()'s own rotation.
+    for gen in range(1, 6):
+        with open(diagnostics.LOG_FILE, "w") as f:
+            f.write(f"generation {gen}\n" + "x" * diagnostics.MAX_LOG_BYTES)
+        logger.info("rotate")
+    check("rotation keeps three old logs",
+          sorted(n for n in os.listdir(tmp) if n != "streamsync.log"),
+          ["streamsync.log.1", "streamsync.log.2", "streamsync.log.3"])
+
+    def generation(path):
+        try:
+            with open(path) as f:
+                return f.readline(40).strip()
+        except OSError:
+            return None
+
+    check("the newest is .1", generation(diagnostics.LOG_FILE + ".1"),
+          "generation 5")
+    check("the oldest kept is .3", generation(diagnostics.LOG_FILE + ".3"),
+          "generation 3")
+    ok("the live log restarts with the line that rotated it",
+       os.path.getsize(diagnostics.LOG_FILE) < 1000)
+    ok("each log may reach 2 MB", diagnostics.MAX_LOG_BYTES >= 2_000_000)
 
     # A read-only log directory must not take the app down with it.
     diagnostics.LOG_FILE = "/nonexistent/nowhere/streamsync.log"
