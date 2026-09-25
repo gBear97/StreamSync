@@ -19,6 +19,7 @@ It talks to its shell only through the event queue, with the same
 """
 
 import json
+import math
 import sys
 import threading
 import time
@@ -45,6 +46,8 @@ LOW_CONFIDENCE = 0.55      # video-match trust threshold
 DRIFT_TOLERANCE = 0.35
 PAUSE_LOOK_BACK = 25.0     # resume search: behind the pause point...
 PAUSE_LOOK_AHEAD = 40.0    # ...and ahead of it, plus time since the pause
+PAUSE_GROW_STEP = 60.0     # ...counted in whole steps (one decode per step)
+PAUSE_GROW_MAX = 600.0     # ...and at most this much
 SESSION_CLOSE_WAIT = 1.5   # how long quitting waits for a session to end
 IS_MAC = sys.platform == "darwin"
 
@@ -481,10 +484,18 @@ class SyncController:
         # probe: paused, waiting for the stream to resume. If the "pause"
         # was really a stretch the matcher could not hear, the stream kept
         # playing - so the window grows with the time since, or the film
-        # would wait forever for audio that has already gone by.
+        # would wait forever for audio that has already gone by. It grows
+        # a step at a time, because the film's decode is cached by window
+        # (in chunks of up to 900 s) and an edge that moved every probe had
+        # its chunk decoded afresh every probe; and only so far, because a
+        # real pause - hours of one, if the streamer is away - resumes
+        # where it stopped, and a search that kept growing scanned ever
+        # more of the film at every look.
         since = self._now() - state["paused_at"]
+        grow = min(math.ceil(since / PAUSE_GROW_STEP) * PAUSE_GROW_STEP,
+                   PAUSE_GROW_MAX)
         lo = state["pause_point"] - PAUSE_LOOK_BACK
-        hi = state["pause_point"] + PAUSE_LOOK_AHEAD + since
+        hi = state["pause_point"] + PAUSE_LOOK_AHEAD + grow
         hit = self._auto_probe(lo, hi)
         if hit and not self._stale(gen):
             t, score, z, t0 = hit
