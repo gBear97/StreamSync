@@ -566,10 +566,10 @@ class ExternalPlayer(_ClosedLoop):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
 
-    def _cmd(self, command, val=None):
+    def _cmd(self, command, val=None, key="val"):
         params = {"command": command}
         if val is not None:
-            params["val"] = val
+            params[key] = val
         return self._request(params)
 
     def _alive(self):
@@ -580,22 +580,38 @@ class ExternalPlayer(_ClosedLoop):
             return False
 
     def load(self, path):
+        # Native separators: VLC on Windows silently ignores a forward-slash
+        # path - empty playlist, state "stopped", no error - on both the
+        # command line and in_play, and Tk's file dialog hands paths back
+        # with forward slashes. The identical backslash path plays fine.
+        # No-op on macOS.
+        path = str(Path(path))
         try:
             from matcher import probe
-            self.duration = probe(str(path))[0]
+            duration = probe(path)[0]
         except Exception:
-            self.duration = None
+            duration = None
         if self._alive():
-            self._cmd("in_play", str(path))
+            # in_play takes the MRL as `input=`; `val=` is silently ignored
+            # and the film already playing carries on
+            self._cmd("in_play", path, key="input")
         else:
-            self.proc = subprocess.Popen([
+            argv = [
                 self.exe, "--extraintf", "http",
                 "--http-host", "127.0.0.1",
                 "--http-port", str(self.port),
                 "--http-password", self.password,
-                "--no-one-instance", "--no-video-title-show",
-                str(path),
-            ])
+                "--no-video-title-show",
+            ]
+            if sys.platform != "darwin":
+                # Cocoa VLC has no one-instance option and treats an
+                # unknown option as fatal: it would exit before the HTTP
+                # interface ever came up. (Not needed there anyway: the
+                # binary is exec'd directly, so Launch Services never
+                # hands the file to a running copy.)
+                argv.append("--no-one-instance")
+            argv.append(path)
+            self.proc = subprocess.Popen(argv)
             deadline = time.perf_counter() + 12.0
             while time.perf_counter() < deadline:
                 if self._alive():
@@ -604,6 +620,14 @@ class ExternalPlayer(_ClosedLoop):
             else:
                 raise VLCError("External VLC did not come up with its HTTP "
                                "interface enabled.")
+        # Only once VLC has accepted the new film (in_play returned, or the
+        # spawned VLC answered): the poller turns its position fraction
+        # into seconds with this, and the new film's length over the old
+        # film's playback is a wrong clock for everything reading it.
+        # Accepted is not yet switched - VLC changes film on its own thread
+        # after in_play, so for a moment its status can still show the old
+        # one, scaled by this. That window is left open.
+        self.duration = duration
         self.has_media = True
         self._clk.reset()
         if self._poller is None or not self._poller.is_alive():
