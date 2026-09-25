@@ -15,7 +15,8 @@ judgement - when to seek, how far, and when to leave playback alone:
 - a false pause (a stretch the matcher cannot hear while the stream keeps
   playing) recovers, because the resume search grows with time;
 - nudges during a watch party go to the session, which would otherwise
-  undo them;
+  undo them, and a session that takes the playhead while auto mode is
+  listening is not overruled by what auto mode then finds;
 - leaving a session, or quitting, does not wait on the relay (the UI
   thread froze for the websocket's closing handshake);
 - the time readout carries its rounding (119.96 s once read "1:60.0").
@@ -114,6 +115,7 @@ class Monitor:
     def __init__(self, clock):
         self.clock = clock
         self.frame = 0
+        self.on_capture = None    # runs while "recording": the world moves on
 
     def running(self):
         return True
@@ -122,6 +124,8 @@ class Monitor:
         return self.clock()
 
     def capture_span(self, seconds, start=None):
+        if self.on_capture:
+            self.on_capture()
         t0 = self.clock() - seconds if start is None else start
         # recording takes real (simulated) time when it must wait
         self.clock.now = max(self.clock.now, t0 + seconds)
@@ -300,6 +304,44 @@ def test_viewer_nudge_goes_to_session():
     print("watch party: nudges go to the session's offset")
 
 
+def test_session_start_mid_listen_wins():
+    ctl, stream, player, clock, q = make()
+    run_sync(ctl, ctl.sync, "", "", "audio")
+    mon = ctl._loopback()
+    viewer = session.ViewerSession("ws://x", "CODE", "film.mkv", player, q)
+
+    def party_starts():
+        ctl.session = viewer
+
+    # drift to correct - but a watch party takes over during the listen
+    player.anchor = (player.pos() - 1.3, clock())
+    n = len(player.seeks)
+    mon.on_capture = party_starts
+    clock.now += ctl.auto_step(new_state())
+    assert len(player.seeks) == n, "auto mode corrected drift under a session"
+
+    # a resume found while a watch party starts: the party has the film
+    ctl.session, mon.on_capture = None, None
+    state = new_state()
+    stream.pause()
+    for _ in range(3):
+        clock.now += ctl.auto_step(state)
+    assert state["mode"] == "probe" and not player.playing
+    stream.play()
+    n = len(player.seeks)
+    mon.on_capture = party_starts
+    clock.now += ctl.auto_step(state)
+    assert len(player.seeks) == n and not player.playing, \
+        "auto mode resumed the film under a session"
+    assert state["mode"] == "probe"
+
+    # the party over, the pause auto mode made is still its to lift
+    ctl.session, mon.on_capture = None, None
+    clock.now += ctl.auto_step(state)
+    assert state["mode"] == "normal" and abs(player.pos() - stream.pos()) < 1e-6
+    print("watch party: a session started mid-listen keeps the playhead")
+
+
 class SlowSession:
     """A session whose stop() hangs, as a websocket closing handshake does
     when the relay has gone away - and whose stop flag only goes up once
@@ -374,6 +416,7 @@ def main():
     test_false_pause_recovers()
     test_real_pause_and_resume()
     test_viewer_nudge_goes_to_session()
+    test_session_start_mid_listen_wins()
     test_session_teardown_does_not_block()
     test_fmt_time_carries()
     print("CONTROLLER TEST PASSED")
