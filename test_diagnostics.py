@@ -13,6 +13,7 @@ import ast
 import io
 import logging
 import os
+import platform
 import sys
 import tempfile
 import threading
@@ -297,6 +298,17 @@ try:
     ok("the live log restarts with the line that rotated it",
        os.path.getsize(diagnostics.LOG_FILE) < 1000)
     ok("each log may reach 2 MB", diagnostics.MAX_LOG_BYTES >= 2_000_000)
+
+    # Every run's first line says what it ran on - on Windows too, where
+    # describe() has no OS version to offer.
+    diagnostics.log_session_start()
+    with open(diagnostics.LOG_FILE) as f:
+        start = [ln for ln in f if " starting (" in ln]
+    ok("the startup line is logged", len(start) == 1)
+    ok("and names the OS and its build",
+       bool(start) and platform.platform() in start[0])
+    ok("and how the app was launched",
+       bool(start) and f"args {sys.argv[1:]}" in start[0])
 
     # A read-only log directory must not take the app down with it.
     diagnostics.LOG_FILE = "/nonexistent/nowhere/streamsync.log"

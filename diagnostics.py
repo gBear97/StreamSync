@@ -552,8 +552,11 @@ def install_tk_hook(root):
 def log_session_start():
     log("=" * 60)
     d = describe()
+    # The OS by name and build: describe() only knows the macOS version,
+    # which leaves a Windows log unable to say what it ran on.
     log(f"StreamSync {d['streamsync']} starting "
-        f"({d['process_arch']}, frozen={d['frozen']}, python {d['python']})")
+        f"({d['process_arch']}, frozen={d['frozen']}, python {d['python']}, "
+        f"{platform.platform()}, args {sys.argv[1:]})")
     if d["translocated"]:
         log("NOTE: running translocated - the app has not been moved out "
             "of the disk image, so macOS is running a shadow copy.")
