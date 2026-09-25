@@ -21,7 +21,9 @@ judgement - when to seek, how far, and when to leave playback alone:
   of the film at every look;
 - a film that cannot be read (its drive unplugged) is not taken for a
   paused stream: the same failure three times running is reported once
-  and switches auto mode off, while a silent capture is still a pause;
+  and switches auto mode off - whether the film was playing or auto mode
+  had paused it and was waiting for the stream - while a silent capture
+  is still a pause;
 - nudges during a watch party go to the session, which would otherwise
   undo them, and a session that takes the playhead while auto mode is
   listening is not overruled by what auto mode then finds;
@@ -482,6 +484,61 @@ def test_vanished_film_gives_up():
     print("vanished film: one report, one traceback, then auto re-sync off")
 
 
+def test_vanished_paused_film_gives_up():
+    # the likelier way to meet it: the film is paused, auto mode waiting
+    # for the stream to come back, when its drive goes (a player whose file
+    # vanished mid-play tends to stop, and a stopped film is left alone)
+    ctl, stream, player, clock, q = make()
+    ctl.auto_enabled = True
+    run_sync(ctl, ctl.sync, "", "", "audio")
+    drain(q)
+    hear = controller.audio_matcher.find_match_audio
+    gone = []
+    seen = {}
+
+    def find(path, feats, lo=None, hi=None, progress=None):
+        if gone:
+            raise controller.matcher.MatchError(
+                "ffmpeg could not read this file as a video.")
+        return hear(path, feats, lo, hi, progress)
+    controller.audio_matcher.find_match_audio = find
+
+    def unplug():
+        assert not player.playing, "auto mode did not follow the pause"
+        seen["seeks"] = len(player.seeks)
+        gone.append(True)
+
+    def gave_up():
+        got = drain(q)
+        offs = [e[1] for e in got if e[0] == "auto_off"]
+        assert offs, "auto mode kept waiting on a film it could not read"
+        assert len(offs) == 1 and "still available" in offs[0], offs
+        assert not ctl.auto_enabled
+        assert not player.playing and len(player.seeks) == seen["seeks"], \
+            "the unreadable film was moved"
+        failed = [e for e in got if e[0] == "status" and "check failed" in e[1]]
+        assert len(failed) == 1, failed
+        log = controller.diagnostics
+        assert len(log.blocks) == 1 and "MatchError" in log.blocks[0][1]
+        assert len(log.lines) == 2, log.lines
+
+    def replug_and_retick():
+        del gone[:]
+        ctl.auto_enabled = True
+    run_loop(ctl, clock, 330, [
+        (0, stream.pause),
+        (60, unplug),
+        (190, gave_up),
+        (200, replug_and_retick),
+        (250, stream.play)])
+    # the pause was auto mode's, so with the film back it is still its to lift
+    assert player.playing and abs(player.pos() - stream.pos()) < 1e-6, \
+        "the film auto mode paused was not resumed once Auto was re-ticked"
+    assert not any(e[0] == "auto_off" for e in drain(q))
+    print("vanished film while paused: auto re-sync off once, the film left "
+          "paused; re-ticked, it resumes with the stream")
+
+
 def test_give_up_needs_a_run():
     a = controller.matcher.MatchError("Could not decode audio from the file "
                                       "in that range.")
@@ -660,6 +717,7 @@ def main():
     test_auto_pause_survives_weak_resync()
     test_long_pause_window_bounded()
     test_vanished_film_gives_up()
+    test_vanished_paused_film_gives_up()
     test_give_up_needs_a_run()
     test_silent_capture_is_a_miss()
     test_viewer_nudge_goes_to_session()
