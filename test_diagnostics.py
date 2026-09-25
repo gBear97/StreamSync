@@ -305,6 +305,63 @@ try:
        os.path.getsize(diagnostics.LOG_FILE) < 1000)
     ok("each log may reach 2 MB", diagnostics.MAX_LOG_BYTES >= 2_000_000)
 
+    # On Windows a file another program holds open cannot be renamed -
+    # `Get-Content -Wait` tailing the log is enough. A rotation that
+    # cannot finish must lose none of the old logs, and must not be tried
+    # again on every line. A stand-in os.replace refuses the held file.
+    held, tried, real_replace = set(), [], os.replace
+
+    def replace(src, dst):
+        tried.append(src)
+        if src in held or dst in held:
+            raise PermissionError(13, "in use by another process", src)
+        real_replace(src, dst)
+
+    def backups():
+        return [generation(diagnostics.LOG_FILE + f".{n}") for n in (1, 2, 3)]
+
+    with open(diagnostics.LOG_FILE, "w") as f:
+        f.write("generation 6\n" + "x" * diagnostics.MAX_LOG_BYTES)
+    os.replace = replace
+    try:
+        held.add(diagnostics.LOG_FILE)
+        for _ in range(5):
+            diagnostics.log("while the log is held open")
+        check("a live log that will not move leaves every old log in place",
+              backups(), ["generation 5", "generation 4", "generation 3"])
+        with open(diagnostics.LOG_FILE) as f:
+            live = f.read()
+        ok("and keeps writing on the end of itself",
+           live.startswith("generation 6")
+           and live.count("while the log is held open") == 5)
+        check("and is not tried again on every line",
+              tried.count(diagnostics.LOG_FILE), 1)
+
+        # The reader lets go; the next try, once the log has grown a
+        # little more, rotates as if nothing had happened.
+        held.clear()
+        with open(diagnostics.LOG_FILE, "a") as f:
+            f.write("x" * getattr(diagnostics, "ROTATE_RETRY_BYTES", 0))
+        diagnostics.log("let go")
+        check("then rotates, one generation down",
+              backups(), ["generation 6", "generation 5", "generation 4"])
+
+        # A backup that will not move must not be written over either.
+        held.add(diagnostics.LOG_FILE + ".2")
+        with open(diagnostics.LOG_FILE, "w") as f:
+            f.write("generation 7\n" + "x" * diagnostics.MAX_LOG_BYTES)
+        diagnostics.log("while an old log is held open")
+        check("an old log that will not move is not written over",
+              backups(), ["generation 6", "generation 5", "generation 4"])
+        check("and the live log stays where it was",
+              generation(diagnostics.LOG_FILE), "generation 7")
+        check("with nothing left half-moved",
+              sorted(os.listdir(tmp)),
+              ["streamsync.log", "streamsync.log.1", "streamsync.log.2",
+               "streamsync.log.3"])
+    finally:
+        os.replace = real_replace
+
     # Every run's first line says what it ran on - on Windows too, where
     # describe() has no OS version to offer.
     diagnostics.log_session_start()

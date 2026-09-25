@@ -69,23 +69,56 @@ def _run(cmd, timeout=10):
 
 _write_lock = threading.Lock()
 
+# A rotation that cannot happen - on Windows, a reader such as
+# `Get-Content -Wait` holding the log open - is tried again once the log
+# has grown this much more, rather than on every line.
+ROTATE_RETRY_BYTES = 64_000
+_rotate_retry = (None, 0)  # (log file, size it must reach first)
+
+
+def _shift_aside():
+    """streamsync.log -> .1 -> .2 -> .3, the oldest dropped; True if done.
+
+    A rename can fail part way, and a failed rotation must lose nothing.
+    So the live log moves first, to a name of its own: if it will not
+    move, no backup has moved either. And if a backup will not move, the
+    live log goes back rather than land on top of it."""
+    staging = LOG_FILE + ".rotating"
+    try:
+        os.replace(LOG_FILE, staging)
+    except OSError:
+        return False
+    try:
+        # .2 -> .3 before .1 -> .2, so only the oldest is ever overwritten
+        for n in range(LOG_BACKUPS - 1, 0, -1):
+            try:
+                os.replace(f"{LOG_FILE}.{n}", f"{LOG_FILE}.{n + 1}")
+            except FileNotFoundError:
+                pass  # no such backup yet
+        os.replace(staging, LOG_FILE + ".1")
+        return True
+    except OSError:
+        try:
+            os.replace(staging, LOG_FILE)
+        except OSError:
+            pass
+        return False
+
 
 def _rotate():
+    global _rotate_retry
     try:
-        if os.path.getsize(LOG_FILE) < MAX_LOG_BYTES:
-            return
+        size = os.path.getsize(LOG_FILE)
     except OSError:
         return
-    # .2 -> .3 before .1 -> .2, so only the oldest is ever overwritten
-    for n in range(LOG_BACKUPS - 1, 0, -1):
-        try:
-            os.replace(f"{LOG_FILE}.{n}", f"{LOG_FILE}.{n + 1}")
-        except OSError:
-            pass  # no such backup yet
-    try:
-        os.replace(LOG_FILE, LOG_FILE + ".1")
-    except OSError:
-        pass
+    if size < MAX_LOG_BYTES:
+        return
+    if _rotate_retry[0] == LOG_FILE and size < _rotate_retry[1]:
+        return  # it failed a moment ago; this line goes on the end
+    if _shift_aside():
+        _rotate_retry = (None, 0)
+    else:
+        _rotate_retry = (LOG_FILE, size + ROTATE_RETRY_BYTES)
 
 
 def log(message, echo=True):
