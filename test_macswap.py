@@ -11,7 +11,15 @@ thread each System Events round trip ran on. What is tested:
   libvlc's own fullscreen does nothing once the film renders into our
   window, so the swap used to leave the film fullscreen over the
   browser and the next Cmd-Shift-F took two presses;
-- a swap that fails hands back the fullscreen it took away.
+- a swap that fails hands back the fullscreen it took away;
+- the osascript round trips never run on the Tk thread (each can block
+  for seconds - the first waits on the Automation prompt - and pausing
+  used to freeze the UI for that long), and the browser is looked up
+  once, not on every swap;
+- a rapid pause/resume/pause only plays out the state it settled on;
+- the fullscreen debt survives swaps that overlap, however their
+  results interleave with new pauses;
+- closing stops the swap worker before the controller shuts down.
 """
 
 import threading
@@ -144,7 +152,9 @@ class External:
 
 
 class Ctl:
-    """SyncController as the shell sees it."""
+    """SyncController as the shell sees it. close() notes whether the
+    shell's swap `worker` had already been told to stop: given `wait`
+    seconds, a stopped worker is gone, one never told is still there."""
     def __init__(self, q, player):
         self.q = q
         self.embedded = self.player = player
@@ -158,6 +168,9 @@ class Ctl:
         self.auto_follow = True
         self.relay_url = "ws://localhost:8765"
         self.closed = False
+        self.worker = None
+        self.wait = 1.0
+        self.worker_alive_at_close = None
 
     def load_config(self):
         return {}
@@ -179,6 +192,9 @@ class Ctl:
         return False
 
     def close(self):
+        if self.worker is not None:
+            self.worker.join(self.wait)
+            self.worker_alive_at_close = self.worker.is_alive()
         self.closed = True
 
     def __getattr__(self, name):
@@ -337,9 +353,128 @@ def test_failed_swap_gives_fullscreen_back():
     print("failed swap: fullscreen given back, next pause tries again")
 
 
+def idle(app, seconds=0.3):
+    """Keep the Tk side running a while, for things that must NOT happen."""
+    pump(app, lambda: False, timeout=seconds)
+
+
+def wait_for(cond, timeout=3.0):
+    """Wait on the worker alone - the Tk side is busy elsewhere."""
+    deadline = time.monotonic() + timeout
+    while not cond():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def test_swap_runs_off_the_tk_thread():
+    app, mac = make()
+    mac.delay = 0.3                     # System Events on a good day
+    t = time.perf_counter()
+    app._stream_swap(True)
+    froze = time.perf_counter() - t
+    assert froze < 0.2, f"pausing froze the UI for {froze:.2f}s"
+    assert pump(app, lambda: app._swapped), mac.names()
+    app._stream_swap(False)
+    assert pump(app, lambda: not app._swapped), mac.names()
+    app._stream_swap(True)
+    assert pump(app, lambda: app._swapped), mac.names()
+    on_tk = [name for name, _, thread in mac.calls if thread == TK]
+    assert not on_tk, f"osascript ran on the Tk thread: {on_tk}"
+    assert mac.names().count("list_gui_apps") == 1, \
+        f"the browser was looked up on every swap: {mac.names()}"
+    print("swap: osascript runs off the Tk thread, browser looked up once")
+
+
+def test_rapid_toggles_collapse():
+    app, mac = make()
+    mac.hold = threading.Event()
+    app._stream_swap(True)              # pause: the browser is being raised
+    assert mac.started.wait(2.0)
+    app._stream_swap(False)             # ...while resume, pause, resume
+    app._stream_swap(True)              #    pile up behind it
+    app._stream_swap(False)
+    mac.hold.set()
+    settled = ["list_gui_apps", "activate_app", "hide_app", "activate_self"]
+    pump(app, lambda: mac.names() == settled and not app._swapped)
+    idle(app)
+    assert mac.names() == settled and not app._swapped, mac.names()
+    print("swap: a rapid pause/resume/pause plays out only where it settled")
+
+
+def test_fullscreen_debt_survives_overlapping_swaps():
+    # pause, resume and pause again while the first raise is still running
+    app, mac = make()
+    app._toggle_fullscreen()
+    mac.hold = threading.Event()
+    app._stream_swap(True)
+    assert fullscreen(app) == (False, False), \
+        f"fullscreen must be left before the browser is raised: {fullscreen(app)}"
+    assert mac.started.wait(2.0)
+    app._stream_swap(False)
+    app._stream_swap(True)
+    mac.hold.set()
+    assert pump(app, lambda: app._swapped)
+    idle(app)
+    assert fullscreen(app) == (False, False) and app._was_fullscreen
+    app._stream_swap(False)
+    assert pump(app, lambda: not app._swapped and app.fullscreen), \
+        f"the fullscreen debt was forgotten: {fullscreen(app)}"
+    assert fullscreen(app) == (True, True) and not app._was_fullscreen
+
+    # the resume's result reaches the Tk side only after the next pause
+    app, mac = make()
+    app._toggle_fullscreen()
+    app._stream_swap(True)
+    assert pump(app, lambda: app._swapped)
+    app._stream_swap(False)
+    assert wait_for(lambda: "activate_self" in mac.names())
+    app._stream_swap(True)              # handled before that "swapdone"
+    assert pump(app, lambda: mac.names().count("activate_app") == 2
+                and app._swapped), mac.names()
+    idle(app)
+    assert fullscreen(app) == (False, False), \
+        f"fullscreen came back over the browser: {fullscreen(app)}"
+    app._stream_swap(False)
+    assert pump(app, lambda: not app._swapped and app.fullscreen), \
+        f"the fullscreen debt was forgotten: {fullscreen(app)}"
+    assert fullscreen(app) == (True, True) and not app._was_fullscreen
+    print("fullscreen: the debt survives overlapping swaps")
+
+
+def test_worker_stops_before_the_controller_closes():
+    app, mac = make()
+    worker = getattr(app, "_swap_thread", None)
+    assert worker is not None and worker.is_alive(), "no swap worker running"
+    app.ctl.worker = worker
+    app._on_close()
+    assert app.ctl.closed and app.root.destroyed
+    assert app.ctl.worker_alive_at_close is False, \
+        "the swap worker was still running when the controller closed"
+
+    # a round trip in flight finishes, but nothing queued behind it runs
+    app, mac = make()
+    mac.hold = threading.Event()
+    app._stream_swap(True)
+    assert mac.started.wait(2.0)
+    app._stream_swap(False)
+    app.ctl.worker, app.ctl.wait = app._swap_thread, 0.0
+    app._on_close()
+    mac.hold.set()
+    app._swap_thread.join(2.0)
+    assert not app._swap_thread.is_alive()
+    assert "hide_app" not in mac.names(), mac.names()
+    print("close: the swap worker stops before the controller does")
+
+
 def main():
     test_fullscreen_goes_through_the_film_window()
     test_failed_swap_gives_fullscreen_back()
+    test_swap_runs_off_the_tk_thread()
+    test_rapid_toggles_collapse()
+    test_fullscreen_debt_survives_overlapping_swaps()
+    test_worker_stops_before_the_controller_closes()
     print("MAC SWAP TEST PASSED")
 
 
