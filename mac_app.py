@@ -599,18 +599,26 @@ class MacApp:
         video = {"mute": self.mute_var.get()}
         if method == "video":
             self._set_status("Capturing stream frames...")
-            self.root.withdraw()  # our window must not cover the stream
+            # Our windows must not cover the stream - least of all the film
+            # window, which is up from the moment a film loads: inside the
+            # capture region, the matcher would find our own picture.
+            hidden = [self.root]
+            if self.video_win.state() not in ("withdrawn", "iconic"):
+                hidden.append(self.video_win)
+            for win in hidden:
+                win.withdraw()
             self.root.update()
             video.update(mask=controller.build_mask(self.facecam_var.get(),
                                                     self.ctl.facecam_rect),
                          mirror=self.mirror_var.get(),
-                         hidden=[self.root])
+                         hidden=hidden)
         run = self.ctl.resync if resync else self.ctl.sync
         try:
             started = run(self.hint_var.get(), self.window_var.get(), method,
                           **video)
         except ValueError as e:
-            self.root.deiconify()
+            for win in video.get("hidden") or ():
+                win.deiconify()
             messagebox.showerror("StreamSync", str(e))
             return
         if not started:
