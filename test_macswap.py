@@ -19,7 +19,9 @@ thread each System Events round trip ran on. What is tested:
 - a rapid pause/resume/pause only plays out the state it settled on;
 - the fullscreen debt survives swaps that overlap, however their
   results interleave with new pauses;
-- closing stops the swap worker before the controller shuts down.
+- closing stops the swap worker before the controller shuts down;
+- a video-capture sync takes the film window off screen too, so the
+  matcher cannot find our own picture inside the capture region.
 """
 
 import threading
@@ -468,6 +470,41 @@ def test_worker_stops_before_the_controller_closes():
     print("close: the swap worker stops before the controller does")
 
 
+def test_video_sync_hides_the_film_window():
+    app, mac = make()
+    app.method_var.set("video")
+    app.ctl.region = (0, 0, 1280, 720)
+    sent = []
+    app.ctl.sync = lambda hint, window, method, **video: \
+        sent.append(video) or True
+    app._sync()
+    hidden = sent[0]["hidden"]
+    assert app.video_win in hidden and not app.video_win.shown, \
+        "the film window stayed on screen for the capture"
+    assert app.root in hidden and not app.root.shown
+    app.q.put(("show", hidden))         # the controller, frames grabbed
+    assert pump(app, lambda: app.video_win.shown and app.root.shown)
+
+    # a film window the user closed is not brought back by a sync
+    app.video_win.withdraw()
+    sent.clear()
+    app._sync()
+    assert app.video_win not in sent[0]["hidden"]
+    app.q.put(("show", sent[0]["hidden"]))
+    assert pump(app, lambda: app.root.shown)
+    assert not app.video_win.shown
+
+    # a time it cannot read puts every hidden window straight back
+    app._show_video_window()
+
+    def unreadable(*a, **kw):
+        raise ValueError("Can't read that time.")
+    app.ctl.sync = unreadable
+    app._sync()
+    assert app.root.shown and app.video_win.shown
+    print("video sync: the film window is off screen for the capture")
+
+
 def main():
     test_fullscreen_goes_through_the_film_window()
     test_failed_swap_gives_fullscreen_back()
@@ -475,6 +512,7 @@ def main():
     test_rapid_toggles_collapse()
     test_fullscreen_debt_survives_overlapping_swaps()
     test_worker_stops_before_the_controller_closes()
+    test_video_sync_hides_the_film_window()
     print("MAC SWAP TEST PASSED")
 
 
