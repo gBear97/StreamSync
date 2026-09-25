@@ -3,8 +3,9 @@
 No window, no sound card, no film: a fake stream plays (or pauses) on a
 fake clock, a fake player can be seeked and nudged, and the matcher is
 replaced by one that "hears" the stream exactly when its audio is
-audible and inside the search window. What is tested is the controller's
-judgement - when to seek, how far, and when to leave playback alone:
+audible, inside the search window and in the film searched. What is
+tested is the controller's judgement - when to seek, how far, and when
+to leave playback alone:
 
 - auto mode leaves a nudged film alone (it once "corrected" any nudge over
   0.35 s at every check, forever);
@@ -14,7 +15,7 @@ judgement - when to seek, how far, and when to leave playback alone:
 - a weak first look listens longer before giving up;
 - a pause auto mode made survives a manual sync that was not applied
   (the film once stayed paused for good), and is handed back when the
-  interruption plays the film;
+  interruption plays the film, loads another or switches player;
 - a false pause (a stretch the matcher cannot hear while the stream keeps
   playing) recovers, because the resume search grows with time - in
   steps, and only so far, so a long real pause does not decode ever more
@@ -58,6 +59,7 @@ class Stream:
         self.clock = clock
         self.anchor = (pos, clock())
         self.playing = True
+        self.film = "film.mkv"    # what the streamer is playing
         self.audible = True       # can the matcher hear the film at all?
         self.weak_until = 0.0     # recordings shorter than this are weak
 
@@ -104,6 +106,10 @@ class Player:
         if self.playing:
             self.anchor = (self.pos(), self.now())
             self.playing = False
+
+    def load(self, path):
+        self.path = path          # another film: stopped, nowhere yet
+        self.anchor, self.playing = None, False
 
     def sync_seek(self, match_t, t0, offset):
         target = match_t + (self.now() - t0) + offset
@@ -162,7 +168,8 @@ def install_fakes(stream):
         t0, seconds = feats
         true = stream.pos(t0)
         inside = (lo is None or lo <= true) and (hi is None or true <= hi)
-        if not stream.audible or not stream.playing or not inside:
+        if (path != stream.film or not stream.audible or not stream.playing
+                or not inside):
             return (lo or 0.0) + 7.0, 0.2 * S, 0.6 * Z    # noise
         if seconds < stream.weak_until:
             return true, 0.4 * S, Z                       # right but weak
@@ -445,6 +452,55 @@ def test_auto_pause_survives_weak_resync():
     assert player.playing and abs(player.pos() - stream.pos()) < 1e-6
     print("auto pause: kept across a weak Resync and resumed with the "
           "stream; handed back when a Resync resumed it")
+
+
+def test_held_pause_is_only_that_films():
+    # auto mode paused the film for a stream pause; Auto is unticked and
+    # something else goes up - another film, or this one on the other
+    # player - before it is ticked again and the stream plays. What is up
+    # now was never paused by auto mode, so it must not look for the
+    # stream in it around the old pause point, nor "resume" it
+    def run(swap, on_external=False):
+        ctl, stream, player, clock, q = make()
+        ctl.auto_enabled = True
+        if on_external:
+            ctl.external = Player(clock)
+            run_sync(ctl, ctl.use_external, True)
+        run_sync(ctl, ctl.sync, "", "", "audio")
+        was = ctl.player
+        looks = []
+        hear = controller.audio_matcher.find_match_audio
+
+        def find(path, feats, lo=None, hi=None, progress=None):
+            looks.append((path, lo, hi))
+            return hear(path, feats, lo, hi, progress)
+        controller.audio_matcher.find_match_audio = find
+        seen = {}
+
+        def paused():
+            assert not was.playing, "auto mode did not follow the pause"
+            seen["seeks"] = len(was.seeks)
+
+        def rearm():
+            ctl.auto_enabled = True
+            del looks[:]
+        run_loop(ctl, clock, 200, [
+            (0, stream.pause),
+            (60, paused),
+            (61, lambda: setattr(ctl, "auto_enabled", False)),
+            (62, lambda: swap(ctl)),
+            (63, rearm),
+            (100, stream.play)])
+        assert not looks, \
+            f"auto mode looked for a pause it did not make: {looks[:2]}"
+        now = ctl.player
+        assert not now.playing and (now is was or not now.seeks), \
+            "auto mode 'resumed' a film it never paused"
+        assert not was.playing and len(was.seeks) == seen["seeks"]
+
+    run(lambda ctl: ctl.load_file("other.mkv"))
+    run(lambda ctl: ctl.use_embedded(), on_external=True)
+    print("auto pause: let go once another film, or the other player, is up")
 
 
 def test_real_pause_and_resume():
@@ -751,6 +807,7 @@ def main():
     test_false_pause_recovers()
     test_real_pause_and_resume()
     test_auto_pause_survives_weak_resync()
+    test_held_pause_is_only_that_films()
     test_long_pause_window_bounded()
     test_vanished_film_gives_up()
     test_vanished_paused_film_gives_up()
