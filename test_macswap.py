@@ -11,9 +11,11 @@ thread each System Events round trip ran on. What is tested:
   libvlc's own fullscreen does nothing once the film renders into our
   window, so the swap used to leave the film fullscreen over the
   browser and the next Cmd-Shift-F took two presses;
-- a swap that fails hands back the fullscreen it took away, and does
-  not latch: the next pause tries again, and a resume after a failed
-  pause has no browser to hide;
+- a swap that fails hands back the fullscreen it took away and settles
+  on what it left on screen: a pause after it raises the browser when
+  the film is in front - a pause after a failed resume used to be
+  skipped, leaving the film fullscreen over the stream - and the resume
+  every sync sends does not run a failed pause (and its error) again;
 - the osascript round trips never run on the Tk thread (each can block
   for seconds - the first waits on the Automation prompt - and pausing
   used to freeze the UI for that long), and the browser is looked up
@@ -270,6 +272,13 @@ def make(film=True, **osa):
     mac_app.diagnostics = types.SimpleNamespace(
         log=lambda *a, **kw: None, LOG_FILE="")
     app = mac_app.MacApp(Root())
+    settle = app._swap_done
+    app.results = []                    # each swap result the Tk side settled
+
+    def counted(*result):
+        app.results.append(result)
+        settle(*result)
+    app._swap_done = counted
     if film:
         app._choose_file()
     return app, mac
@@ -285,6 +294,12 @@ def pump(app, until, timeout=3.0):
         if time.monotonic() > deadline:
             return False
         time.sleep(0.01)
+
+
+def settled(app, n):
+    """Pump until the Tk side has settled the worker's n-th swap result -
+    not just shown its status line, which the worker sends first."""
+    return pump(app, lambda: len(app.results) >= n)
 
 
 def status(app):
@@ -366,6 +381,67 @@ def test_failed_swap_gives_fullscreen_back():
     assert pump(app, lambda: "App swap failed" in status(app)
                 and app.fullscreen), (status(app), fullscreen(app))
     assert fullscreen(app) == (True, True) and not app._was_fullscreen
+    # ...and the stream's next pause is not skipped as a repeat of the
+    # one before: the film is fullscreen again, in front of the browser
+    # it has to make way for
+    mac.fail = set()
+    app._stream_swap(True)
+    assert pump(app, lambda: mac.names().count("activate_app") == 2), \
+        f"the pause after a failed resume never ran: {mac.names()}"
+    assert fullscreen(app) == (False, False) and app._was_fullscreen, \
+        f"the film stayed fullscreen over the stream: {fullscreen(app)}"
+
+    # a hide that fails under a windowed film leaves the browser in front
+    # of it, so the next resume tries the hide again
+    app, mac = make()
+    app._stream_swap(True)
+    assert pump(app, lambda: app._swapped)
+    mac.fail = {"hide_app"}
+    app._stream_swap(False)
+    assert settled(app, 2) and "App swap failed" in status(app), status(app)
+    mac.fail = set()
+    app._stream_swap(False)
+    assert pump(app, lambda: mac.names().count("hide_app") == 2), \
+        f"the resume after a failed one never ran: {mac.names()}"
+    assert settled(app, 3) and not app._swapped
+    # ...unless the film went fullscreen over it during the pause: then
+    # the film is in front, and it is the next pause that has to run
+    app, mac = make()
+    app._stream_swap(True)
+    assert pump(app, lambda: app._swapped)
+    app._toggle_fullscreen()            # Shift-Cmd-F while paused
+    mac.fail = {"hide_app"}
+    app._stream_swap(False)
+    assert settled(app, 2) and "App swap failed" in status(app), status(app)
+    mac.fail = set()
+    app._stream_swap(True)
+    assert pump(app, lambda: mac.names().count("activate_app") == 2), \
+        f"a film made fullscreen during the pause stayed over the stream " \
+        f"once its resume failed: {mac.names()}"
+    assert fullscreen(app) == (False, False) and app._was_fullscreen
+
+    # the browser hid, but bringing the film forward failed: nothing is
+    # left up, so a resume has nothing to do and the next pause raises
+    # the browser again - fullscreen or not
+    for full in (False, True):
+        app, mac = make()
+        if full:
+            app._toggle_fullscreen()
+        app._stream_swap(True)
+        assert pump(app, lambda: app._swapped)
+        mac.fail = {"activate_self"}
+        app._stream_swap(False)
+        assert settled(app, 2) and "App swap failed" in status(app), \
+            status(app)
+        assert fullscreen(app) == (full, full) and not app._was_fullscreen
+        mac.fail = set()
+        app._stream_swap(False)
+        idle(app)
+        assert mac.names().count("hide_app") == 1, \
+            f"a resume after a half-done one hid the browser: {mac.names()}"
+        app._stream_swap(True)
+        assert pump(app, lambda: mac.names().count("activate_app") == 2), \
+            f"the pause after a half-done resume never ran: {mac.names()}"
 
     # no browser running at all
     app, mac = make(apps=("Finder",))
@@ -374,7 +450,7 @@ def test_failed_swap_gives_fullscreen_back():
     assert pump(app, lambda: "Pick the stream's browser" in status(app)
                 and app.fullscreen), (status(app), fullscreen(app))
     assert fullscreen(app) == (True, True) and not app._was_fullscreen
-    print("failed swap: fullscreen given back, next pause tries again")
+    print("failed swap: fullscreen given back, what is on screen settles it")
 
 
 def idle(app, seconds=0.3):
@@ -390,6 +466,113 @@ def wait_for(cond, timeout=3.0):
             return False
         time.sleep(0.01)
     return True
+
+
+MATCHED = "Matched stream audio at 9:54.0 (score 9.1, peak z 12)."
+REFUSED = {"list_gui_apps", "activate_app", "hide_app", "activate_self"}
+
+
+def sync_applied(app):
+    """What an applied sync sends the Tk side: the resume swap, then the
+    sync's result line."""
+    app.q.put(("swap", False))
+    app.q.put(("status", MATCHED))
+
+
+def test_failed_swap_is_not_rerun_by_every_sync():
+    # Automation permission refused: every System Events call fails, and
+    # the pause that found out has said so. The resume each applied sync
+    # sends has no browser to hide, and must not run the failing swap
+    # again only to write its error over the sync's result - whether the
+    # browser was picked or looked up, the film fullscreen or windowed
+    for pick, full in (("Safari", False), ("", True)):
+        app, mac = make()
+        app.stream_app = pick
+        if full:
+            app._toggle_fullscreen()
+        mac.fail = set(REFUSED)
+        app._stream_swap(True)
+        assert settled(app, 1) and fullscreen(app) == (full, full)
+        tried = mac.names()
+        for _ in range(3):
+            sync_applied(app)
+            idle(app, 0.1)
+            assert status(app) == MATCHED, \
+                f"the failed pause was run again over a sync: {status(app)}"
+        idle(app)
+        assert mac.names() == tried, \
+            f"every sync ran the failed pause's swap again: {mac.names()}"
+
+    # permission withdrawn during a pause: the resume fails and hands
+    # fullscreen back, and the film is in front again - the syncs after it
+    # have nothing to hide either
+    app, mac = make()
+    app._toggle_fullscreen()
+    app._stream_swap(True)
+    assert pump(app, lambda: app._swapped)
+    mac.fail = set(REFUSED)
+    sync_applied(app)
+    assert settled(app, 2) and fullscreen(app) == (True, True)
+    assert "App swap failed" in status(app), status(app)
+    tried = mac.names()
+    for _ in range(3):
+        sync_applied(app)
+        idle(app, 0.1)
+        assert status(app) == MATCHED, \
+            f"the failed resume was run again over a sync: {status(app)}"
+    idle(app)
+    assert mac.names() == tried, \
+        f"every sync ran the failed resume's swap again: {mac.names()}"
+    print("failed swap: not run again by every sync, whose result stays up")
+
+
+def test_refused_swap_leaves_things_as_they_were():
+    # The first pause sits on the Automation prompt, and the stream
+    # resumes - or a sync lands - before the user answers Don't Allow.
+    # Nothing was raised, so the resume's refused hide left nothing up
+    # either, and the syncs after it have nothing to hide
+    app, mac = make()
+    app.stream_app = "Safari"
+    mac.fail = set(REFUSED)
+    mac.hold = threading.Event()        # the prompt is up
+    app._stream_swap(True)
+    assert mac.started.wait(2.0)
+    app._stream_swap(False)             # resumed before it is answered
+    mac.hold.set()                      # Don't Allow
+    assert settled(app, 2), app.results
+    tried = mac.names()
+    for _ in range(3):
+        sync_applied(app)
+        idle(app, 0.1)
+        assert status(app) == MATCHED, \
+            f"a pause refused after the resume was sent left every sync " \
+            f"rerunning the hide: {status(app)}"
+    idle(app)
+    assert mac.names() == tried, mac.names()
+
+    # A browser we raised quits during the pause: the resume's hide fails,
+    # the next sync finds no browser at all, and that settles on nothing
+    # being up - so a browser opened later for something else is neither
+    # looked for by every sync nor hidden by one
+    app, mac = make()
+    app._stream_swap(True)
+    assert pump(app, lambda: app._swapped), mac.names()
+    mac.apps = ["Finder"]               # Safari quit during the pause
+    sync_applied(app)
+    assert settled(app, 2) and "App swap failed" in status(app), status(app)
+    sync_applied(app)                   # no browser to find
+    idle(app)
+    tried = mac.names()
+    for _ in range(3):
+        sync_applied(app)
+        idle(app, 0.1)
+    mac.apps = ["Finder", "Google Chrome"]
+    sync_applied(app)
+    idle(app)
+    assert mac.names() == tried, \
+        f"a sync went looking for a browser it never raised: " \
+        f"{mac.names()[len(tried):]}"
+    print("failed swap: a refused call leaves the stream app where it was")
 
 
 def test_swap_runs_off_the_tk_thread():
@@ -562,6 +745,8 @@ def test_switch_to_embedded_shows_the_film_window():
 def main():
     test_fullscreen_goes_through_the_film_window()
     test_failed_swap_gives_fullscreen_back()
+    test_failed_swap_is_not_rerun_by_every_sync()
+    test_refused_swap_leaves_things_as_they_were()
     test_swap_runs_off_the_tk_thread()
     test_rapid_toggles_collapse()
     test_fullscreen_debt_survives_overlapping_swaps()

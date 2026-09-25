@@ -47,8 +47,9 @@ class MacApp:
         self.q = queue.Queue()
         self.fullscreen = False
         self.stream_app = ""
-        self._swapped = False        # what the swap worker last applied
+        self._swapped = False        # stream app left up by the last swap
         self._swap_target = False    # what the last dispatched swap aims at
+                                     # (after a failure, what is on screen)
         self._swap_seq = 0
         self._swap_app = ""          # resolved browser, cached across swaps
         self._swap_q = queue.Queue()
@@ -880,13 +881,22 @@ class MacApp:
                 if show:
                     self.q.put(("status", "Pick the stream's browser under "
                                           "Advanced > Stream App first."))
-                self.q.put(("swapdone", seq, show, False))
+                # nothing was raised, and nothing we can reach is up
+                self.q.put(("swapdone", seq, show, False, False))
                 continue
+            # Where this swap left the stream app; None until a call goes
+            # through. A refused call moved nothing - a refused activate_app
+            # raised nothing (at most it unhid the browser, and the film
+            # stays in front), and a refused hide leaves it where the last
+            # swap left it - so it stands as it was.
+            shown = None
             try:
                 if show:
                     macwindowctl.activate_app(app_name)
+                    shown = True
                 else:
                     macwindowctl.hide_app(app_name)
+                    shown = False
                     if embedded:
                         macwindowctl.activate_self()
                     else:
@@ -896,27 +906,38 @@ class MacApp:
                 self.q.put(("status", f"App swap failed: {e} (grant "
                                       "Automation permission in System "
                                       "Settings > Privacy)."))
-                self.q.put(("swapdone", seq, show, False))
+                self.q.put(("swapdone", seq, show, False, shown))
                 continue
-            self.q.put(("swapdone", seq, show, True))
+            self.q.put(("swapdone", seq, show, True, shown))
 
-    def _swap_done(self, seq, show, ok):
-        """Tk thread: settle a swap the worker has finished with."""
-        if ok:
-            self._swapped = show
+    def _swap_done(self, seq, show, ok, shown):
+        """Tk thread: settle a swap the worker has finished with. `shown`
+        says whether it left the stream app up (None: as it was)."""
+        if shown is not None:
+            self._swapped = shown
         if seq != self._swap_seq:
             # A newer swap is already on its way and settles the film when
             # it lands. Giving fullscreen back now would put the film over
             # a browser that is about to be raised.
             return
-        if not ok:
-            # Let the next pause try again instead of latching on a failure.
-            self._swap_target = self._swapped
         if not show or not ok:
             # The film is back, or the swap failed - a browser that never
             # came up, or one that would not hide again: either way
             # nothing else will hand fullscreen back.
             self._repay_fullscreen()
+        if not ok:
+            # Settle on what is on screen, so the next swap is judged
+            # against that and not against what the failed one aimed at.
+            # A fullscreen film is in front of whatever is still up, so the
+            # stream's next pause has to raise it - after a hide that
+            # failed and handed fullscreen back, too. A failed pause raised
+            # nothing, so the resume every sync sends has nothing to do and
+            # does not run the failing swap again. A hide that failed under
+            # a windowed film leaves the stream app in front, and the next
+            # resume tries it again.
+            if self.fullscreen and self.player is self.player_backend:
+                self._swapped = False
+            self._swap_target = self._swapped
 
     def _repay_fullscreen(self):
         if self._was_fullscreen and self.player is self.player_backend:
