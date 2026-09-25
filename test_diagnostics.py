@@ -353,9 +353,9 @@ try:
         # Nor may an old log that will not move cost any of them, whichever
         # it is: the newest, the one after it, or the oldest. The rotation
         # that just worked has cleared the wait the failed one set: this
-        # log is no bigger than that one was, so without that none of
-        # these would even be tried, and "nothing moved" would prove
-        # nothing.
+        # log is no bigger than that one was, so without that the first
+        # case (.1 held) would not even be tried, and its "nothing moved"
+        # would prove nothing.
         with open(diagnostics.LOG_FILE, "w") as f:
             f.write("generation 7\n" + "x" * diagnostics.MAX_LOG_BYTES)
         for n in (1, 2, 3):
