@@ -459,7 +459,7 @@ class SyncController:
                               f"(score {score:.1f}, z {z:.0f}).")
                 return self.auto_interval
             if hit:
-                return 1     # a manual sync overtook this one
+                return 1     # a manual sync or a session overtook this one
             state["failures"] += 1
             if state["failures"] == 1:
                 # the stream stopped somewhere after the last good match and
@@ -499,8 +499,11 @@ class SyncController:
 
     def _stale(self, gen):
         """A manual sync started (or is running) since `gen` was read - its
-        result wins over whatever auto mode found."""
-        return self._busy or self._gen != gen
+        result wins over whatever auto mode found. So does a watch party
+        that took the playhead while auto mode was listening: the loop
+        only checks for one between passes, and a pass listens for up to
+        8 s, matching after each look, before it acts."""
+        return self._busy or self._gen != gen or self.session_running()
 
     def _auto_loop(self):
         state = {"mode": "normal", "failures": 0, "pause_point": None,
