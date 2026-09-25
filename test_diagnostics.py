@@ -475,6 +475,8 @@ try:
     ok("with its traceback and the path it could not write",
        "Traceback (most recent call last)" in failed
        and "no-such-folder" in failed)
+    check("and not also as a save that worked",
+          read_log().count("config saved ("), 1)
 finally:
     diagnostics.LOG_DIR, diagnostics.LOG_FILE, controller.CONFIG_PATH = saved
     tmp_dir.cleanup()
