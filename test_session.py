@@ -198,7 +198,10 @@ def main():
         print(f"viewer: verified, file offset {viewer.delta:+.3f}s")
         assert abs(viewer.delta) < 0.05, viewer.delta
 
-        wait(lambda: viewer.delay is not None, 60, "a delay measurement")
+        # the first probe starts about when the viewer's voice does,
+        # usually too soon to reach 3.37 s back; and a young viewer uses
+        # a delay only once a second probe agrees - ~50 s in all
+        wait(lambda: viewer.delay is not None, 90, "a delay measurement")
         print(f"viewer: stream delay {viewer.delay:.3f}s (true {STREAM_DELAY}s)")
         assert abs(viewer.delay - STREAM_DELAY) < 0.05, viewer.delay
 

@@ -46,6 +46,7 @@ MEASURE_INTERVAL = 25.0     # viewer stream-delay measurement
 MEASURE_SECONDS = 10.0
 MEASURE_LOOKBACK = 90.0     # longest stream delay looked for
 MEASURE_EARLY = 1.0         # a near-zero delay can align this far under 0
+MEASURE_AGREE = 0.5         # two delays this close agree (young session)
 # The host sends a voice block only once its whole span is recorded, and
 # fingerprinting and the relay hop add a little more: the voice a probe
 # ends on (and MEASURE_EARLY past it) has reached the viewer this long
@@ -199,7 +200,9 @@ def measure_delay(voice_buf, samples, sr, probe_t0):
     The look-back stops at the oldest voice held. A viewer who joined
     30 s ago holds no host voice from 90 s ago - the relay does not
     replay it - and scoring that as a dropout kept every viewer under
-    the coverage gate for its first ~80 s.
+    the coverage gate for its first ~80 s. A stream further behind than
+    the voice held can then only align by chance, so callers use a delay
+    from a clipped look-back only once a second measurement agrees.
     """
     first = voice_buf.first_utc()
     if first is None:
@@ -806,15 +809,32 @@ class ViewerSession:
     def _measure_loop(self):
         self._monitor = mon = audio_capture.AudioMonitor(
             "loopback", self.speaker_name, keep=30)
+        last = None         # the last delay measured, used or not
+        follow = None       # where the next probe starts, if not from now
         while not self.stop_flag.is_set():
+            start, follow = follow, None
             try:
-                samples, sr, t0, _ = mon.capture_span(MEASURE_SECONDS,
-                                                      start=mon.mark())
+                samples, sr, t0, frame = mon.capture_span(
+                    MEASURE_SECONDS,
+                    start=mon.mark() if start is None else start)
                 probe_t0 = self.clock.perf_to_utc(t0)
                 # the host is still recording the voice this probe ends on
                 if self.stop_flag.wait(VOICE_SETTLE):
                     break
                 d = measure_delay(self.voice, samples, sr, probe_t0)
+                if d is not None:
+                    agrees = any(v is not None and abs(d - v) <= MEASURE_AGREE
+                                 for v in (last, self.delay))
+                    last = d
+                    if not agrees and (self.voice.first_utc()
+                                       > probe_t0 - MEASURE_LOOKBACK):
+                        # measured against only the voice held since this
+                        # viewer joined: a stream further behind than that
+                        # can only align by chance. Wait for a second
+                        # measurement to agree - from the audio straight
+                        # after this probe, most of it recorded already.
+                        d = None
+                        follow = frame + len(samples)
                 if d is not None:
                     first = self.delay is None
                     self.delay = d if first else 0.7 * self.delay + 0.3 * d
@@ -824,5 +844,6 @@ class ViewerSession:
                 pass        # silence on loopback - stream muted, keep default
             except Exception:
                 pass
-            self.stop_flag.wait(max(0.0, MEASURE_INTERVAL - MEASURE_SECONDS
-                                    - VOICE_SETTLE))
+            if follow is None:
+                self.stop_flag.wait(max(0.0, MEASURE_INTERVAL
+                                        - MEASURE_SECONDS - VOICE_SETTLE))

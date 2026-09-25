@@ -271,6 +271,10 @@ def measure_loop():
     straight away, the reference is missing the probe's tail and a short
     delay cannot align (3b). The loop has to wait VOICE_SETTLE first -
     and, if the viewer leaves meanwhile, not measure at all.
+
+    A young viewer's look-back stops at the voice it holds (3c), so a
+    stream further behind than that can only align by chance - and does,
+    now and then. Such a measurement is used only once a second agrees.
     """
     settle = 0.3
     saved = {k: getattr(session, k, None) for k in
@@ -281,36 +285,61 @@ def measure_loop():
         def perf_to_utc(self, perf):
             return perf         # the fake probes are dated in UTC already
 
-    def run(probes, leave=None):
+    def run(probes, leave=None, results=(), held_from=None):
         """A viewer's measure loop over probes heard from each UTC in
-        `probes`; the viewer leaves as probe `leave` ends. Returns, per
-        measurement, (seconds after its probe ended, probe_t0)."""
+        `probes`, measure_delay returning `results` in turn (then None).
+        The viewer holds host voice from UTC `held_from` on, and leaves as
+        probe `leave` ends. Returns, per measurement: seconds after its
+        probe ended ("dt"), the probe's UTC ("t0"), the viewer's delay
+        after it ("delay"), and whether the next probe went straight on
+        from the audio after it, with no pause ("follow")."""
         viewer = session.ViewerSession("ws://unused", "ROOM", None, None,
                                        queue.Queue())
         viewer.clock = UtcClock()
-        probes = list(probes)
+        if held_from is not None:
+            viewer.voice.add(held_from, np.zeros(16, np.uint16))
+        probes, results = list(probes), list(results)
         ended, measured = [], []
+        paused = [False]
+        settle_or_pause = viewer.stop_flag.wait
+
+        def wait(timeout=None):
+            paused[0] = True        # only the pause comes after a measurement
+            return settle_or_pause(timeout)
+
+        viewer.stop_flag.wait = wait
 
         class Monitor:
+            end = None              # frame the last probe ended at
+
             def mark(self):
-                return None
+                return "now"
 
             def capture_span(self, seconds, start=None):
+                if measured:
+                    measured[-1]["delay"] = viewer.delay
+                    measured[-1]["follow"] = (start == self.end
+                                              and not paused[0])
                 if not probes:
                     viewer.stop_flag.set()
                     raise RuntimeError("no more probes")
                 if len(ended) == leave:
                     viewer.stop_flag.set()
                 ended.append(time.perf_counter())
-                return (np.zeros(int(seconds * SR), np.float32), SR,
-                        probes.pop(0), None)
+                t0 = probes.pop(0)
+                frame = int(round((t0 - 1000.0) * SR))
+                samples = np.zeros(int(seconds * SR), np.float32)
+                self.end = frame + samples.size
+                return samples, SR, t0, frame
 
             def stop(self):
                 pass
 
         def measure(voice_buf, samples, sr, probe_t0):
-            measured.append((time.perf_counter() - ended[-1], probe_t0))
-            return None
+            measured.append({"dt": time.perf_counter() - ended[-1],
+                             "t0": probe_t0})
+            paused[0] = False
+            return results.pop(0) if results else None
 
         session.audio_capture.AudioMonitor = lambda *a, **kw: Monitor()
         session.measure_delay = measure
@@ -322,14 +351,47 @@ def measure_loop():
         # no pause between probes beyond the settle wait
         session.MEASURE_INTERVAL = session.MEASURE_SECONDS + settle
         measured = run([1020.0, 1045.0, 1070.0])
-        assert [t for _, t in measured] == [1020.0, 1045.0, 1070.0], measured
-        assert min(dt for dt, _ in measured) > 0.8 * settle, measured
-        print(f"measure loop: measures {min(dt for dt, _ in measured):.2f} s "
-              f"after each probe ends (VOICE_SETTLE {settle} s here)")
+        assert [m["t0"] for m in measured] == [1020.0, 1045.0, 1070.0], measured
+        dt = min(m["dt"] for m in measured)
+        assert dt > 0.8 * settle, measured
+        print(f"measure loop: measures {dt:.2f} s after each probe ends "
+              f"(VOICE_SETTLE {settle} s here)")
         measured = run([1020.0, 1045.0], leave=1)
-        assert [t for _, t in measured] == [1020.0], measured
+        assert [m["t0"] for m in measured] == [1020.0], measured
         print("measure loop: a viewer who leaves while the voice settles "
               "does not measure")
+
+        # A viewer who joined at UTC 1000, 45 s behind the host, holds
+        # none of the voice its probes heard. A chance alignment (0.6 s)
+        # is not used: the next probe follows straight on, and its own
+        # measurement disagrees - and so waits for a third that agrees.
+        # (Used outright, 0.6 s would have taken seven more 25 s rounds
+        # of the moving average to get within 5 s of the truth.)
+        m = run([1020.0, 1030.0, 1040.0], results=[0.6, 45.0, 45.02],
+                held_from=1000.0)
+        assert [x["delay"] for x in m] == [None, None, 45.02], m
+        assert [x["follow"] for x in m] == [True, True, False], m
+        print("measure loop: a young viewer's chance alignment is not used; "
+              "two measurements that agree are")
+
+        # a short delay is used as soon as the probe after it agrees, and
+        # a chance alignment after that does not drag it off
+        m = run([1020.0, 1030.0, 1055.0, 1065.0],
+                results=[2.07, 2.09, 38.4, 2.1], held_from=1000.0)
+        assert [x["delay"] for x in m] == [
+            None, 2.09, 2.09, 0.7 * 2.09 + 0.3 * 2.1], m
+        assert [x["follow"] for x in m] == [True, False, True, False], m
+        print("measure loop: a young viewer's delay is used from the second "
+              "probe, and a later chance alignment is not averaged in")
+
+        # once the voice held spans the whole look-back, a measurement is
+        # used outright, as in v1.0.7 - whatever came before it. (Joined
+        # at 999: the look-back from 1080 starts before that, from 1090
+        # it does not.)
+        m = run([1080.0, 1090.0], results=[30.0, 7.25], held_from=999.0)
+        assert [x["delay"] for x in m] == [None, 7.25], m
+        print("measure loop: with the full look-back held, a delay is used "
+              "at once")
     finally:
         for k, v in saved.items():
             setattr(session, k, v)
