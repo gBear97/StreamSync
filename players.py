@@ -424,12 +424,15 @@ class EmbeddedPlayer(_ClosedLoop):
 
     def load(self, path):
         self.mp.set_media(self.instance.media_new(path))
-        # Each media gets a fresh vout, and VLC's D3D11 output can come up
-        # DETACHED - its own hidden top-level "VLC (Direct3D11 output)"
-        # window, via its leaky double-click fullscreen or a hidden-window
-        # fallback - leaving 1x1 husks in our frame and a black picture it
-        # never recovers from. Re-anchoring the drawable and forcing
-        # libvlc fullscreen off costs nothing.
+        # A guard, and an idempotent one: hand libvlc our drawable again
+        # and turn its own fullscreen off. libvlc keeps both across
+        # set_media already (checked on 3.0.23: get_hwnd() and
+        # get_fullscreen() survive it), and nothing of ours sets its
+        # fullscreen once a drawable is set, so this re-writes values it
+        # holds. It answers a Windows field report - VLC's D3D11 output
+        # detached into a top-level window of its own - but is not shown
+        # to bring back a vout that has already gone; that needs a playing
+        # video on real Windows VLC to check.
         if self.hwnd is not None:
             self.mp.set_hwnd(self.hwnd)
             self.mp.set_fullscreen(False)
@@ -516,8 +519,8 @@ class EmbeddedPlayer(_ClosedLoop):
         Once a drawable is set the window is ours, not libvlc's, and
         whoever owns it has to resize it: on macOS libvlc accepts the
         call, reports the new state and changes nothing, and on Windows
-        its fullscreen is the way out of our window that load() guards
-        against. So the call is not made."""
+        it would move the picture out of our window into one of libvlc's
+        own. So the call is not made."""
         if self.hwnd is not None or self.nsview is not None:
             return False
         self.mp.set_fullscreen(bool(flag))

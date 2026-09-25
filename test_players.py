@@ -331,10 +331,9 @@ class AnchorInstance:
 
 def embedded_anchor():
     """Every load hands libvlc our drawable again and turns its own
-    fullscreen off: VLC's D3D11 output was seen detached into a hidden
-    top-level window of its own, never to come back. And once a drawable
-    is set, set_fullscreen reports that it does nothing rather than
-    pretend."""
+    fullscreen off - a guard only, as real libvlc keeps both across loads
+    already. And once a drawable is set, set_fullscreen reports that it
+    does nothing rather than pretend."""
     saved = players.vlc, players._tk_nsview
     try:
         # Windows: the hwnd is given to the constructor
