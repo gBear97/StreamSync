@@ -38,9 +38,10 @@ jobs:
         run: python -m pip install -r requirements.txt
 
       # Engine, capture timing, controller decisions, fingerprints, the
-      # relay and a whole watch party - none needs a sound card, a display
-      # or VLC. (test_windowctl / test_macwindowctl drive real windows and
-      # skip themselves off their platform.)
+      # relay, a whole watch party and the Mac shell's swap (over a fake
+      # Tk) - none needs a sound card, a display or VLC. (test_windowctl /
+      # test_macwindowctl drive real windows and skip themselves off their
+      # platform.)
       - name: Engine and session tests
         shell: bash
         run: |
@@ -48,7 +49,7 @@ jobs:
           for t in test_audio_capture test_players test_controller test_matcher \
                    test_audio_matcher test_fingerprint test_relay \
                    test_session test_updater test_netcerts test_diagnostics \
-                   test_windowctl; do
+                   test_macswap test_windowctl; do
             echo "=== $t"
             python "$t.py"
           done
