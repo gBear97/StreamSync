@@ -28,7 +28,9 @@ judgement - when to seek, how far, and when to leave playback alone:
   undo them, and a session that takes the playhead while auto mode is
   listening is not overruled by what auto mode then finds;
 - leaving a session, or quitting, does not wait on the relay (the UI
-  thread froze for the websocket's closing handshake);
+  thread froze for the websocket's closing handshake), though quitting
+  gives a goodbye still going out - even one from a Leave just before -
+  a moment before the player stops;
 - the time readout carries its rounding (119.96 s once read "1:60.0").
 """
 
@@ -645,17 +647,18 @@ class SlowSession:
     """A session whose stop() hangs, as a websocket closing handshake does
     when the relay has gone away - and whose stop flag only goes up once
     it is done, so a caller that relies on stop() for it is caught."""
-    def __init__(self, hang=5.0, order=None):
+    def __init__(self, hang=5.0, order=None, name="session"):
         self.stop_flag = threading.Event()
         self.hang = hang
         self.order = order if order is not None else []
+        self.name = name
         self.called = threading.Event()
 
     def stop(self):
         self.called.set()
         time.sleep(self.hang)
         self.stop_flag.set()
-        self.order.append("session")
+        self.order.append(self.name)
 
 
 def test_session_teardown_does_not_block():
@@ -685,8 +688,41 @@ def test_session_teardown_does_not_block():
     player.stop = lambda: order.append("player")
     ctl.close()
     assert order == ["session", "player"], order
+
+    # ...and so does one from a Leave just before quitting, which once
+    # found no session at quit and stopped the player under the goodbye
+    order = []
+    ctl, stream, player, clock, q = make()
+    ctl.session = SlowSession(hang=0.3, order=order)
+    player.stop = lambda: order.append("player")
+    ctl.leave()
+    ctl.close()
+    assert order == ["session", "player"], \
+        f"quitting after Leave stopped the player first: {order}"
+
+    # Leave, join another party, quit: both goodbyes go out first...
+    order = []
+    ctl, stream, player, clock, q = make()
+    ctl.session = SlowSession(hang=0.6, order=order, name="left")
+    player.stop = lambda: order.append("player")
+    ctl.leave()
+    ctl.session = SlowSession(hang=0.1, order=order, name="joined")
+    ctl.close()
+    assert order == ["joined", "left", "player"], order
+
+    # ...but two dead relays still hold quitting SESSION_CLOSE_WAIT in all
+    ctl, stream, player, clock, q = make()
+    ctl.session = SlowSession()
+    ctl.leave()
+    ctl.session = SlowSession()
+    t = time.perf_counter()
+    ctl.close()
+    took = time.perf_counter() - t
+    assert took < controller.SESSION_CLOSE_WAIT + 0.5, \
+        f"quitting after Leave waited {took:.1f} s on the relays"
     print("sessions: Leave returns at once, quitting waits "
-          f"{controller.SESSION_CLOSE_WAIT:.1f} s at most")
+          f"{controller.SESSION_CLOSE_WAIT:.1f} s at most - for a goodbye "
+          "from a Leave just before, too")
 
 
 def test_fmt_time_carries():

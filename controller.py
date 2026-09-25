@@ -141,6 +141,7 @@ class SyncController:
         self.auto_interval = 30
         self.relay_url = "ws://localhost:8765"
         self.session = None          # active HostSession / ViewerSession
+        self._closers = []           # threads stopping sessions since ended
         self._monitor_factory = monitor_factory or (
             lambda name: audio_capture.AudioMonitor("loopback", name))
         self._monitor = None
@@ -620,12 +621,14 @@ class SyncController:
             self._end_session()
 
     def _end_session(self):
-        """Stop the session in the background; returns the thread doing it.
-        Stopping says goodbye to the relay and waits out the websocket's
-        closing handshake - seconds on an unreachable relay, which is just
-        when people reach for Leave - and the shells call this on the UI
-        thread. The stop flag goes up before this returns, so the
-        session's loops (a viewer's drives the player) stand down now."""
+        """Stop the session in the background. Stopping says goodbye to
+        the relay and waits out the websocket's closing handshake - seconds
+        on an unreachable relay, which is just when people reach for Leave
+        - and the shells call this on the UI thread. The stop flag goes up
+        before this returns, so the session's loops (a viewer's drives the
+        player) stand down at their next check of it. The thread is kept
+        for close(): quitting straight after Leave must not stop the
+        player under a goodbye still going out."""
         sess, self.session = self.session, None
         sess.stop_flag.set()
 
@@ -636,7 +639,7 @@ class SyncController:
                 diagnostics.log(f"session stop failed: {e!r}")
         closer = threading.Thread(target=stop, daemon=True)
         closer.start()
-        return closer
+        self._closers = [t for t in self._closers if t.is_alive()] + [closer]
 
     # ------------------------------------------------------------ logging
 
@@ -707,10 +710,14 @@ class SyncController:
     def close(self):
         self._closing = True
         if self.session is not None:
-            # give the goodbye a moment to go out before the player stops,
-            # but a dead relay must not hold the window open for its whole
-            # close timeout
-            self._end_session().join(SESSION_CLOSE_WAIT)
+            self._end_session()
+        # give each goodbye - this session's, or one still going out from
+        # a Leave just before - a moment to go out before the player
+        # stops, but a dead relay must not hold the window open for its
+        # whole close timeout: SESSION_CLOSE_WAIT in all, not each
+        deadline = time.monotonic() + SESSION_CLOSE_WAIT
+        for closer in self._closers:
+            closer.join(max(0.0, deadline - time.monotonic()))
         if self._monitor is not None:
             self._monitor.stop()
         try:
