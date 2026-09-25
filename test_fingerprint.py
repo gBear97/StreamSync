@@ -145,8 +145,10 @@ def main():
     # could never align a stream under 5 s behind - those viewers sat on
     # the host's default_delay hint all party. A stream with next to no
     # delay can also align a little under 0 (clock sync, device latency);
-    # that reads as 0.
-    for true_delay in (0.0, 0.96, 2.07, 3.96, -0.37):
+    # that reads as 0. At -0.8 s the probe's words (9.5 s of a 10 s probe)
+    # end 0.3 s past the probe, so they fit only because the reference
+    # runs MEASURE_EARLY past its end.
+    for true_delay in (0.0, 0.96, 2.07, 3.96, -0.37, -0.8):
         probe_t0 = base_utc + 95.0 + true_delay
         d = session.measure_delay(buf, heard(95.0), SR, probe_t0)
         assert d is not None, f"delay {true_delay}: inconclusive"
