@@ -13,7 +13,8 @@ Checks the things that only show up with everything running:
   and shifted by the user's nudge;
 - a dropped host connection resumes the same room, a dropped viewer
   connection rejoins it, and the session carries on;
-- leaving stops everything (no microphone left open).
+- leaving stops everything (no microphone left open), and ends the room
+  even when the host leaves in the middle of reconnecting.
 """
 
 import os
@@ -228,9 +229,25 @@ def main():
              "voice to flow again after reconnecting")
         print("reconnect: host resumed and viewer rejoined the same room")
 
-        # leaving closes every device and ends the viewer's session
-        host.stop()
-        wait(lambda: viewer.stop_flag.is_set(), 10, "the viewer to hear it ended")
+        # leaving closes every device and ends the viewer's session - even
+        # a Leave that lands while the host is reconnecting: the resume
+        # already on its way still gets the room, on a link nothing else
+        # would close, and viewers would wait on a host that had left
+        real_send = session.Link.send
+
+        def send(link, obj):
+            real_send(link, obj)
+            if obj.get("type") == "resume":
+                session.Link.send = real_send
+                host.stop()                 # Leave, before the relay answers
+
+        session.Link.send = send
+        try:
+            host.link.ws.close()
+            wait(lambda: viewer.stop_flag.is_set(), 10,
+                 "the viewer to hear it ended")
+        finally:
+            session.Link.send = real_send
         viewer.stop()
         wait(lambda: all(getattr(d, "closed", False) for d in opened), 10,
              "every capture device to close")

@@ -432,6 +432,19 @@ class HostSession:
             self.link.close()
         self._shutdown()
 
+    def _left_while_connecting(self):
+        """True if the user left while _connect was reaching the relay.
+        stop() then said goodbye on the link before this one, or on none,
+        and the relay - which lets a resume displace a stale host socket -
+        has since given this one the room: end it here, or the room
+        outlives the session. self.link is set before this is asked, so a
+        Leave landing after it finds this link itself."""
+        if not self.stop_flag.is_set():
+            return False
+        self._send({"type": "end"})
+        self.link.close()
+        return True
+
     def _shutdown(self):
         self.stop_flag.set()
         self.clock.stop()
@@ -463,6 +476,8 @@ class HostSession:
                  "meta": {"title": self.title, "duration": duration}},
                 ("created",), self.stop_flag, time.monotonic() + 20)
             self.code, self.token = msg["code"], msg.get("token")
+            if self._left_while_connecting():
+                return
             self._say(f"Session live - code {self.code}. Waiting for viewers.")
 
             # publish the film fingerprint for verification (cached by relay)
@@ -510,6 +525,8 @@ class HostSession:
                     except RuntimeError as e:
                         self._say(f"Relay connection lost ({e}). "
                                   "Session ended.")
+                        break
+                    if self._left_while_connecting():
                         break
                     self._say(f"Session {self.code} - reconnected.")
         except Exception as e:
@@ -667,6 +684,16 @@ class ViewerSession:
             self.link.close()
         self._shutdown()
 
+    def _left_while_connecting(self):
+        """True if the user left while a join was reaching the relay: stop()
+        closed the link before this one, or none, so close this one too.
+        self.link is set before this is asked, so a Leave landing after
+        it finds this link itself."""
+        if not self.stop_flag.is_set():
+            return False
+        self.link.close()
+        return True
+
     def _shutdown(self):
         self.stop_flag.set()
         self.clock.stop()
@@ -696,6 +723,8 @@ class ViewerSession:
                 self.link, _ = self._join(time.monotonic() + 20)
             except RuntimeError as e:
                 self._say(f"Could not join: {e}")
+                return
+            if self._left_while_connecting():
                 return
             threading.Thread(target=self._recv_loop, daemon=True).start()
 
@@ -772,6 +801,8 @@ class ViewerSession:
                     self._say("Relay connection lost - reconnecting...")
                     try:
                         self.link, _ = self._join(time.monotonic() + RECONNECT_FOR)
+                        if self._left_while_connecting():
+                            break
                         self._say("Reconnected. Following the session.")
                     except RuntimeError as e:
                         self._say(f"Relay connection lost ({e}).")
