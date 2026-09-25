@@ -13,7 +13,9 @@ instead of stalling the room.
 
 A host whose connection drops keeps its room for --host-grace seconds
 (viewers are told the host is away) and can reclaim it with the token it
-was given at creation. A host that means to leave says "end".
+was given at creation - also before the relay has noticed the old
+connection is dead, which the token displaces. A host that means to
+leave says "end".
 """
 
 import argparse
@@ -34,6 +36,7 @@ CODE_ALPHABET = string.ascii_uppercase + "23456789"  # no 0/O/1/I
 _CHUNK_KEY = re.compile(r"fp_chunk_(\d+)$")
 
 rooms = {}  # code -> Room
+closing = set()  # close handshakes of displaced host sockets, in flight
 
 
 class Room:
@@ -93,6 +96,16 @@ async def expire(room, grace):
         end_room(room)
 
 
+def drop(ws):
+    """Close a displaced host socket without waiting for it. A dead peer
+    never answers the close handshake, so awaiting it would hold up the
+    new host's resume for the whole close timeout (10 s) - as long as the
+    client waits for that reply before giving up on the attempt."""
+    task = asyncio.ensure_future(ws.close())
+    closing.add(task)                  # the loop only holds tasks weakly
+    task.add_done_callback(closing.discard)
+
+
 async def handle(ws, grace=HOST_GRACE):
     role, room = None, None
     try:
@@ -126,14 +139,21 @@ async def handle(ws, grace=HOST_GRACE):
                 if r is None or not secrets.compare_digest(
                         str(msg.get("token", "")), r.token):
                     await send(ws, {"type": "error", "reason": "cannot resume"})
-                elif r.host is not None:
-                    await send(ws, {"type": "error", "reason": "host connected"})
                 else:
-                    room, role = r, "host"
+                    # A host socket still registered here is stale: the
+                    # host has reconnected, typically after a blip left the
+                    # old one half-open, which keepalive takes 40 s to
+                    # notice. Refusing would end the session (the client
+                    # treats any error as fatal), so the token displaces
+                    # it. Rebind first, so the old handler's finally sees
+                    # room.host is not its socket and leaves the room be.
+                    old, room, role = r.host, r, "host"
                     room.host = ws
                     if room.expiry:
                         room.expiry.cancel()
                         room.expiry = None
+                    if old is not None:
+                        drop(old)
                     await send(ws, {"type": "resumed", "code": room.code})
                     broadcast(room, json.dumps({"type": "host_back"}))
                     await send(ws, {"type": "viewers", "n": len(room.viewers)})
