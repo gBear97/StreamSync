@@ -530,7 +530,7 @@ class SyncController:
         result wins over whatever auto mode found. So does a watch party
         that took the playhead while auto mode was listening: the loop
         only checks for one between passes, and a pass listens for up to
-        12 s."""
+        8 s, matching after each look, before it acts."""
         return self._busy or self._gen != gen or self.session_running()
 
     def _auto_failed(self, state, e):
