@@ -19,7 +19,8 @@ thread each System Events round trip ran on. What is tested:
 - the osascript round trips never run on the Tk thread (each can block
   for seconds - the first waits on the Automation prompt - and pausing
   used to freeze the UI for that long), and the browser is looked up
-  once, not on every swap;
+  once, not on every swap - again only once a swap with it has failed
+  (it may have quit) or another Stream App is picked;
 - a rapid pause/resume/pause only plays out the state it settled on;
 - the fullscreen debt survives swaps that overlap, however their
   results interleave with new pauses;
@@ -215,6 +216,8 @@ class Osascript:
     Calls take `delay` seconds, like System Events does; `hold` (an Event)
     keeps activate_app waiting until the test releases it - bounded, so a
     shell that waits for it on the Tk thread fails instead of hanging.
+    An app that is not in `apps` cannot be activated or hidden, as an app
+    that has quit cannot.
     """
     def __init__(self, apps=("Finder", "Safari")):
         self.apps = list(apps)
@@ -234,6 +237,9 @@ class Osascript:
             time.sleep(self.delay)
         if name in self.fail:
             raise RuntimeError("Not authorized to send Apple events")
+        if name in ("activate_app", "hide_app") and arg not in self.apps:
+            # System Events addresses an application process by name
+            raise RuntimeError(f"Can't get application process \"{arg}\".")
 
     def list_gui_apps(self):
         self._run("list_gui_apps")
@@ -594,6 +600,44 @@ def test_swap_runs_off_the_tk_thread():
     print("swap: osascript runs off the Tk thread, browser looked up once")
 
 
+def activated(mac):
+    return [arg for name, arg, _ in mac.calls if name == "activate_app"]
+
+
+def test_browser_is_looked_up_again():
+    # the browser found and remembered quits, and another one is open
+    app, mac = make()
+    app._stream_swap(True)
+    assert pump(app, lambda: app._swapped)
+    app._stream_swap(False)
+    assert pump(app, lambda: not app._swapped)
+    mac.apps = ["Finder", "Google Chrome"]
+    app._stream_swap(True)              # Safari has gone: this one fails
+    assert settled(app, 3) and "App swap failed" in status(app), status(app)
+    app._stream_swap(True)              # ...and the next one looks again
+    assert pump(app, lambda: app._swapped), \
+        f"a browser that quit was kept after its swap failed: {activated(mac)}"
+    assert activated(mac) == ["Safari", "Safari", "Google Chrome"]
+    assert mac.names().count("list_gui_apps") == 2, mac.names()
+
+    # a Stream App picked by hand replaces the browser found automatically
+    app, mac = make(apps=("Finder", "Safari", "Google Chrome"))
+    app._stream_swap(True)
+    assert pump(app, lambda: app._swapped)
+    app._stream_swap(False)
+    assert pump(app, lambda: not app._swapped)
+    app.streamapp_var.set("Google Chrome")
+    app._on_streamapp_pick()
+    # (the pick wins over the remembered browser anyway; this is that
+    # nothing found under the old choice outlives it)
+    assert app._swap_app == "", \
+        f"the browser found automatically outlived the pick: {app._swap_app}"
+    app._stream_swap(True)
+    assert pump(app, lambda: app._swapped)
+    assert activated(mac) == ["Safari", "Google Chrome"], activated(mac)
+    print("swap: a browser that quit, or a new pick, is looked up again")
+
+
 def test_rapid_toggles_collapse():
     app, mac = make()
     mac.hold = threading.Event()
@@ -748,6 +792,7 @@ def main():
     test_failed_swap_is_not_rerun_by_every_sync()
     test_refused_swap_leaves_things_as_they_were()
     test_swap_runs_off_the_tk_thread()
+    test_browser_is_looked_up_again()
     test_rapid_toggles_collapse()
     test_fullscreen_debt_survives_overlapping_swaps()
     test_worker_stops_before_the_controller_closes()
