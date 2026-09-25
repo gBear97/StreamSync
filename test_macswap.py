@@ -564,7 +564,7 @@ def test_browser_is_looked_up_again():
     assert pump(app, lambda: not app._swapped)
     mac.apps = ["Finder", "Google Chrome"]
     app._stream_swap(True)              # Safari has gone: this one fails
-    assert pump(app, lambda: "App swap failed" in status(app)), status(app)
+    assert settled(app, 3) and "App swap failed" in status(app), status(app)
     app._stream_swap(True)              # ...and the next one looks again
     assert pump(app, lambda: app._swapped), \
         f"a browser that quit was kept after its swap failed: {activated(mac)}"
