@@ -48,7 +48,7 @@ class MacApp:
         self.fullscreen = False
         self.stream_app = ""
         self._swapped = False
-        self._was_fullscreen = False
+        self._was_fullscreen = False  # we owe the user fullscreen back
         self._preview_photo = None
 
         root.title(f"StreamSync {__version__}")
@@ -642,17 +642,22 @@ class MacApp:
 
     def _toggle_fullscreen(self):
         if self.player is self.player_backend:
-            self.fullscreen = not self.fullscreen
-            if self.player_backend.embedded:
-                # The video lives in our own window now, so fullscreen is
-                # the window's, not libvlc's - set_fullscreen only works
-                # on a window libvlc itself owns.
-                self.video_win.deiconify()
-                self.video_win.attributes("-fullscreen", self.fullscreen)
-            else:
-                self.player_backend.set_fullscreen(self.fullscreen)
+            self._set_fullscreen(not self.fullscreen)
         else:
             self.external.fullscreen_toggle()
+
+    def _set_fullscreen(self, flag):
+        """Fullscreen for the built-in player - the one way in or out, so
+        self.fullscreen always says what the screen shows."""
+        self.fullscreen = bool(flag)
+        if self.player_backend.embedded:
+            # The video lives in our own window now, so fullscreen is
+            # the window's, not libvlc's - set_fullscreen only works
+            # on a window libvlc itself owns.
+            self.video_win.deiconify()
+            self.video_win.attributes("-fullscreen", self.fullscreen)
+        else:
+            self.player_backend.set_fullscreen(self.fullscreen)
 
     # ---------------------------------------------------- hosted sessions
 
@@ -813,25 +818,34 @@ class MacApp:
             return
         try:
             if show:
-                self._was_fullscreen = self.fullscreen
                 if self.player is self.player_backend and self.fullscreen:
-                    self.player_backend.set_fullscreen(False)
-                    self.fullscreen = False
+                    # Leave fullscreen before the browser is raised: a
+                    # fullscreen window would keep it behind the film. The
+                    # flag means "we owe the user fullscreen back", so it
+                    # is only ever set when we actually take it away.
+                    self._was_fullscreen = True
+                    self._set_fullscreen(False)
                 macwindowctl.activate_app(app_name)
                 self._swapped = True
             else:
                 macwindowctl.hide_app(app_name)
                 if self.player is self.player_backend:
                     macwindowctl.activate_self()
-                    if self._was_fullscreen:
-                        self.player_backend.set_fullscreen(True)
-                        self.fullscreen = True
                 else:
                     macwindowctl.activate_app("VLC")
                 self._swapped = False
+                self._repay_fullscreen()
         except Exception as e:
             self._set_status(f"App swap failed: {e} (grant Automation "
                              "permission in System Settings > Privacy).")
+            # A browser that never came up, or a film the user resumed:
+            # either way nothing else will hand fullscreen back.
+            self._repay_fullscreen()
+
+    def _repay_fullscreen(self):
+        if self._was_fullscreen and self.player is self.player_backend:
+            self._was_fullscreen = False   # debt paid
+            self._set_fullscreen(True)
 
     # ------------------------------------------------------------ subtitles
 
