@@ -1,12 +1,17 @@
 """End-to-end relay test on localhost: rooms, passwords, caching for late
 joiners, host->viewer broadcast, viewer->host routing, malformed input,
-a host reconnecting with its token, and both ways a session ends."""
+a host reconnecting with its token (also over its own stale socket), and
+both ways a session ends."""
 
+import base64
 import json
+import os
+import socket
 import subprocess
 import sys
 import time
 
+from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect as _connect
 
 PORT = 8899
@@ -23,6 +28,28 @@ def send(ws, obj):
 
 def recv(ws, timeout=5):
     return json.loads(ws.recv(timeout=timeout))
+
+
+def quiet_link(obj):
+    """A connection that goes quiet the way a half-open one does: it opens,
+    sends `obj`, and never reads again - so it never answers the relay's
+    close handshake. Raw socket, because a websockets client answers it."""
+    s = socket.create_connection(("127.0.0.1", PORT), timeout=5)
+    key = base64.b64encode(os.urandom(16)).decode()
+    s.sendall((f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\n"
+               "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+               f"Sec-WebSocket-Key: {key}\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+    reply = b""
+    while b"\r\n\r\n" not in reply:
+        reply += s.recv(1024)
+    assert b" 101 " in reply.split(b"\r\n")[0], reply
+    data = json.dumps(obj).encode()
+    assert len(data) < 126                   # one-byte length, masked text
+    mask = os.urandom(4)
+    s.sendall(bytes([0x81, 0x80 | len(data)]) + mask
+              + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+    return s
 
 
 def main():
@@ -115,6 +142,61 @@ def main():
                     "utc": 163.0, "playing": True, "default_delay": 9})
         assert recv(viewer)["seq"] == 3
         print("host reconnect: away -> resumed with token (not without)")
+
+        # a host can reconnect while the relay still holds its old socket -
+        # half-open after a network blip, which keepalive takes 40 s to
+        # notice. The session ends on any refusal, so the token displaces
+        # that socket; a wrong token is still refused.
+        thief = connect(URL)
+        send(thief, {"type": "resume", "code": code, "token": "guess"})
+        assert recv(thief) == {"type": "error", "reason": "cannot resume"}
+        thief.close()
+        stale = host
+        host = connect(URL)
+        send(host, {"type": "resume", "code": code, "token": token})
+        got = recv(host)
+        assert got["type"] == "resumed", f"resume over a live socket: {got}"
+        assert recv(viewer)["type"] == "host_back"
+        assert recv(host) == {"type": "viewers", "n": 1}
+        try:
+            got = recv(stale)
+            raise AssertionError(f"displaced socket still open: {got}")
+        except TimeoutError:
+            raise AssertionError("the relay never closed the displaced socket")
+        except ConnectionClosed:
+            pass
+        time.sleep(0.3)                      # its handler has exited
+        send(host, {"type": "state", "ck": "state", "seq": 4, "pos": 150.0,
+                    "utc": 173.0, "playing": True, "default_delay": 9})
+        got = recv(viewer)
+        assert got.get("seq") == 4, got      # no host_away from the old one
+        print("stale host socket: displaced by its token, and closed")
+
+        # ...and one that never answers the relay's close must not hold up
+        # the resume: a client gives up on an attempt after 10 s, which is
+        # also the relay's close timeout
+        quiet = quiet_link({"type": "resume", "code": code, "token": token})
+        assert recv(viewer)["type"] == "host_back"    # quiet holds the room
+        host.close()
+        host = connect(URL)
+        send(host, {"type": "resume", "code": code, "token": token})
+        try:
+            got = recv(host, timeout=3)
+        except TimeoutError:
+            raise AssertionError("resume waited on the dead socket's close")
+        assert got["type"] == "resumed", got
+        assert recv(viewer)["type"] == "host_back"
+        assert recv(host) == {"type": "viewers", "n": 1}
+        quiet.sendall(bytes([0x88, 0x80]) + os.urandom(4))  # answer at last
+        while quiet.recv(4096):              # until the relay hangs up
+            pass
+        quiet.close()
+        time.sleep(0.3)
+        send(host, {"type": "state", "ck": "state", "seq": 5, "pos": 160.0,
+                    "utc": 183.0, "playing": True, "default_delay": 9})
+        got = recv(viewer)
+        assert got.get("seq") == 5, got
+        print("unresponsive host socket: displaced without waiting on it")
 
         # a late joiner after all that: cache holds only the known keys
         late = connect(URL)
