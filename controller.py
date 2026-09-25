@@ -562,8 +562,9 @@ class SyncController:
         state.update(fail_sig=sig, fail_n=n)
         if n == 1:
             self._say(f"Auto-resync check failed: {e}")
-            diagnostics.log_block("auto re-sync check failed:",
-                                  "".join(traceback.format_exception(e)))
+            # the three-argument form: Python 3.9 has no one-argument one
+            diagnostics.log_block("auto re-sync check failed:", "".join(
+                traceback.format_exception(type(e), e, e.__traceback__)))
         elif n < AUTO_FAIL_GIVEUP:
             diagnostics.log(f"auto re-sync check failed again "
                             f"({n}/{AUTO_FAIL_GIVEUP}): {sig[0]}: {e}")
