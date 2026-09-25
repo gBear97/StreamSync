@@ -989,6 +989,10 @@ class MacApp:
 
 def main():
     root = tk.Tk()
+    # A windowed build has no console: without these, an exception on a
+    # worker thread or in a Tk callback leaves no trace anywhere.
+    diagnostics.install_excepthook()
+    diagnostics.install_tk_hook(root)
     MacApp(root)
     # Same exposure the first-run dialog had: launched from Finder this
     # window can come up titled but unpainted until something forces a draw.

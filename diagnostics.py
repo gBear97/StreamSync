@@ -28,6 +28,7 @@ import os
 import platform
 import subprocess
 import sys
+import threading
 import time
 import traceback
 
@@ -435,20 +436,63 @@ def log_report(reason=""):
 
 # --- crashes ------------------------------------------------------------
 
+def _log_exception(title, exc_type, exc, tb):
+    try:
+        log_block(title,
+                  "".join(traceback.format_exception(exc_type, exc, tb)))
+    except Exception:
+        pass
+
+
 def install_excepthook():
     """An uncaught exception in a windowed build vanishes silently. This
-    is the only reason such a crash leaves any trace at all."""
-    previous = sys.excepthook
+    is the only reason such a crash leaves any trace at all.
 
-    def hook(exc_type, exc, tb):
-        try:
-            log_block("UNCAUGHT EXCEPTION:",
-                      "".join(traceback.format_exception(exc_type, exc, tb)))
-        except Exception:
-            pass
-        previous(exc_type, exc, tb)
+    Most of the app's work - listening, matching, seeking, the watch
+    party - runs on worker threads, and an exception there never reaches
+    sys.excepthook: threads have a hook of their own, which by default
+    prints to the stderr a windowed build does not have. So both.
 
-    sys.excepthook = hook
+    Each hook passes the exception on to the one it replaced, and a
+    second call changes nothing: streamsync.py installs these before the
+    dependency gate, and each shell again for a direct launch."""
+    if not getattr(sys.excepthook, "_streamsync", False):
+        previous = sys.excepthook
+
+        def hook(exc_type, exc, tb):
+            _log_exception("UNCAUGHT EXCEPTION:", exc_type, exc, tb)
+            previous(exc_type, exc, tb)
+
+        hook._streamsync = True
+        sys.excepthook = hook
+
+    if not getattr(threading.excepthook, "_streamsync", False):
+        previous_thread = threading.excepthook
+
+        def thread_hook(args):
+            # SystemExit is how a thread quits on purpose; the default
+            # hook stays silent about it, and so does this one.
+            if args.exc_type is not SystemExit:
+                name = args.thread.name if args.thread else "?"
+                _log_exception(f"UNCAUGHT EXCEPTION in thread {name!r}:",
+                               args.exc_type, args.exc_value,
+                               args.exc_traceback)
+            previous_thread(args)
+
+        thread_hook._streamsync = True
+        threading.excepthook = thread_hook
+
+
+def install_tk_hook(root):
+    """Tk catches an exception raised in a callback - a button, a menu
+    item, an after() - prints it to stderr and carries on. In a windowed
+    build that leaves a control that silently did nothing and no trace of
+    why. Log it instead (log_block still echoes it to a Terminal)."""
+    def report(exc_type, exc, tb):
+        _log_exception("UNCAUGHT EXCEPTION in a Tk callback:",
+                       exc_type, exc, tb)
+
+    root.report_callback_exception = report
 
 
 def log_session_start():

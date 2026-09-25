@@ -25,6 +25,7 @@ from PIL import Image, ImageTk
 import audio_capture
 import capture
 import controller
+import diagnostics
 import windowctl
 from controller import fmt_time
 from players import EmbeddedPlayer, VLCError
@@ -862,6 +863,10 @@ def main():
     except Exception:
         pass
     root = tk.Tk()
+    # A windowed build has no console: without these, an exception on a
+    # worker thread or in a Tk callback leaves no trace anywhere.
+    diagnostics.install_excepthook()
+    diagnostics.install_tk_hook(root)
     App(root)
     if "--selftest" in sys.argv:
         root.after(3000, root.destroy)
