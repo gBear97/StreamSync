@@ -884,11 +884,12 @@ class MacApp:
                 # nothing was raised, and nothing we can reach is up
                 self.q.put(("swapdone", seq, show, False, False))
                 continue
-            # Where the stream app stands until this swap moves it. A
-            # refused activate_app raised nothing - at most it unhid the
-            # browser, and the film stays in front - and a refused hide
-            # leaves it up.
-            shown = not show
+            # Where this swap left the stream app; None until a call goes
+            # through. A refused call moved nothing - a refused activate_app
+            # raised nothing (at most it unhid the browser, and the film
+            # stays in front), and a refused hide leaves it where the last
+            # swap left it - so it stands as it was.
+            shown = None
             try:
                 if show:
                     macwindowctl.activate_app(app_name)
@@ -911,8 +912,9 @@ class MacApp:
 
     def _swap_done(self, seq, show, ok, shown):
         """Tk thread: settle a swap the worker has finished with. `shown`
-        says whether it left the stream app up."""
-        self._swapped = shown
+        says whether it left the stream app up (None: as it was)."""
+        if shown is not None:
+            self._swapped = shown
         if seq != self._swap_seq:
             # A newer swap is already on its way and settles the film when
             # it lands. Giving fullscreen back now would put the film over

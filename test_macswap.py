@@ -532,6 +532,55 @@ def test_failed_swap_is_not_rerun_by_every_sync():
     print("failed swap: not run again by every sync, whose result stays up")
 
 
+def test_refused_swap_leaves_things_as_they_were():
+    # The first pause sits on the Automation prompt, and the stream
+    # resumes - or a sync lands - before the user answers Don't Allow.
+    # Nothing was raised, so the resume's refused hide left nothing up
+    # either, and the syncs after it have nothing to hide
+    app, mac = make()
+    app.stream_app = "Safari"
+    mac.fail = set(REFUSED)
+    mac.hold = threading.Event()        # the prompt is up
+    app._stream_swap(True)
+    assert mac.started.wait(2.0)
+    app._stream_swap(False)             # resumed before it is answered
+    mac.hold.set()                      # Don't Allow
+    assert settled(app, 2), app.results
+    tried = mac.names()
+    for _ in range(3):
+        sync_applied(app)
+        idle(app, 0.1)
+        assert status(app) == MATCHED, \
+            f"a pause refused after the resume was sent left every sync " \
+            f"rerunning the hide: {status(app)}"
+    idle(app)
+    assert mac.names() == tried, mac.names()
+
+    # A browser we raised quits during the pause: the resume's hide fails,
+    # the next sync finds no browser at all, and that settles on nothing
+    # being up - so a browser opened later for something else is neither
+    # looked for by every sync nor hidden by one
+    app, mac = make()
+    app._stream_swap(True)
+    assert pump(app, lambda: app._swapped), mac.names()
+    mac.apps = ["Finder"]               # Safari quit during the pause
+    sync_applied(app)
+    assert settled(app, 2) and "App swap failed" in status(app), status(app)
+    sync_applied(app)                   # no browser to find
+    idle(app)
+    tried = mac.names()
+    for _ in range(3):
+        sync_applied(app)
+        idle(app, 0.1)
+    mac.apps = ["Finder", "Google Chrome"]
+    sync_applied(app)
+    idle(app)
+    assert mac.names() == tried, \
+        f"a sync went looking for a browser it never raised: " \
+        f"{mac.names()[len(tried):]}"
+    print("failed swap: a refused call leaves the stream app where it was")
+
+
 def test_swap_runs_off_the_tk_thread():
     app, mac = make()
     mac.delay = 0.3                     # System Events on a good day
@@ -741,6 +790,7 @@ def main():
     test_fullscreen_goes_through_the_film_window()
     test_failed_swap_gives_fullscreen_back()
     test_failed_swap_is_not_rerun_by_every_sync()
+    test_refused_swap_leaves_things_as_they_were()
     test_swap_runs_off_the_tk_thread()
     test_browser_is_looked_up_again()
     test_rapid_toggles_collapse()
