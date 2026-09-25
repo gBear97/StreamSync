@@ -207,6 +207,10 @@ try:
         ok("naming the thread it killed", "'audio-worker'" in body)
         check("and is still passed on to the previous thread hook",
               [a.exc_type for a in thread_chained], [RuntimeError])
+        # The hooks went in twice above, and a worker crash must not be
+        # logged twice either.
+        check("a worker crash is logged once",
+              body.count("RuntimeError: worker boom"), 1)
 
         # A thread quitting on purpose is not a crash.
         quitter = threading.Thread(target=sys.exit, name="quitter")
