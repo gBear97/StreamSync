@@ -139,7 +139,10 @@ for key in ("streamsync", "frozen", "process_arch", "translocated", "log"):
 
 # --- the log -------------------------------------------------------------
 saved_dir, saved_file = diagnostics.LOG_DIR, diagnostics.LOG_FILE
-tmp = tempfile.mkdtemp()
+# Several MB of logs go in here, and must not outlive the run: removed at
+# the end, or when the interpreter exits if a check crashes first.
+tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+tmp = tmp_dir.name
 try:
     diagnostics.LOG_DIR = tmp
     diagnostics.LOG_FILE = os.path.join(tmp, "streamsync.log")
@@ -403,13 +406,19 @@ try:
     ok("and how the app was launched",
        bool(start) and f"args {sys.argv[1:]}" in start[0])
 
-    # A read-only log directory must not take the app down with it.
-    diagnostics.LOG_FILE = "/nonexistent/nowhere/streamsync.log"
-    diagnostics.LOG_DIR = "/nonexistent/nowhere"
+    # A log directory that cannot be written must not take the app down
+    # with it. A file where the directory should be refuses everyone,
+    # where a made-up path does not: Windows lets a user create
+    # \nonexistent\nowhere at the root of the drive, and the log with it.
+    blocker = os.path.join(tmp, "not-a-folder")
+    open(blocker, "w").close()
+    diagnostics.LOG_DIR = os.path.join(blocker, "nowhere")
+    diagnostics.LOG_FILE = os.path.join(diagnostics.LOG_DIR, "streamsync.log")
     try:
         diagnostics.log("this cannot be written")
     except Exception as e:
         fails.append(f"log raised when it could not write: {e!r}")
+    ok("where it really could not", not os.path.exists(diagnostics.LOG_FILE))
 finally:
     diagnostics.LOG_DIR, diagnostics.LOG_FILE = saved_dir, saved_file
 
@@ -468,6 +477,7 @@ try:
        and "no-such-folder" in failed)
 finally:
     diagnostics.LOG_DIR, diagnostics.LOG_FILE, controller.CONFIG_PATH = saved
+    tmp_dir.cleanup()
 
 # --- probing must never be what breaks the app ---------------------------
 # It runs while diagnosing an already-broken machine, so every part of it
