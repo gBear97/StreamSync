@@ -24,10 +24,12 @@ where the environment is already broken.
 """
 
 import ctypes
+import logging
 import os
 import platform
 import subprocess
 import sys
+import threading
 import time
 import traceback
 
@@ -40,7 +42,10 @@ else:
     LOG_DIR = os.path.expanduser("~/.streamsync")
 LOG_FILE = os.path.join(LOG_DIR, "streamsync.log")
 
-MAX_LOG_BYTES = 1_000_000
+# Room for the detail a field run needs: the live log up to 2 MB, and
+# three older ones beside it (streamsync.log.1 is the newest).
+MAX_LOG_BYTES = 2_000_000
+LOG_BACKUPS = 3
 
 VLC_DYLIB_CANDIDATES = [
     "/Applications/VLC.app/Contents/MacOS/lib/libvlc.dylib",
@@ -62,32 +67,90 @@ def _run(cmd, timeout=10):
 
 # --- the log ------------------------------------------------------------
 
+_write_lock = threading.Lock()
+
+# A rotation that cannot happen - on Windows, while another program holds
+# one of the logs open without delete sharing, as a Python open() or .NET's
+# File.OpenRead does - is tried again once the log has grown this much
+# more, rather than on every line.
+ROTATE_RETRY_BYTES = 64_000
+_rotate_retry = (None, 0)  # (log file, size it must reach first)
+
+
+def _shift_aside():
+    """streamsync.log -> .1 -> .2 -> .3, the oldest dropped; True if done.
+
+    Any of those renames can fail, and a failed rotation must lose
+    nothing, whichever log would not move. So nothing is written over
+    until every log that moves has first been renamed aside, to its own
+    name plus ".rotating". If one will not go, those already aside go
+    back and nothing has changed. Once all are aside, the oldest is
+    dropped and the rest take their new names, every one of them free by
+    then. A missing old log ends the shift: nothing lands on the ones
+    beyond it, so they stay."""
+    names = [LOG_FILE] + [f"{LOG_FILE}.{n}" for n in range(1, LOG_BACKUPS + 1)]
+    aside = []
+    for name in names:
+        try:
+            os.replace(name, name + ".rotating")
+        except FileNotFoundError:
+            break
+        except OSError:
+            for moved in reversed(aside):
+                try:
+                    os.replace(moved + ".rotating", moved)
+                except OSError:
+                    pass
+            return False
+        aside.append(name)
+    if len(aside) == len(names):
+        try:
+            os.remove(aside.pop() + ".rotating")  # the oldest
+        except OSError:
+            pass
+    for n in range(len(aside), 0, -1):  # oldest first
+        try:
+            os.replace(aside[n - 1] + ".rotating", names[n])
+        except OSError:
+            pass
+    return True
+
+
 def _rotate():
+    global _rotate_retry
     try:
-        if os.path.getsize(LOG_FILE) < MAX_LOG_BYTES:
-            return
+        size = os.path.getsize(LOG_FILE)
     except OSError:
         return
-    try:
-        os.replace(LOG_FILE, LOG_FILE + ".1")
-    except OSError:
-        pass
+    if size < MAX_LOG_BYTES:
+        return
+    if _rotate_retry[0] == LOG_FILE and size < _rotate_retry[1]:
+        return  # it failed a moment ago; this line goes on the end
+    if _shift_aside():
+        _rotate_retry = (None, 0)
+    else:
+        _rotate_retry = (LOG_FILE, size + ROTATE_RETRY_BYTES)
 
 
-def log(message):
-    """Append one timestamped line. Also to stderr, which a `open -a`
-    launch discards but a Terminal launch shows."""
+def log(message, echo=True):
+    """Append one timestamped line. Also to stderr (unless echo is
+    False), which a `open -a` launch discards but a Terminal launch
+    shows."""
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     line = f"{stamp}  {message}"
+    if echo:
+        try:
+            sys.stderr.write(line + "\n")
+        except Exception:
+            pass
     try:
-        sys.stderr.write(line + "\n")
-    except Exception:
-        pass
-    try:
-        os.makedirs(LOG_DIR, exist_ok=True)
-        _rotate()
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        # Worker threads log too, and two of them rotating at once would
+        # push every backup down twice.
+        with _write_lock:
+            os.makedirs(LOG_DIR, exist_ok=True)
+            _rotate()
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
     except OSError:
         pass  # a log we cannot write is not worth crashing over
 
@@ -96,6 +159,39 @@ def log_block(title, text):
     """Log a multi-line block, indented so it reads as one entry."""
     body = "\n".join("    " + ln for ln in str(text).splitlines())
     log(f"{title}\n{body}")
+
+
+class LogHandler(logging.Handler):
+    """Python logging, into this same file.
+
+    log() is the app's own voice, one line at a time; a module that wants
+    levels, logger names and exc_info tracebacks reaches for `logging`
+    instead. Both land here - one file, one rotation - rather than in a
+    second log nobody knows to look for. DEBUG goes to the file only: it
+    is what a field run needs, and noise on a Terminal."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFormatter(logging.Formatter(
+            "%(levelname)s %(name)s: %(message)s"))
+
+    def emit(self, record):
+        try:
+            first, *rest = self.format(record).splitlines() or [""]
+            log("\n".join([first] + ["    " + ln for ln in rest]),
+                echo=record.levelno >= logging.INFO)
+        except Exception:
+            self.handleError(record)
+
+
+def install_log_handler():
+    """Send the "streamsync" logger family (streamsync.controller and
+    the like) to this log, DEBUG and up. Safe to call more than once."""
+    logger = logging.getLogger("streamsync")
+    if not any(isinstance(h, LogHandler) for h in logger.handlers):
+        logger.addHandler(LogHandler())
+    logger.setLevel(logging.DEBUG)
+    return logger
 
 
 # --- what this build is -------------------------------------------------
@@ -435,27 +531,76 @@ def log_report(reason=""):
 
 # --- crashes ------------------------------------------------------------
 
+def _log_exception(title, exc_type, exc, tb):
+    try:
+        log_block(title,
+                  "".join(traceback.format_exception(exc_type, exc, tb)))
+    except Exception:
+        pass
+
+
 def install_excepthook():
     """An uncaught exception in a windowed build vanishes silently. This
-    is the only reason such a crash leaves any trace at all."""
-    previous = sys.excepthook
+    is the only reason such a crash leaves any trace at all.
 
-    def hook(exc_type, exc, tb):
-        try:
-            log_block("UNCAUGHT EXCEPTION:",
-                      "".join(traceback.format_exception(exc_type, exc, tb)))
-        except Exception:
-            pass
-        previous(exc_type, exc, tb)
+    Most of the app's work - listening, matching, seeking, the watch
+    party - runs on worker threads, and an exception there never reaches
+    sys.excepthook: threads have a hook of their own, which by default
+    prints to the stderr a windowed build does not have. So both.
 
-    sys.excepthook = hook
+    Each hook passes the exception on to the one it replaced, and a
+    second call changes nothing: streamsync.py installs these before the
+    dependency gate, and each shell again for a direct launch. Python
+    logging's "streamsync" loggers are routed into the log here too, so
+    the tracebacks they carry are not lost either."""
+    install_log_handler()
+    if not getattr(sys.excepthook, "_streamsync", False):
+        previous = sys.excepthook
+
+        def hook(exc_type, exc, tb):
+            _log_exception("UNCAUGHT EXCEPTION:", exc_type, exc, tb)
+            previous(exc_type, exc, tb)
+
+        hook._streamsync = True
+        sys.excepthook = hook
+
+    if not getattr(threading.excepthook, "_streamsync", False):
+        previous_thread = threading.excepthook
+
+        def thread_hook(args):
+            # SystemExit is how a thread quits on purpose; the default
+            # hook stays silent about it, and so does this one.
+            if args.exc_type is not SystemExit:
+                name = args.thread.name if args.thread else "?"
+                _log_exception(f"UNCAUGHT EXCEPTION in thread {name!r}:",
+                               args.exc_type, args.exc_value,
+                               args.exc_traceback)
+            previous_thread(args)
+
+        thread_hook._streamsync = True
+        threading.excepthook = thread_hook
+
+
+def install_tk_hook(root):
+    """Tk catches an exception raised in a callback - a button, a menu
+    item, an after() - prints it to stderr and carries on. In a windowed
+    build that leaves a control that silently did nothing and no trace of
+    why. Log it instead (log_block still echoes it to a Terminal)."""
+    def report(exc_type, exc, tb):
+        _log_exception("UNCAUGHT EXCEPTION in a Tk callback:",
+                       exc_type, exc, tb)
+
+    root.report_callback_exception = report
 
 
 def log_session_start():
     log("=" * 60)
     d = describe()
+    # The OS by name and build: describe() only knows the macOS version,
+    # which leaves a Windows log unable to say what it ran on.
     log(f"StreamSync {d['streamsync']} starting "
-        f"({d['process_arch']}, frozen={d['frozen']}, python {d['python']})")
+        f"({d['process_arch']}, frozen={d['frozen']}, python {d['python']}, "
+        f"{platform.platform()}, args {sys.argv[1:]})")
     if d["translocated"]:
         log("NOTE: running translocated - the app has not been moved out "
             "of the disk image, so macOS is running a shadow copy.")

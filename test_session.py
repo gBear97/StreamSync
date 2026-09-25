@@ -8,12 +8,13 @@ clock. Internet time is skipped (both ends share this machine's clock).
 
 Checks the things that only show up with everything running:
 - the viewer verifies its copy and measures the stream delay from the
-  host's voice, to within tens of milliseconds;
+  host's voice, to within tens of milliseconds, at production settings;
 - the viewer's player follows the host's timeline, delayed by that delay
   and shifted by the user's nudge;
 - a dropped host connection resumes the same room, a dropped viewer
   connection rejoins it, and the session carries on;
-- leaving stops everything (no microphone left open).
+- leaving stops everything (no microphone left open), and ends the room
+  even when the host leaves in the middle of reconnecting.
 """
 
 import os
@@ -166,9 +167,9 @@ def main():
 
     session.audio_capture.AudioMonitor = monitor
     session.SharedClock = LocalClock
-    session.MEASURE_LOOKBACK = 20.0
-    session.MEASURE_SECONDS = 6.0
-    session.MEASURE_INTERVAL = 7.0
+    # MEASURE_* stay at production values: a shorter probe and look-back
+    # here once hid that no viewer under ~5 s behind, or in its first
+    # ~80 s of a session, ever measured its delay
     session.VERIFY_WINDOW = 20.0
 
     relay = subprocess.Popen([sys.executable, "relay_server.py",
@@ -198,7 +199,10 @@ def main():
         print(f"viewer: verified, file offset {viewer.delta:+.3f}s")
         assert abs(viewer.delta) < 0.05, viewer.delta
 
-        wait(lambda: viewer.delay is not None, 60, "a delay measurement")
+        # the first probe starts about when the viewer's voice does,
+        # usually too soon to reach 3.37 s back; and a young viewer uses
+        # a delay only once a second probe agrees - ~50 s in all
+        wait(lambda: viewer.delay is not None, 90, "a delay measurement")
         print(f"viewer: stream delay {viewer.delay:.3f}s (true {STREAM_DELAY}s)")
         assert abs(viewer.delay - STREAM_DELAY) < 0.05, viewer.delay
 
@@ -225,9 +229,25 @@ def main():
              "voice to flow again after reconnecting")
         print("reconnect: host resumed and viewer rejoined the same room")
 
-        # leaving closes every device and ends the viewer's session
-        host.stop()
-        wait(lambda: viewer.stop_flag.is_set(), 10, "the viewer to hear it ended")
+        # leaving closes every device and ends the viewer's session - even
+        # a Leave that lands while the host is reconnecting: the resume
+        # already on its way still gets the room, on a link nothing else
+        # would close, and viewers would wait on a host that had left
+        real_send = session.Link.send
+
+        def send(link, obj):
+            real_send(link, obj)
+            if obj.get("type") == "resume":
+                session.Link.send = real_send
+                host.stop()                 # Leave, before the relay answers
+
+        session.Link.send = send
+        try:
+            host.link.ws.close()
+            wait(lambda: viewer.stop_flag.is_set(), 10,
+                 "the viewer to hear it ended")
+        finally:
+            session.Link.send = real_send
         viewer.stop()
         wait(lambda: all(getattr(d, "closed", False) for d in opened), 10,
              "every capture device to close")

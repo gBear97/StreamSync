@@ -27,6 +27,7 @@ curve: how many sigmas a lag stands above the search as a whole.
 """
 
 import collections
+import math
 import os
 import subprocess
 import threading
@@ -42,9 +43,16 @@ HOP_S = 0.016         # feature frame step -> 16 ms timing resolution
 N_BANDS = 26
 F_LO, F_HI = 80.0, 7200.0
 CHUNK_S = 900.0       # decode long windows in chunks this big
-OVERLAP_S = 8.0
+OVERLAP_S = 20.0      # chunks overlap by at least this (see find_match_audio)
 
-CACHE_CHUNKS = 12     # decoded feature chunks kept (~6 MB each at 900 s)
+# Decoded feature chunks kept (see _file_features): as many as a whole-film
+# search of a LONG_FILM_S film cuts, so the weak-match retries over it
+# reuse the first look's decode. The search visits its chunks in order,
+# so a cache even one chunk short misses on every one of them. A 900 s
+# chunk is 56,247 frames x 26 bands of float32, 5.85 MB: 17 of them, about
+# 100 MB at most, cover films up to 4 h 9 m.
+LONG_FILM_S = 4 * 3600.0
+CACHE_CHUNKS = 1 + math.ceil((LONG_FILM_S - CHUNK_S) / (CHUNK_S - OVERLAP_S))
 
 # Voice-activity weights (see voice_weights).
 VOICE_REF_PCT = 20.0  # the capture's quietest fifth sets the reference level
@@ -381,6 +389,18 @@ def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None):
     if t1 - t0 < 8.0:
         t0, t1 = max(0.0, t0 - 8.0), min(duration, t1 + 8.0)
 
+    # A capture is only found where it fits entirely inside one chunk: a
+    # chunk covers starts up to its end minus the capture's length, so the
+    # next chunk has to begin at least that far back, or every boundary
+    # hides a band no chunk can reach - and the search answers from
+    # somewhere else entirely. A fixed 8 s left 10 s of every boundary of a
+    # whole-film search blind to the 18 s retry listen, the one a first
+    # sync applies even when weak. OVERLAP_S covers every listen the
+    # controller makes, so its 6/12/18 s looks cut the same chunks and
+    # reuse one decode (_file_features); only a longer capture widens it
+    # (to at most half a chunk, so the scan always moves on).
+    overlap = min(max(OVERLAP_S, len(C) * HOP_S + 1.0), 0.5 * CHUNK_S)
+
     cands = []  # (time, peak z, best z more than RUNNER_EXCL away) per chunk
     seg0 = t0
     while seg0 < t1:
@@ -407,7 +427,7 @@ def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None):
             cands.append((seg0 + (i + d) * HOP_S, float(scores[i]), runner))
         if seg1 >= t1:
             break
-        seg0 = seg1 - OVERLAP_S
+        seg0 = seg1 - overlap
     if not cands:
         raise MatchError("Audio scan produced no candidates.")
     best = max(cands, key=lambda c: c[1])

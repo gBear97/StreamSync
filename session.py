@@ -45,6 +45,13 @@ MISSES_FOR_PAUSE = 2        # listen mode: misses in a row that mean paused
 MEASURE_INTERVAL = 25.0     # viewer stream-delay measurement
 MEASURE_SECONDS = 10.0
 MEASURE_LOOKBACK = 90.0     # longest stream delay looked for
+MEASURE_EARLY = 1.0         # a near-zero delay can align this far under 0
+MEASURE_AGREE = 0.5         # two delays this close agree (young session)
+# The host sends a voice block only once its whole span is recorded, and
+# fingerprinting and the relay hop add a little more: the voice a probe
+# ends on (and MEASURE_EARLY past it) has reached the viewer this long
+# after the probe ends.
+VOICE_SETTLE = VOICE_CHUNK + fingerprint.FP_WIN + 1.5
 VERIFY_WINDOW = 45.0        # seconds fingerprinted per verification sample
 DRIFT_TOLERANCE = 0.35
 RECONNECT_FOR = 60.0        # keep retrying a dropped relay this long
@@ -150,6 +157,11 @@ class VoiceBuffer:
             cutoff = self.blocks[-1][0] - 240.0
             self.blocks = [b for b in self.blocks if b[0] >= cutoff]
 
+    def first_utc(self):
+        """UTC the oldest block held starts at, or None while empty."""
+        with self.lock:
+            return self.blocks[0][0] if self.blocks else None
+
     def timeline(self, t_from, t_to):
         """(words, base_utc, coverage 0..1) for the requested span.
 
@@ -178,9 +190,26 @@ def measure_delay(voice_buf, samples, sr, probe_t0):
     samples: loopback audio whose first sample was heard at probe_t0
     (shared-clock UTC). Aligned against the host's voice timeline below
     the fingerprint hop. Returns delay seconds, or None when inconclusive.
+
+    A probe heard D late holds host voice up to its own end minus D, and
+    the alignment needs all of it inside the reference - so the reference
+    runs past the probe's end. One that stopped 5 s after a 10 s probe
+    began could only align streams 5 s or more behind. Callers wait
+    VOICE_SETTLE after the probe first, or that tail has not arrived.
+
+    The look-back stops at the oldest voice held. A viewer who joined
+    30 s ago holds no host voice from 90 s ago - the relay does not
+    replay it - and scoring that as a dropout kept every viewer under
+    the coverage gate for its first ~80 s. A stream further behind than
+    the voice held can then only align by chance, so callers use a delay
+    from a clipped look-back only once a second measurement agrees.
     """
-    ref, base, cov = voice_buf.timeline(probe_t0 - MEASURE_LOOKBACK,
-                                        probe_t0 + 5.0)
+    first = voice_buf.first_utc()
+    if first is None:
+        return None
+    probe_end = probe_t0 + len(samples) / sr
+    ref, base, cov = voice_buf.timeline(
+        max(probe_t0 - MEASURE_LOOKBACK, first), probe_end + MEASURE_EARLY)
     probe_words = int(len(samples) / sr / FP_HOP)
     if cov < 0.8 or len(ref) < probe_words + 20:
         return None
@@ -191,9 +220,11 @@ def measure_delay(voice_buf, samples, sr, probe_t0):
     if ber > fingerprint.DELAY_BER or median - ber < fingerprint.DELAY_MARGIN:
         return None
     delay = probe_t0 - (base + spoken)
-    if not (0.0 <= delay <= MEASURE_LOOKBACK):
+    # clock sync and device latency put a stream with next to no delay a
+    # little either side of 0
+    if not (-MEASURE_EARLY <= delay <= MEASURE_LOOKBACK):
         return None
-    return float(delay)
+    return float(max(0.0, delay))
 
 
 class ListenTracker:
@@ -401,6 +432,19 @@ class HostSession:
             self.link.close()
         self._shutdown()
 
+    def _left_while_connecting(self):
+        """True if the user left while _connect was reaching the relay.
+        stop() then said goodbye on the link before this one, or on none,
+        and the relay - which lets a resume displace a stale host socket -
+        has since given this one the room: end it here, or the room
+        outlives the session. self.link is set before this is asked, so a
+        Leave landing after it finds this link itself."""
+        if not self.stop_flag.is_set():
+            return False
+        self._send({"type": "end"})
+        self.link.close()
+        return True
+
     def _shutdown(self):
         self.stop_flag.set()
         self.clock.stop()
@@ -432,6 +476,8 @@ class HostSession:
                  "meta": {"title": self.title, "duration": duration}},
                 ("created",), self.stop_flag, time.monotonic() + 20)
             self.code, self.token = msg["code"], msg.get("token")
+            if self._left_while_connecting():
+                return
             self._say(f"Session live - code {self.code}. Waiting for viewers.")
 
             # publish the film fingerprint for verification (cached by relay)
@@ -479,6 +525,8 @@ class HostSession:
                     except RuntimeError as e:
                         self._say(f"Relay connection lost ({e}). "
                                   "Session ended.")
+                        break
+                    if self._left_while_connecting():
                         break
                     self._say(f"Session {self.code} - reconnected.")
         except Exception as e:
@@ -636,6 +684,16 @@ class ViewerSession:
             self.link.close()
         self._shutdown()
 
+    def _left_while_connecting(self):
+        """True if the user left while a join was reaching the relay: stop()
+        closed the link before this one, or none, so close this one too.
+        self.link is set before this is asked, so a Leave landing after
+        it finds this link itself."""
+        if not self.stop_flag.is_set():
+            return False
+        self.link.close()
+        return True
+
     def _shutdown(self):
         self.stop_flag.set()
         self.clock.stop()
@@ -665,6 +723,8 @@ class ViewerSession:
                 self.link, _ = self._join(time.monotonic() + 20)
             except RuntimeError as e:
                 self._say(f"Could not join: {e}")
+                return
+            if self._left_while_connecting():
                 return
             threading.Thread(target=self._recv_loop, daemon=True).start()
 
@@ -741,6 +801,8 @@ class ViewerSession:
                     self._say("Relay connection lost - reconnecting...")
                     try:
                         self.link, _ = self._join(time.monotonic() + RECONNECT_FOR)
+                        if self._left_while_connecting():
+                            break
                         self._say("Reconnected. Following the session.")
                     except RuntimeError as e:
                         self._say(f"Relay connection lost ({e}).")
@@ -778,12 +840,32 @@ class ViewerSession:
     def _measure_loop(self):
         self._monitor = mon = audio_capture.AudioMonitor(
             "loopback", self.speaker_name, keep=30)
+        last = None         # the last delay measured, used or not
+        follow = None       # where the next probe starts, if not from now
         while not self.stop_flag.is_set():
+            start, follow = follow, None
             try:
-                samples, sr, t0, _ = mon.capture_span(MEASURE_SECONDS,
-                                                      start=mon.mark())
-                d = measure_delay(self.voice, samples, sr,
-                                  self.clock.perf_to_utc(t0))
+                samples, sr, t0, frame = mon.capture_span(
+                    MEASURE_SECONDS,
+                    start=mon.mark() if start is None else start)
+                probe_t0 = self.clock.perf_to_utc(t0)
+                # the host is still recording the voice this probe ends on
+                if self.stop_flag.wait(VOICE_SETTLE):
+                    break
+                d = measure_delay(self.voice, samples, sr, probe_t0)
+                if d is not None:
+                    agrees = any(v is not None and abs(d - v) <= MEASURE_AGREE
+                                 for v in (last, self.delay))
+                    last = d
+                    if not agrees and (self.voice.first_utc()
+                                       > probe_t0 - MEASURE_LOOKBACK):
+                        # measured against only the voice held since this
+                        # viewer joined: a stream further behind than that
+                        # can only align by chance. Wait for a second
+                        # measurement to agree - from the audio straight
+                        # after this probe, most of it recorded already.
+                        d = None
+                        follow = frame + len(samples)
                 if d is not None:
                     first = self.delay is None
                     self.delay = d if first else 0.7 * self.delay + 0.3 * d
@@ -793,4 +875,6 @@ class ViewerSession:
                 pass        # silence on loopback - stream muted, keep default
             except Exception:
                 pass
-            self.stop_flag.wait(max(0.0, MEASURE_INTERVAL - MEASURE_SECONDS))
+            if follow is None:
+                self.stop_flag.wait(max(0.0, MEASURE_INTERVAL
+                                        - MEASURE_SECONDS - VOICE_SETTLE))

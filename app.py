@@ -25,6 +25,7 @@ from PIL import Image, ImageTk
 import audio_capture
 import capture
 import controller
+import diagnostics
 import windowctl
 from controller import fmt_time
 from players import EmbeddedPlayer, VLCError
@@ -717,6 +718,12 @@ class App:
                 elif kind == "busy_off":
                     self.sync_btn.state(["!disabled"])
                     self.resync_btn.state(["!disabled"])
+                elif kind == "auto_off":
+                    # auto mode gave up (details in the log): untick it
+                    # exactly as a manual uncheck would, then say why
+                    self.auto_var.set(False)
+                    self._on_auto_toggle()
+                    self._set_status(payload[0])
                 elif kind == "hotkey":
                     self._hotkey(payload[0])
         except queue.Empty:
@@ -856,6 +863,10 @@ def main():
     except Exception:
         pass
     root = tk.Tk()
+    # A windowed build has no console: without these, an exception on a
+    # worker thread or in a Tk callback leaves no trace anywhere.
+    diagnostics.install_excepthook()
+    diagnostics.install_tk_hook(root)
     App(root)
     if "--selftest" in sys.argv:
         root.after(3000, root.destroy)

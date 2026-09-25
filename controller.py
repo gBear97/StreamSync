@@ -16,12 +16,16 @@ It talks to its shell only through the event queue, with the same
     ("show", token)      re-show windows hidden for a screen capture
     ("preview", image)   the frame a video sync captured
     ("busy_off",)        a manual sync finished; re-enable its buttons
+    ("auto_off", text)   auto mode gave up and switched itself off; untick
+                         it as a manual uncheck would, and show `text`
 """
 
 import json
+import math
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -41,21 +45,28 @@ AUDIO_SYNC_SECONDS = 6.0   # manual sync recording length...
 AUDIO_RETRY_SECONDS = (12.0, 18.0)  # ...extended this far when it is weak
 AUTO_RECORD_SECONDS = 4.0  # auto-mode recording length
 AUTO_RETRY_SECONDS = 8.0   # one longer look before counting a failure
+AUTO_FAIL_GIVEUP = 3       # an auto check failing the same way this many
+                           # times running is not a blip: stop, and say so
 LOW_CONFIDENCE = 0.55      # video-match trust threshold
 DRIFT_TOLERANCE = 0.35
 PAUSE_LOOK_BACK = 25.0     # resume search: behind the pause point...
 PAUSE_LOOK_AHEAD = 40.0    # ...and ahead of it, plus time since the pause
+PAUSE_GROW_STEP = 60.0     # ...counted in whole steps (one decode per step)
+PAUSE_GROW_MAX = 600.0     # ...and at most this much
+SESSION_CLOSE_WAIT = 1.5   # how long quitting waits for a session to end
 IS_MAC = sys.platform == "darwin"
 
 
 def fmt_time(s):
-    s = max(0.0, float(s))
-    h, rem = divmod(int(s), 3600)
+    # whole tenths, so rounding carries: rounding only the fraction of
+    # 119.96 gave the impossible "1:60.0"
+    tenths = int(round(max(0.0, float(s)) * 10))
+    whole, frac = divmod(tenths, 10)
+    h, rem = divmod(whole, 3600)
     m, sec = divmod(rem, 60)
-    frac = s - int(s)
     if h:
-        return f"{h}:{m:02d}:{sec + frac:04.1f}"
-    return f"{m}:{sec + frac:04.1f}"
+        return f"{h}:{m:02d}:{sec:02d}.{frac}"
+    return f"{m}:{sec:02d}.{frac}"
 
 
 def parse_time(text):
@@ -121,6 +132,7 @@ class SyncController:
         self.external = None
         self.player = embedded
         self.video_path = None
+        self._embedded_path = None   # the film the built-in player holds
         self.offset = 0.0            # user's accumulated nudge, seconds
         self.audio_device = ""       # substring of the capture device name
         self.region = None           # video method: screen box
@@ -130,6 +142,7 @@ class SyncController:
         self.auto_interval = 30
         self.relay_url = "ws://localhost:8765"
         self.session = None          # active HostSession / ViewerSession
+        self._closers = []           # threads stopping sessions since ended
         self._monitor_factory = monitor_factory or (
             lambda name: audio_capture.AudioMonitor("loopback", name))
         self._monitor = None
@@ -177,6 +190,7 @@ class SyncController:
         self.video_path = path
         if self.player is self.embedded:
             self.embedded.load(path)
+            self._embedded_path = path
             return
         name = Path(path).name
 
@@ -217,9 +231,23 @@ class SyncController:
         return None
 
     def use_embedded(self):
+        """Switch playback back to the built-in player. VLCError
+        propagates, as from load_file.
+
+        A film opened while external VLC had playback went to VLC alone,
+        so it is loaded here: the built-in player would otherwise play
+        nothing, or the film it had before, and Sync would fail with "No
+        video file loaded.". A film it already holds is not reloaded, so
+        it keeps its place and its subtitles. A new one waits at its start
+        for the first sync, as it does when opened with this player active
+        (libvlc ignores a seek before playback starts, so VLC's position
+        cannot be carried over the way use_external carries this one's)."""
         if self.external is not None:
             self.external.pause()
         self.player = self.embedded
+        if self.video_path and self._embedded_path != self.video_path:
+            self.embedded.load(self.video_path)
+            self._embedded_path = self.video_path
 
     def set_mute(self, mute):
         self.player.set_mute(mute)
@@ -409,17 +437,19 @@ class SyncController:
         None. A weak first look gets one longer look before it counts as a
         miss, so a quiet line of dialogue is not mistaken for a pause.
         Silence counts as a miss: a silent stream is a paused stream as far
-        as syncing is concerned."""
+        as syncing is concerned. A film that cannot be read does not: its
+        errors propagate, or a vanished film would pass for a paused
+        stream and be waited on forever."""
         mon = self._loopback()
         start = mon.mark()
         for seconds in (AUTO_RECORD_SECONDS, AUTO_RETRY_SECONDS):
             try:
                 samples, sr, t0 = mon.capture(seconds, start=start)
                 feats = audio_matcher.prep_capture(samples, sr)
-                t, score, z = audio_matcher.find_match_audio(
-                    self.video_path, feats, lo, hi)
-            except (RuntimeError, matcher.MatchError):
+            except RuntimeError:    # heard nothing usable: a miss
                 return None
+            t, score, z = audio_matcher.find_match_audio(
+                self.video_path, feats, lo, hi)
             if trusted(score, z):
                 return t, score, z, t0
         return None
@@ -427,9 +457,10 @@ class SyncController:
     def auto_step(self, state):
         """One pass of auto mode; returns seconds until the next pass.
 
-        `state` carries mode ("normal" or "probe"), failures, pause_point
-        and paused_at across passes. Split out of the loop so tests can
-        drive it without threads or sleeps.
+        `state` carries mode ("normal" or "probe"), failures, pause_point,
+        paused_at and film (what auto mode paused) across passes; held
+        marks a pause kept while auto mode stood aside. Split out of the
+        loop so tests can drive it without threads or sleeps.
         """
         player = self.player
         gen = self._gen
@@ -456,7 +487,7 @@ class SyncController:
                               f"(score {score:.1f}, z {z:.0f}).")
                 return self.auto_interval
             if hit:
-                return 1     # a manual sync overtook this one
+                return 1     # a manual sync or a session overtook this one
             state["failures"] += 1
             if state["failures"] == 1:
                 # the stream stopped somewhere after the last good match and
@@ -469,19 +500,36 @@ class SyncController:
                 player.pause()
                 state.update(mode="probe",
                              pause_point=state.get("miss_point", here),
-                             paused_at=self._now())
+                             paused_at=self._now(),
+                             film=(self.video_path, player))
                 self.q.put(("swap", True))
                 self._say("Auto: film audio not found on the stream - "
                           "assuming pause. Watching for resume...")
                 return 8
             return 10
+        if state.pop("held", False) and (
+                state["film"] != (self.video_path, player)
+                or player.is_playing()):
+            # auto mode stood aside with this film paused, and meanwhile it
+            # was played (a manual sync that applied, the user) or another
+            # film loaded: the pause is not auto mode's to lift any more
+            state.update(mode="normal", failures=0)
+            return 1
         # probe: paused, waiting for the stream to resume. If the "pause"
         # was really a stretch the matcher could not hear, the stream kept
         # playing - so the window grows with the time since, or the film
-        # would wait forever for audio that has already gone by.
+        # would wait forever for audio that has already gone by. It grows
+        # a step at a time, because the film's decode is cached by window
+        # (in chunks of up to 900 s) and an edge that moved every probe had
+        # its chunk decoded afresh every probe; and only so far, because a
+        # real pause - hours of one, if the streamer is away - resumes
+        # where it stopped, and a search that kept growing scanned ever
+        # more of the film at every look.
         since = self._now() - state["paused_at"]
+        grow = min(math.ceil(since / PAUSE_GROW_STEP) * PAUSE_GROW_STEP,
+                   PAUSE_GROW_MAX)
         lo = state["pause_point"] - PAUSE_LOOK_BACK
-        hi = state["pause_point"] + PAUSE_LOOK_AHEAD + since
+        hi = state["pause_point"] + PAUSE_LOOK_AHEAD + grow
         hit = self._auto_probe(lo, hi)
         if hit and not self._stale(gen):
             t, score, z, t0 = hit
@@ -496,26 +544,74 @@ class SyncController:
 
     def _stale(self, gen):
         """A manual sync started (or is running) since `gen` was read - its
-        result wins over whatever auto mode found."""
-        return self._busy or self._gen != gen
+        result wins over whatever auto mode found. So does a watch party
+        that took the playhead while auto mode was listening: the loop
+        only checks for one between passes, and a pass listens for up to
+        8 s, matching after each look, before it acts."""
+        return self._busy or self._gen != gen or self.session_running()
+
+    def _auto_failed(self, state, e):
+        """A pass that raised `e`; returns seconds until the next. The same
+        failure every time is not a blip - the film's drive unplugged, the
+        file moved - and reporting it every interval forever helps no one.
+        The first of a run is reported, with one traceback in the log;
+        repeats get a log line; the AUTO_FAIL_GIVEUP-th in a row says what
+        is wrong once and switches auto mode off."""
+        sig = (type(e).__name__, str(e))
+        n = state["fail_n"] + 1 if sig == state["fail_sig"] else 1
+        state.update(fail_sig=sig, fail_n=n)
+        if n == 1:
+            self._say(f"Auto-resync check failed: {e}")
+            # the three-argument form: Python 3.9 has no one-argument one
+            diagnostics.log_block("auto re-sync check failed:", "".join(
+                traceback.format_exception(type(e), e, e.__traceback__)))
+        elif n < AUTO_FAIL_GIVEUP:
+            diagnostics.log(f"auto re-sync check failed again "
+                            f"({n}/{AUTO_FAIL_GIVEUP}): {sig[0]}: {e}")
+        else:
+            diagnostics.log(f"auto re-sync gave up after {n} identical "
+                            f"failures: {sig[0]}: {e}")
+            if isinstance(e, (OSError, matcher.MatchError)):
+                why = ("can't read the film's audio - check the file is "
+                       "still available")
+            else:
+                why = f"the same error kept coming back ({e})"
+            self.auto_enabled = False
+            self.q.put(("auto_off", f"Auto re-sync stopped: {why}. "
+                                    "Tick Auto re-sync again to retry."))
+        return max(self.auto_interval, 20)
 
     def _auto_loop(self):
         state = {"mode": "normal", "failures": 0, "pause_point": None,
-                 "paused_at": None}
+                 "paused_at": None, "fail_sig": None, "fail_n": 0}
         next_at = 0.0
         while not self._closing:
             time.sleep(0.5)
             if (not self.auto_enabled or self._busy or not self.video_path
                     or self.session_running()):  # sessions own the playhead
-                state.update(mode="normal", failures=0)
+                if state["mode"] == "probe":
+                    # a pause auto mode made is still its to lift: nobody
+                    # else will, and a weak Resync (not applied) leaves the
+                    # film paused where normal mode would ignore it for good
+                    state["held"] = True
+                else:
+                    state.update(mode="normal", failures=0)
+                # standing aside ends a failure streak: a user retrying
+                # (or re-ticking Auto) gets the full tries again
+                state.update(fail_sig=None, fail_n=0)
                 continue
             if time.monotonic() < next_at:
                 continue
+            # a pass is timed from its start: "every 30 s" is every 30 s,
+            # and a held pause listens again as soon as a look ends. A
+            # failure backs off from when it failed
+            began = time.monotonic()
             try:
-                next_at = time.monotonic() + self.auto_step(state)
+                next_at = began + self.auto_step(state)
             except Exception as e:
-                self._say(f"Auto-resync check failed: {e}")
-                next_at = time.monotonic() + max(self.auto_interval, 20)
+                next_at = time.monotonic() + self._auto_failed(state, e)
+            else:
+                state.update(fail_sig=None, fail_n=0)   # a clean check
 
     # ----------------------------------------------------------- sessions
 
@@ -542,8 +638,28 @@ class SyncController:
 
     def leave(self):
         if self.session is not None:
-            self.session.stop()
-            self.session = None
+            self._end_session()
+
+    def _end_session(self):
+        """Stop the session in the background. Stopping says goodbye to
+        the relay and waits out the websocket's closing handshake - seconds
+        on an unreachable relay, which is just when people reach for Leave
+        - and the shells call this on the UI thread. The stop flag goes up
+        before this returns, so the session's loops (a viewer's drives the
+        player) stand down at their next check of it. The thread is kept
+        for close(): quitting straight after Leave must not stop the
+        player under a goodbye still going out."""
+        sess, self.session = self.session, None
+        sess.stop_flag.set()
+
+        def stop():
+            try:
+                sess.stop()
+            except Exception as e:
+                diagnostics.log(f"session stop failed: {e!r}")
+        closer = threading.Thread(target=stop, daemon=True)
+        closer.start()
+        self._closers = [t for t in self._closers if t.is_alive()] + [closer]
 
     # ------------------------------------------------------------ logging
 
@@ -576,7 +692,13 @@ class SyncController:
         try:
             CONFIG_PATH.write_text(json.dumps(cfg))
         except OSError:
-            pass
+            # The log is the only witness: a save that fails silently on
+            # exit looks identical to one that worked.
+            diagnostics.log_block("config save FAILED:",
+                                  traceback.format_exc())
+            return
+        diagnostics.log(f"config saved (auto={self.auto_enabled} "
+                        f"follow={self.auto_follow})")
 
     def load_config(self):
         """Apply the controller's saved settings; return the whole dict so
@@ -614,10 +736,14 @@ class SyncController:
     def close(self):
         self._closing = True
         if self.session is not None:
-            try:
-                self.session.stop()
-            except Exception:
-                pass
+            self._end_session()
+        # give each goodbye - this session's, or one still going out from
+        # a Leave just before - a moment to go out before the player
+        # stops, but a dead relay must not hold the window open for its
+        # whole close timeout: SESSION_CLOSE_WAIT in all, not each
+        deadline = time.monotonic() + SESSION_CLOSE_WAIT
+        for closer in self._closers:
+            closer.join(max(0.0, deadline - time.monotonic()))
         if self._monitor is not None:
             self._monitor.stop()
         try:

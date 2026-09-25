@@ -9,3 +9,17 @@ __pycache__/
 
 # local state
 .streamsync.json
+
+# macos
+.DS_Store
+
+# local media - test films are big, and not ours to redistribute
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.m4a
+*.wav
+
+# agent worktrees (also in .git/info/exclude, which clones don't inherit)
+.claude/worktrees/

@@ -10,9 +10,16 @@ that was never the problem.
 """
 
 import ast
+import io
+import logging
 import os
+import platform
+import queue
 import sys
 import tempfile
+import threading
+import types
+from pathlib import Path
 
 import diagnostics
 
@@ -132,7 +139,10 @@ for key in ("streamsync", "frozen", "process_arch", "translocated", "log"):
 
 # --- the log -------------------------------------------------------------
 saved_dir, saved_file = diagnostics.LOG_DIR, diagnostics.LOG_FILE
-tmp = tempfile.mkdtemp()
+# Several MB of logs go in here, and must not outlive the run: removed at
+# the end, or when the interpreter exits if a check crashes first.
+tmp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+tmp = tmp_dir.name
 try:
     diagnostics.LOG_DIR = tmp
     diagnostics.LOG_FILE = os.path.join(tmp, "streamsync.log")
@@ -157,12 +167,16 @@ try:
        os.path.getsize(diagnostics.LOG_FILE) < 1000)
 
     # The whole point is evidence surviving a crash nobody watched.
-    saved_hook = sys.excepthook
+    saved_hook, saved_thread_hook = sys.excepthook, threading.excepthook
     try:
-        # Silence the hook we chain to, so a passing run prints no
+        # Silence the hooks we chain to, so a passing run prints no
         # traceback and a real failure is the only thing on screen.
-        chained = []
+        chained, thread_chained = [], []
         sys.excepthook = lambda *a: chained.append(a)
+        threading.excepthook = thread_chained.append
+        diagnostics.install_excepthook()
+        # streamsync.py installs the hooks, then the shell again: that
+        # must not log every crash twice.
         diagnostics.install_excepthook()
         inner = sys.excepthook
         try:
@@ -174,18 +188,298 @@ try:
         ok("an uncaught exception reaches the log",
            "UNCAUGHT EXCEPTION" in body and "boom" in body)
         ok("and is still passed on to the previous hook", len(chained) == 1)
-    finally:
-        sys.excepthook = saved_hook
+        check("installing the hooks twice logs a crash once",
+              body.count("ValueError: boom"), 1)
 
-    # A read-only log directory must not take the app down with it.
-    diagnostics.LOG_FILE = "/nonexistent/nowhere/streamsync.log"
-    diagnostics.LOG_DIR = "/nonexistent/nowhere"
+        # Where the app's crashes actually happen: listening, matching
+        # and seeking all run on worker threads, whose exceptions never
+        # reach sys.excepthook.
+        def listen():
+            raise RuntimeError("worker boom")
+
+        worker = threading.Thread(target=listen, name="audio-worker")
+        worker.start()
+        worker.join()
+        with open(diagnostics.LOG_FILE) as f:
+            body = f.read()
+        ok("a worker thread's exception reaches the log",
+           "RuntimeError: worker boom" in body)
+        ok("with its full traceback",
+           "Traceback (most recent call last)" in body
+           and "in listen" in body)
+        ok("naming the thread it killed", "'audio-worker'" in body)
+        check("and is still passed on to the previous thread hook",
+              [a.exc_type for a in thread_chained], [RuntimeError])
+        # The hooks went in twice above, and a worker crash must not be
+        # logged twice either.
+        check("a worker crash is logged once",
+              body.count("RuntimeError: worker boom"), 1)
+
+        # A thread quitting on purpose is not a crash.
+        quitter = threading.Thread(target=sys.exit, name="quitter")
+        quitter.start()
+        quitter.join()
+        with open(diagnostics.LOG_FILE) as f:
+            ok("a thread's SystemExit is not logged as a crash",
+               "'quitter'" not in f.read())
+    finally:
+        sys.excepthook, threading.excepthook = saved_hook, saved_thread_hook
+
+    # A Tk callback's exception is caught by Tk itself and printed to a
+    # stderr the windowed build does not have - the button just does
+    # nothing. Driven through tkinter's own callback wrapper on a root
+    # that never opens a window.
+    def on_click():
+        raise KeyError("tk boom")
+
+    try:
+        import tkinter
+    except ImportError:          # a Python built without Tk: call it as Tk would
+        tk_root = types.SimpleNamespace()
+        diagnostics.install_tk_hook(tk_root)
+        try:
+            on_click()
+        except KeyError:
+            tk_root.report_callback_exception(*sys.exc_info())
+    else:
+        tk_root = tkinter.Tk.__new__(tkinter.Tk)
+        tk_root.master = None
+        diagnostics.install_tk_hook(tk_root)
+        tkinter.CallWrapper(on_click, None, tk_root)()
+    with open(diagnostics.LOG_FILE) as f:
+        body = f.read()
+    ok("a Tk callback's exception reaches the log",
+       "UNCAUGHT EXCEPTION in a Tk callback" in body
+       and "KeyError: 'tk boom'" in body)
+    ok("with its full traceback", "in on_click" in body)
+
+    # Python logging lands in the same file (install_excepthook, above,
+    # routed it there): a module that wants levels and exc_info gets
+    # them without a second log nobody knows to look for.
+    logger = logging.getLogger("streamsync.test")
+    saved_err, sys.stderr = sys.stderr, io.StringIO()
+    try:
+        logger.info("film loaded")
+        logger.debug("frame detail")
+        try:
+            raise OSError("disk gone")
+        except OSError:
+            logger.warning("save FAILED", exc_info=True)
+        echoed = sys.stderr.getvalue()
+    finally:
+        sys.stderr = saved_err
+    with open(diagnostics.LOG_FILE) as f:
+        body = f.read()
+    ok("a module logger's line reaches the log",
+       "INFO streamsync.test: film loaded" in body)
+    check("once, though the handler was installed twice",
+          body.count("film loaded"), 1)
+    ok("with exc_info's traceback, indented as one entry",
+       "WARNING streamsync.test: save FAILED\n    Traceback" in body
+       and "\n    OSError: disk gone" in body)
+    ok("DEBUG detail reaches the file",
+       "DEBUG streamsync.test: frame detail" in body)
+    ok("but not the Terminal", "frame detail" not in echoed)
+    ok("where INFO still echoes, as log() does", "film loaded" in echoed)
+
+    # More detail needs more room, and still a bound: three old logs of
+    # up to 2 MB beside the live one, the oldest dropped. Through the
+    # handler, which writes with log()'s own rotation.
+    for gen in range(1, 6):
+        with open(diagnostics.LOG_FILE, "w") as f:
+            f.write(f"generation {gen}\n" + "x" * diagnostics.MAX_LOG_BYTES)
+        logger.info("rotate")
+    check("rotation keeps three old logs",
+          sorted(n for n in os.listdir(tmp) if n != "streamsync.log"),
+          ["streamsync.log.1", "streamsync.log.2", "streamsync.log.3"])
+
+    def generation(path):
+        try:
+            with open(path) as f:
+                return f.readline(40).strip()
+        except OSError:
+            return None
+
+    check("the newest is .1", generation(diagnostics.LOG_FILE + ".1"),
+          "generation 5")
+    check("the oldest kept is .3", generation(diagnostics.LOG_FILE + ".3"),
+          "generation 3")
+    ok("the live log restarts with the line that rotated it",
+       os.path.getsize(diagnostics.LOG_FILE) < 1000)
+    ok("each log may reach 2 MB", diagnostics.MAX_LOG_BYTES >= 2_000_000)
+
+    # On Windows a file another program holds open without delete sharing
+    # - a Python open() of it, or .NET's File.OpenRead - cannot be renamed,
+    # nor replaced by a rename. A rotation that cannot finish must lose
+    # none of the old logs, whichever one is held, and must not be tried
+    # again on every line. A stand-in os.replace refuses the held file.
+    held, tried, real_replace = set(), [], os.replace
+
+    def replace(src, dst):
+        tried.extend((src, dst))
+        if src in held or dst in held:
+            raise PermissionError(13, "in use by another process", src)
+        real_replace(src, dst)
+
+    def backups():
+        return [generation(diagnostics.LOG_FILE + f".{n}") for n in (1, 2, 3)]
+
+    with open(diagnostics.LOG_FILE, "w") as f:
+        f.write("generation 6\n" + "x" * diagnostics.MAX_LOG_BYTES)
+    os.replace = replace
+    try:
+        held.add(diagnostics.LOG_FILE)
+        for _ in range(5):
+            diagnostics.log("while the log is held open")
+        check("a live log that will not move leaves every old log in place",
+              backups(), ["generation 5", "generation 4", "generation 3"])
+        with open(diagnostics.LOG_FILE) as f:
+            live = f.read()
+        ok("and keeps writing on the end of itself",
+           live.startswith("generation 6")
+           and live.count("while the log is held open") == 5)
+        check("and is not tried again on every line",
+              tried.count(diagnostics.LOG_FILE), 1)
+
+        # The reader lets go; the next try, once the log has grown a
+        # little more, rotates as if nothing had happened.
+        held.clear()
+        with open(diagnostics.LOG_FILE, "a") as f:
+            f.write("x" * getattr(diagnostics, "ROTATE_RETRY_BYTES", 0))
+        diagnostics.log("let go")
+        check("then rotates, one generation down",
+              backups(), ["generation 6", "generation 5", "generation 4"])
+
+        # Nor may an old log that will not move cost any of them, whichever
+        # it is: the newest, the one after it, or the oldest. The rotation
+        # that just worked has cleared the wait the failed one set: this
+        # log is no bigger than that one was, so without that the first
+        # case (.1 held) would not even be tried, and its "nothing moved"
+        # would prove nothing.
+        with open(diagnostics.LOG_FILE, "w") as f:
+            f.write("generation 7\n" + "x" * diagnostics.MAX_LOG_BYTES)
+        for n in (1, 2, 3):
+            for k in (1, 2, 3):  # each case starts from the same old logs
+                with open(diagnostics.LOG_FILE + f".{k}", "w") as f:
+                    f.write(f"generation {7 - k}\n")
+            old = diagnostics.LOG_FILE + f".{n}"
+            held.clear()
+            held.add(old)
+            tried.clear()
+            diagnostics.log(f"while .{n} is held open")
+            ok(f"with .{n} held, a full log still tries to rotate",
+               old in tried)
+            check(f"with .{n} held, no old log is lost or moved",
+                  backups(), ["generation 6", "generation 5", "generation 4"])
+            check(f"with .{n} held, the live log stays where it was",
+                  generation(diagnostics.LOG_FILE), "generation 7")
+            check(f"with .{n} held, nothing is left half-moved",
+                  sorted(os.listdir(tmp)),
+                  ["streamsync.log", "streamsync.log.1", "streamsync.log.2",
+                   "streamsync.log.3"])
+            with open(diagnostics.LOG_FILE, "a") as f:  # past the wait
+                f.write("x" * getattr(diagnostics, "ROTATE_RETRY_BYTES", 0))
+        held.clear()
+        diagnostics.log("all let go")
+        check("once let go, it rotates one generation down",
+              backups(), ["generation 7", "generation 6", "generation 5"])
+
+        # A missing old log is a gap the rotation fills: the ones beyond
+        # it stay, rather than the oldest being dropped to make room.
+        os.remove(diagnostics.LOG_FILE + ".1")
+        with open(diagnostics.LOG_FILE, "w") as f:
+            f.write("generation 8\n" + "x" * diagnostics.MAX_LOG_BYTES)
+        diagnostics.log("after .1 was deleted")
+        check("a gap in the old logs is filled, and none beyond it dropped",
+              backups(), ["generation 8", "generation 6", "generation 5"])
+    finally:
+        os.replace = real_replace
+
+    # Every run's first line says what it ran on - on Windows too, where
+    # describe() has no OS version to offer.
+    diagnostics.log_session_start()
+    with open(diagnostics.LOG_FILE) as f:
+        start = [ln for ln in f if " starting (" in ln]
+    ok("the startup line is logged", len(start) == 1)
+    ok("and names the OS and its build",
+       bool(start) and platform.platform() in start[0])
+    ok("and how the app was launched",
+       bool(start) and f"args {sys.argv[1:]}" in start[0])
+
+    # A log directory that cannot be written must not take the app down
+    # with it. A file where the directory should be refuses everyone,
+    # where a made-up path does not: Windows lets a user create
+    # \nonexistent\nowhere at the root of the drive, and the log with it.
+    blocker = os.path.join(tmp, "not-a-folder")
+    open(blocker, "w").close()
+    diagnostics.LOG_DIR = os.path.join(blocker, "nowhere")
+    diagnostics.LOG_FILE = os.path.join(diagnostics.LOG_DIR, "streamsync.log")
     try:
         diagnostics.log("this cannot be written")
     except Exception as e:
         fails.append(f"log raised when it could not write: {e!r}")
+    ok("where it really could not", not os.path.exists(diagnostics.LOG_FILE))
 finally:
     diagnostics.LOG_DIR, diagnostics.LOG_FILE = saved_dir, saved_file
+
+# --- both shells install the hooks ---------------------------------------
+# A shell can be launched directly (`python app.py`, and CI's --selftest)
+# without streamsync.py, and only a shell holds the Tk root. Read rather
+# than run: main() opens the real window.
+for shell in ("app.py", "mac_app.py"):
+    tree = ast.parse(open(shell, encoding="utf-8").read(), shell)
+    main_fn = next(n for n in tree.body
+                   if isinstance(n, ast.FunctionDef) and n.name == "main")
+    called = {f"{n.func.value.id}.{n.func.attr}" for n in ast.walk(main_fn)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+              and isinstance(n.func.value, ast.Name)}
+    for hook in ("diagnostics.install_excepthook",
+                 "diagnostics.install_tk_hook"):
+        ok(f"{shell} main() calls {hook}", hook in called)
+
+# --- config saves leave a trace ------------------------------------------
+# Settings are saved on the way out, when nobody is watching: a save that
+# failed used to look, in the log, exactly like one that worked.
+import controller
+
+
+def read_log():
+    try:
+        with open(diagnostics.LOG_FILE) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+saved = diagnostics.LOG_DIR, diagnostics.LOG_FILE, controller.CONFIG_PATH
+try:
+    diagnostics.LOG_DIR = tmp
+    diagnostics.LOG_FILE = os.path.join(tmp, "config-saves.log")
+    ctl = controller.SyncController(queue.Queue(), None)
+    ctl.auto_enabled, ctl.auto_follow = True, False
+
+    controller.CONFIG_PATH = Path(tmp) / "streamsync.json"
+    ctl.save_config({"method": "audio"})
+    ok("the settings were written",
+       controller.CONFIG_PATH.read_text().startswith("{"))
+    ok("a config save is logged, with the auto arming flags",
+       "config saved (auto=True follow=False)" in read_log())
+
+    controller.CONFIG_PATH = Path(tmp) / "no-such-folder" / "streamsync.json"
+    try:
+        ctl.save_config({"method": "audio"})
+    except Exception as e:
+        fails.append(f"a failed config save raised: {e!r}")
+    failed = read_log().partition("config save FAILED:")[2]
+    ok("a failed save is logged as one", bool(failed))
+    ok("with its traceback and the path it could not write",
+       "Traceback (most recent call last)" in failed
+       and "no-such-folder" in failed)
+    check("and not also as a save that worked",
+          read_log().count("config saved ("), 1)
+finally:
+    diagnostics.LOG_DIR, diagnostics.LOG_FILE, controller.CONFIG_PATH = saved
+    tmp_dir.cleanup()
 
 # --- probing must never be what breaks the app ---------------------------
 # It runs while diagnosing an already-broken machine, so every part of it
@@ -204,8 +498,6 @@ finally:
 # match" - with playback into a window that did not exist, because libvlc's
 # macOS output renders nothing until handed an NSView. attach_tk is that
 # handoff; these pin its contract without needing a Mac or VLC.
-import types
-
 import players
 
 if sys.platform != "darwin":

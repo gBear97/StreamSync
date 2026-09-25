@@ -1,13 +1,47 @@
 #!/bin/sh
 # Build StreamSync.app - run this ON a Mac, from this folder.
 # VLC.app must still be installed on the machine that runs it.
+#
+# The app bundles the Python and Tk it is built with, and it does not run
+# on Apple's /usr/bin/python3 (Python 3.9 with Tk 8.5) - which is what a
+# bare python3 on a Mac often is. Set PYTHON to the one you run StreamSync
+# with (default: python3):
+#
+#     PYTHON=python3.12 sh build_app_mac.sh
+#
 set -e
-VERSION=$(python3 -c 'from version import __version__; print(__version__)')
-python3 -m pip install -r requirements.txt pyinstaller
+PY="${PYTHON:-python3}"
+
+# Refuse the wrong Python here, rather than ship a bundle that dies on
+# launch. Apple's Python is the one built as Python3.framework (a venv
+# made from it keeps it as its base).
+"$PY" - <<'PYCHECK'
+import sys
+if "/Python3.framework/" in sys.base_prefix:
+    sys.exit("%s is Apple's Python %s - its Tk 8.5 cannot run StreamSync's "
+             "UI, so the app would die on launch. Install Python from "
+             "python.org (MAC_FIRST_RUN.md step 0) and build with it, e.g. "
+             "PYTHON=python3.12 sh build_app_mac.sh"
+             % (sys.executable, sys.version.split()[0]))
+try:
+    import tkinter
+except ImportError:
+    sys.exit("%s has no tkinter, which StreamSync's UI needs. Build with a "
+             "python.org Python (MAC_FIRST_RUN.md step 0), e.g. "
+             "PYTHON=python3.12 sh build_app_mac.sh" % sys.executable)
+if tkinter.TkVersion < 8.6:
+    sys.exit("%s has Tk %s; StreamSync's UI needs Tk 8.6 or newer. Build "
+             "with a python.org Python (MAC_FIRST_RUN.md step 0), e.g. "
+             "PYTHON=python3.12 sh build_app_mac.sh"
+             % (sys.executable, tkinter.TkVersion))
+PYCHECK
+
+VERSION=$("$PY" -c 'from version import __version__; print(__version__)')
+"$PY" -m pip install -r requirements.txt pyinstaller
 # certifi is collected explicitly: netcerts imports it lazily, so
 # PyInstaller's import scan never sees it, and without its cacert.pem the
 # bundle has no CA roots and every HTTPS call fails to verify.
-python3 -m PyInstaller --noconfirm --windowed --name StreamSync \
+"$PY" -m PyInstaller --noconfirm --windowed --name StreamSync \
     --collect-all imageio_ffmpeg \
     --collect-all soundcard \
     --collect-all certifi \

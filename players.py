@@ -356,8 +356,11 @@ class EmbeddedPlayer(_ClosedLoop):
         self._init_loop(EMBED_STALL_GUESS)
         self._watch_time()
         self.embedded = False
+        # the drawable, kept so load() can hand it back to libvlc
+        self.hwnd = self.nsview = None
         if hwnd is not None:
-            self.mp.set_hwnd(int(hwnd))
+            self.hwnd = int(hwnd)
+            self.mp.set_hwnd(self.hwnd)
             # let Tk keep mouse/keyboard events, not the VLC child window
             self.mp.video_set_mouse_input(False)
             self.mp.video_set_key_input(False)
@@ -384,6 +387,7 @@ class EmbeddedPlayer(_ClosedLoop):
         self._init_loop(EMBED_STALL_GUESS)
         self._watch_time()
         self.embedded = False
+        self.hwnd = self.nsview = None
         self.has_media = False
         return self
 
@@ -414,11 +418,27 @@ class EmbeddedPlayer(_ClosedLoop):
         if not view:
             return False
         self.mp.set_nsobject(view)
+        self.nsview = view
         self.embedded = True
         return True
 
     def load(self, path):
         self.mp.set_media(self.instance.media_new(path))
+        # A guard, and an idempotent one: hand libvlc our drawable again
+        # and turn its own fullscreen off. libvlc keeps both across
+        # set_media already (checked on 3.0.23: get_hwnd() and
+        # get_fullscreen() survive it), and nothing of ours sets its
+        # fullscreen once a drawable is set, so this re-writes values it
+        # holds. It answers a Windows field report - VLC's D3D11 output
+        # detached into a top-level window of its own - but is not shown
+        # to bring back a vout that has already gone; that needs a playing
+        # video on real Windows VLC to check.
+        if self.hwnd is not None:
+            self.mp.set_hwnd(self.hwnd)
+            self.mp.set_fullscreen(False)
+        elif self.nsview is not None:
+            self.mp.set_nsobject(self.nsview)
+            self.mp.set_fullscreen(False)
         self.has_media = True
 
     def ensure_playing(self, timeout=6.0):
@@ -493,8 +513,18 @@ class EmbeddedPlayer(_ClosedLoop):
         self.mp.audio_set_mute(bool(mute))
 
     def set_fullscreen(self, flag):
-        """Fullscreen for the libvlc-owned video window (macOS mode)."""
+        """Fullscreen for a libvlc-owned video window. Returns whether it
+        did anything.
+
+        Once a drawable is set the window is ours, not libvlc's, and
+        whoever owns it has to resize it: on macOS libvlc accepts the
+        call, reports the new state and changes nothing, and on Windows
+        it would move the picture out of our window into one of libvlc's
+        own. So the call is not made."""
+        if self.hwnd is not None or self.nsview is not None:
+            return False
         self.mp.set_fullscreen(bool(flag))
+        return True
 
     def is_playing(self):
         return bool(self.mp.is_playing())
@@ -566,10 +596,10 @@ class ExternalPlayer(_ClosedLoop):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
 
-    def _cmd(self, command, val=None):
+    def _cmd(self, command, val=None, key="val"):
         params = {"command": command}
         if val is not None:
-            params["val"] = val
+            params[key] = val
         return self._request(params)
 
     def _alive(self):
@@ -580,22 +610,38 @@ class ExternalPlayer(_ClosedLoop):
             return False
 
     def load(self, path):
+        # Native separators: VLC on Windows silently ignores a forward-slash
+        # path - empty playlist, state "stopped", no error - on both the
+        # command line and in_play, and Tk's file dialog hands paths back
+        # with forward slashes. The identical backslash path plays fine.
+        # No-op on macOS.
+        path = str(Path(path))
         try:
             from matcher import probe
-            self.duration = probe(str(path))[0]
+            duration = probe(path)[0]
         except Exception:
-            self.duration = None
+            duration = None
         if self._alive():
-            self._cmd("in_play", str(path))
+            # in_play takes the MRL as `input=`; `val=` is silently ignored
+            # and the film already playing carries on
+            self._cmd("in_play", path, key="input")
         else:
-            self.proc = subprocess.Popen([
+            argv = [
                 self.exe, "--extraintf", "http",
                 "--http-host", "127.0.0.1",
                 "--http-port", str(self.port),
                 "--http-password", self.password,
-                "--no-one-instance", "--no-video-title-show",
-                str(path),
-            ])
+                "--no-video-title-show",
+            ]
+            if sys.platform != "darwin":
+                # Cocoa VLC has no one-instance option and treats an
+                # unknown option as fatal: it would exit before the HTTP
+                # interface ever came up. (Not needed there anyway: the
+                # binary is exec'd directly, so Launch Services never
+                # hands the file to a running copy.)
+                argv.append("--no-one-instance")
+            argv.append(path)
+            self.proc = subprocess.Popen(argv)
             deadline = time.perf_counter() + 12.0
             while time.perf_counter() < deadline:
                 if self._alive():
@@ -604,6 +650,14 @@ class ExternalPlayer(_ClosedLoop):
             else:
                 raise VLCError("External VLC did not come up with its HTTP "
                                "interface enabled.")
+        # Only once VLC has accepted the new film (in_play returned, or the
+        # spawned VLC answered): the poller turns its position fraction
+        # into seconds with this, and the new film's length over the old
+        # film's playback is a wrong clock for everything reading it.
+        # Accepted is not yet switched - VLC changes film on its own thread
+        # after in_play, so for a moment its status can still show the old
+        # one, scaled by this. That window is left open.
+        self.duration = duration
         self.has_media = True
         self._clk.reset()
         if self._poller is None or not self._poller.is_alive():

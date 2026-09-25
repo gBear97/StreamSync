@@ -12,9 +12,16 @@ On real libvlc the same code measured: sync error 5-9 ms median (was
 82-179 ms), position estimate within 1 ms, +0.1 s nudge nets +96 ms (a
 seek-based nudge netted about -170 ms). This test holds the logic to
 that without needing VLC installed.
+
+It also pins what loading a film sends each player - external VLC's HTTP
+commands and command line, the embedded player's drawable - with fakes
+that record the calls.
 """
 
+import os
+import pathlib
 import random
+import sys
 import threading
 import time
 import types
@@ -173,6 +180,209 @@ def wait_done(p, timeout=30):
     assert not p._working, "correction never finished"
 
 
+class FakeHTTP:
+    """External VLC's HTTP interface: up or not, recording each command
+    with the duration the player held at the moment it was sent."""
+
+    def __init__(self, player, up=True):
+        self.player = player
+        self.up = up
+        self.sent = []
+        self.refuse = set()        # commands that fail on the wire
+        player._request = self.request
+
+    def request(self, params=None, timeout=2.0):
+        if not self.up:
+            raise OSError("connection refused")
+        if params:
+            self.sent.append((dict(params), self.player.duration))
+            if params["command"] in self.refuse:
+                raise OSError("connection reset")
+        return {"state": "playing", "position": 0.5, "length": 100}
+
+    def commands(self, name):
+        return [(params, dur) for params, dur in self.sent
+                if params["command"] == name]
+
+
+FILM_LENGTHS = {"First Film.mkv": 5400.0, "Second Film.mkv": 7200.0,
+                "Third Film.mkv": 6000.0}
+
+
+def external_load():
+    """External VLC loads: the second film really reaches VLC, the
+    spawn suits the platform, Tk's forward-slash paths arrive native,
+    and the length the clock scales by changes only once VLC has
+    accepted the film."""
+    def probe(path):
+        return FILM_LENGTHS[pathlib.Path(path).name], 0.0
+
+    saved = sys.modules.get("matcher"), players.subprocess, players.sys
+    sys.modules["matcher"] = types.SimpleNamespace(probe=probe)  # no ffmpeg
+    made = []
+    try:
+        # a film is playing in a running VLC; the picker hands us another
+        p = players.ExternalPlayer(exe="vlc")
+        made.append(p)
+        http = FakeHTTP(p)
+        p.duration, p.has_media = FILM_LENGTHS["First Film.mkv"], True
+        picked = "C:/Films/Second Film.mkv"      # as Tk's file dialog has it
+        native = str(pathlib.Path(picked))
+        p.load(picked)
+        plays = http.commands("in_play")
+        assert len(plays) == 1, http.sent
+        params, dur_then = plays[0]
+        # VLC's in_play reads `input`; `val` is ignored without an error
+        assert params == {"command": "in_play", "input": native}, params
+        if os.name == "nt":
+            assert "/" not in params["input"], params
+        # still the first film's length while VLC was still playing it
+        assert dur_then == FILM_LENGTHS["First Film.mkv"], dur_then
+        assert p.duration == FILM_LENGTHS["Second Film.mkv"], p.duration
+        print(f"external VLC, running: in_play sent {params['input']!r} as "
+              f"input=, length {dur_then:.0f} s -> {p.duration:.0f} s "
+              f"only after it")
+
+        # VLC never takes the third film: the second is still playing,
+        # and so is its length
+        http.refuse.add("in_play")
+        try:
+            p.load("C:/Films/Third Film.mkv")
+        except OSError:
+            pass
+        else:
+            raise AssertionError("a failed in_play was not reported")
+        assert p.duration == FILM_LENGTHS["Second Film.mkv"], p.duration
+        print("external VLC, in_play fails: the playing film keeps its length")
+
+        # no VLC running: spawn one with the film on its command line
+        for platform in ("win32", "darwin", "linux"):
+            p = players.ExternalPlayer(exe="vlc")
+            made.append(p)
+            http = FakeHTTP(p, up=False)
+            spawned = []
+
+            def popen(argv, http=http, spawned=spawned):
+                spawned.append((list(argv), http.player.duration))
+                http.up = True
+                return types.SimpleNamespace()
+
+            players.subprocess = types.SimpleNamespace(Popen=popen)
+            players.sys = types.SimpleNamespace(platform=platform)
+            p.load(picked)
+            assert len(spawned) == 1, spawned
+            argv, dur_then = spawned[0]
+            # Cocoa VLC exits on an option it does not know
+            assert ("--no-one-instance" in argv) == (platform != "darwin"), \
+                (platform, argv)
+            assert argv[-1] == native, argv
+            assert dur_then is None, dur_then
+            assert p.duration == FILM_LENGTHS["Second Film.mkv"], p.duration
+            print(f"external VLC, spawned on {platform}: "
+                  f"--no-one-instance {'--no-one-instance' in argv}, "
+                  f"film {argv[-1]!r}")
+    finally:
+        real_matcher, players.subprocess, players.sys = saved
+        if real_matcher is None:
+            sys.modules.pop("matcher", None)
+        else:
+            sys.modules["matcher"] = real_matcher
+        for p in made:
+            p.stop()
+
+
+class AnchorMP:
+    """The libvlc media player calls a load and a fullscreen make, in order."""
+
+    def __init__(self):
+        self.calls = []
+
+    def event_manager(self):
+        return types.SimpleNamespace(event_attach=lambda _type, cb: None)
+
+    def set_media(self, m):
+        self.calls.append(("set_media", m))
+
+    def set_hwnd(self, h):
+        self.calls.append(("set_hwnd", h))
+
+    def set_nsobject(self, v):
+        self.calls.append(("set_nsobject", v))
+
+    def set_fullscreen(self, flag):
+        self.calls.append(("set_fullscreen", flag))
+
+    def video_set_mouse_input(self, flag):
+        pass
+
+    def video_set_key_input(self, flag):
+        pass
+
+
+class AnchorInstance:
+    def __init__(self, mp):
+        self.mp = mp
+
+    def media_player_new(self):
+        return self.mp
+
+    def media_new(self, path):
+        return ("media", path)
+
+
+def embedded_anchor():
+    """Every load hands libvlc our drawable again and turns its own
+    fullscreen off - a guard only, as real libvlc keeps both across loads
+    already. And once a drawable is set, set_fullscreen reports that it
+    does nothing rather than pretend."""
+    saved = players.vlc, players._tk_nsview
+    try:
+        # Windows: the hwnd is given to the constructor
+        mp = AnchorMP()
+        players.vlc = types.SimpleNamespace(
+            Instance=lambda *args: AnchorInstance(mp),
+            EventType=FAKE_VLC.EventType, State=FAKE_VLC.State)
+        p = players.EmbeddedPlayer(0x1234)
+        for film in ("one.mkv", "two.mkv"):
+            mp.calls.clear()
+            p.load(film)
+            assert mp.calls == [("set_media", ("media", film)),
+                                ("set_hwnd", 0x1234),
+                                ("set_fullscreen", False)], mp.calls
+        mp.calls.clear()
+        assert p.set_fullscreen(True) is False
+        assert mp.calls == [], mp.calls
+        print("embedded, Windows: every load re-anchors the hwnd, libvlc "
+              "fullscreen off; set_fullscreen reports a no-op")
+
+        # macOS: the NSView arrives later, through attach_tk
+        mp = AnchorMP()
+        p = players.EmbeddedPlayer._around(AnchorInstance(mp), mp)
+        players._tk_nsview = lambda wid: 0xD0A
+        assert p.attach_tk(42) is True
+        mp.calls.clear()
+        p.load("one.mkv")
+        assert mp.calls == [("set_media", ("media", "one.mkv")),
+                            ("set_nsobject", 0xD0A),
+                            ("set_fullscreen", False)], mp.calls
+        mp.calls.clear()
+        assert p.set_fullscreen(True) is False
+        assert mp.calls == [], mp.calls
+        print("embedded, macOS: every load re-anchors the NSView too")
+
+        # no drawable: the window is libvlc's own, and so is fullscreen
+        mp = AnchorMP()
+        p = players.EmbeddedPlayer._around(AnchorInstance(mp), mp)
+        p.load("one.mkv")
+        assert mp.calls == [("set_media", ("media", "one.mkv"))], mp.calls
+        assert p.set_fullscreen(True) is True
+        assert mp.calls[-1] == ("set_fullscreen", True), mp.calls
+        print("embedded, no drawable: load leaves it alone, fullscreen is "
+              "libvlc's")
+    finally:
+        players.vlc, players._tk_nsview = saved
+
+
 def main():
     # 1. the clock: dated position vs truth, despite stale, late events
     p, mp = make()
@@ -225,6 +435,12 @@ def main():
     assert mp._rate() == 1.0, mp._rate()
     print("pause during a trim: correction cancelled, rate back to 1x")
     mp.stop()
+
+    # 5. external VLC: a second film, a fresh spawn, a Tk path
+    external_load()
+
+    # 6. embedded: the drawable is re-anchored on every load
+    embedded_anchor()
     print("PLAYERS TEST PASSED")
 
 
