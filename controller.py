@@ -45,6 +45,7 @@ LOW_CONFIDENCE = 0.55      # video-match trust threshold
 DRIFT_TOLERANCE = 0.35
 PAUSE_LOOK_BACK = 25.0     # resume search: behind the pause point...
 PAUSE_LOOK_AHEAD = 40.0    # ...and ahead of it, plus time since the pause
+SESSION_CLOSE_WAIT = 1.5   # how long quitting waits for a session to end
 IS_MAC = sys.platform == "darwin"
 
 
@@ -544,8 +545,26 @@ class SyncController:
 
     def leave(self):
         if self.session is not None:
-            self.session.stop()
-            self.session = None
+            self._end_session()
+
+    def _end_session(self):
+        """Stop the session in the background; returns the thread doing it.
+        Stopping says goodbye to the relay and waits out the websocket's
+        closing handshake - seconds on an unreachable relay, which is just
+        when people reach for Leave - and the shells call this on the UI
+        thread. The stop flag goes up before this returns, so the
+        session's loops (a viewer's drives the player) stand down now."""
+        sess, self.session = self.session, None
+        sess.stop_flag.set()
+
+        def stop():
+            try:
+                sess.stop()
+            except Exception as e:
+                diagnostics.log(f"session stop failed: {e!r}")
+        closer = threading.Thread(target=stop, daemon=True)
+        closer.start()
+        return closer
 
     # ------------------------------------------------------------ logging
 
@@ -616,10 +635,10 @@ class SyncController:
     def close(self):
         self._closing = True
         if self.session is not None:
-            try:
-                self.session.stop()
-            except Exception:
-                pass
+            # give the goodbye a moment to go out before the player stops,
+            # but a dead relay must not hold the window open for its whole
+            # close timeout
+            self._end_session().join(SESSION_CLOSE_WAIT)
         if self._monitor is not None:
             self._monitor.stop()
         try:
