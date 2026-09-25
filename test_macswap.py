@@ -11,7 +11,9 @@ thread each System Events round trip ran on. What is tested:
   libvlc's own fullscreen does nothing once the film renders into our
   window, so the swap used to leave the film fullscreen over the
   browser and the next Cmd-Shift-F took two presses;
-- a swap that fails hands back the fullscreen it took away;
+- a swap that fails hands back the fullscreen it took away, and does
+  not latch: the next pause tries again, and a resume after a failed
+  pause has no browser to hide;
 - the osascript round trips never run on the Tk thread (each can block
   for seconds - the first waits on the Automation prompt - and pausing
   used to freeze the UI for that long), and the browser is looked up
@@ -328,12 +330,30 @@ def test_failed_swap_gives_fullscreen_back():
     assert pump(app, lambda: "App swap failed" in status(app)
                 and app.fullscreen), (status(app), fullscreen(app))
     assert fullscreen(app) == (True, True) and not app._was_fullscreen
-    # ...and the failure does not latch: the next pause tries again
+    # ...and the failure does not latch: the stream's resume finds no
+    # browser to hide, and its next pause tries again
     mac.fail = set()
     app._stream_swap(False)
+    idle(app)
+    assert mac.names() == ["list_gui_apps", "activate_app"], \
+        f"a resume after a failed pause hid the browser: {mac.names()}"
     app._stream_swap(True)
     assert pump(app, lambda: app._swapped), mac.names()
     assert mac.names().count("activate_app") == 2
+
+    # a pause straight after a failed one, with no resume between (auto
+    # follow restarted while the stream stays paused), tries again too
+    app, mac = make()
+    app._toggle_fullscreen()
+    mac.fail = {"activate_app"}
+    app._stream_swap(True)
+    assert pump(app, lambda: "App swap failed" in status(app)
+                and app.fullscreen), (status(app), fullscreen(app))
+    mac.fail = set()
+    app._stream_swap(True)
+    assert pump(app, lambda: app._swapped), \
+        f"the failed pause latched - the next one never ran: {mac.names()}"
+    assert fullscreen(app) == (False, False) and app._was_fullscreen
 
     # the browser came up, but hiding it again on resume fails
     app, mac = make()
