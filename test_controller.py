@@ -13,6 +13,8 @@ to leave playback alone:
 - a weak match on Resync does not move the film; the very first sync
   still uses its best guess;
 - a weak first look listens longer before giving up;
+- auto mode checks every interval, timed from the start of each pass,
+  and while it holds a pause it listens again as soon as a look ends;
 - a pause auto mode made survives a manual sync that was not applied
   (the film once stayed paused for good), and is handed back when the
   interruption plays the film, loads another or switches player;
@@ -504,6 +506,45 @@ def test_held_pause_is_only_that_films():
     print("auto pause: let go once another film, or the other player, is up")
 
 
+def test_auto_passes_timed_from_their_start():
+    # "checking every 30 s" means every 30 s, and while auto mode holds a
+    # pause it listens again as soon as a look ends, so a stream that
+    # resumes is heard at the next look. Timing each pass from its end
+    # added the listen to every interval, and left a paused film deaf for
+    # 8 s after every 8 s of listening
+    ctl, stream, player, clock, q = make()
+    ctl.auto_enabled = True
+    run_sync(ctl, ctl.sync, "", "", "audio")
+    passes = []
+    hear = controller.audio_matcher.find_match_audio
+
+    def find(path, feats, lo=None, hi=None, progress=None):
+        t0, seconds = feats
+        if seconds == controller.AUTO_RECORD_SECONDS:
+            passes.append(t0)             # a pass's first look starts it
+        return hear(path, feats, lo, hi, progress)
+    controller.audio_matcher.find_match_audio = find
+
+    def gaps(a, b):
+        ts = [t - start for t in passes if a <= t - start < b]
+        return [round(y - x, 1) for x, y in zip(ts, ts[1:])]
+
+    def followed():
+        assert not player.playing, "auto mode did not follow the pause"
+    start = clock.now
+    run_loop(ctl, clock, 380, [
+        (200, stream.pause),
+        (260, followed)])                 # then watching for the resume
+    tracking, watching = gaps(0, 200), gaps(260, 380)
+    assert tracking and all(g <= ctl.auto_interval + 0.5 for g in tracking), \
+        f"checking every {ctl.auto_interval} s took {tracking}"
+    listen = controller.AUTO_RETRY_SECONDS
+    assert watching and all(g <= listen + 1 for g in watching), \
+        f"a paused film listened for {listen:.0f} s every {watching} s"
+    print(f"auto cadence: checks every {max(tracking):.0f} s, and a held "
+          f"pause listens again within {max(watching) - listen:.1f} s")
+
+
 def test_real_pause_and_resume():
     ctl, stream, player, clock, q = make()
     run_sync(ctl, ctl.sync, "", "", "audio")
@@ -811,6 +852,7 @@ def main():
     test_weak_first_look_listens_longer()
     test_false_pause_recovers()
     test_real_pause_and_resume()
+    test_auto_passes_timed_from_their_start()
     test_auto_pause_survives_weak_resync()
     test_held_pause_is_only_that_films()
     test_long_pause_window_bounded()

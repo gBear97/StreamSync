@@ -585,13 +585,16 @@ class SyncController:
                 continue
             if time.monotonic() < next_at:
                 continue
+            # a pass is timed from its start: "every 30 s" is every 30 s,
+            # and a held pause listens again as soon as a look ends. A
+            # failure backs off from when it failed
+            began = time.monotonic()
             try:
-                wait = self.auto_step(state)
+                next_at = began + self.auto_step(state)
             except Exception as e:
-                wait = self._auto_failed(state, e)
+                next_at = time.monotonic() + self._auto_failed(state, e)
             else:
                 state.update(fail_sig=None, fail_n=0)   # a clean check
-            next_at = time.monotonic() + wait
 
     # ----------------------------------------------------------- sessions
 
