@@ -3,7 +3,8 @@ Pillow
 mss
 imageio-ffmpeg
 python-vlc
-soundcard
+# pinned: its WASAPI loopback fills idle time with zeros, so stream dead air reads as silence
+soundcard==0.4.6
 websockets
 keyboard; sys_platform == "win32"
 certifi
