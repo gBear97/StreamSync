@@ -49,13 +49,15 @@ IS_MAC = sys.platform == "darwin"
 
 
 def fmt_time(s):
-    s = max(0.0, float(s))
-    h, rem = divmod(int(s), 3600)
+    # whole tenths, so rounding carries: rounding only the fraction of
+    # 119.96 gave the impossible "1:60.0"
+    tenths = int(round(max(0.0, float(s)) * 10))
+    whole, frac = divmod(tenths, 10)
+    h, rem = divmod(whole, 3600)
     m, sec = divmod(rem, 60)
-    frac = s - int(s)
     if h:
-        return f"{h}:{m:02d}:{sec + frac:04.1f}"
-    return f"{m}:{sec + frac:04.1f}"
+        return f"{h}:{m:02d}:{sec:02d}.{frac}"
+    return f"{m}:{sec:02d}.{frac}"
 
 
 def parse_time(text):
