@@ -16,11 +16,14 @@ judgement - when to seek, how far, and when to leave playback alone:
   playing) recovers, because the resume search grows with time;
 - nudges during a watch party go to the session, which would otherwise
   undo them;
+- leaving a session, or quitting, does not wait on the relay (the UI
+  thread froze for the websocket's closing handshake);
 - the time readout carries its rounding (119.96 s once read "1:60.0").
 """
 
 import queue
 import threading
+import time
 
 import controller
 import session
@@ -297,6 +300,54 @@ def test_viewer_nudge_goes_to_session():
     print("watch party: nudges go to the session's offset")
 
 
+class SlowSession:
+    """A session whose stop() hangs, as a websocket closing handshake does
+    when the relay has gone away - and whose stop flag only goes up once
+    it is done, so a caller that relies on stop() for it is caught."""
+    def __init__(self, hang=5.0, order=None):
+        self.stop_flag = threading.Event()
+        self.hang = hang
+        self.order = order if order is not None else []
+        self.called = threading.Event()
+
+    def stop(self):
+        self.called.set()
+        time.sleep(self.hang)
+        self.stop_flag.set()
+        self.order.append("session")
+
+
+def test_session_teardown_does_not_block():
+    ctl, stream, player, clock, q = make()
+    sess = ctl.session = SlowSession()
+    t = time.perf_counter()
+    ctl.leave()
+    took = time.perf_counter() - t
+    assert took < 0.5, f"Leave blocked the UI thread for {took:.1f} s"
+    assert sess.stop_flag.is_set() and not ctl.session_running(), \
+        "the session was still running when Leave returned"
+    assert sess.called.wait(2), "the session was never stopped"
+
+    ctl, stream, player, clock, q = make()
+    sess = ctl.session = SlowSession()
+    t = time.perf_counter()
+    ctl.close()
+    took = time.perf_counter() - t
+    assert took < controller.SESSION_CLOSE_WAIT + 0.5, \
+        f"quitting waited {took:.1f} s on the relay"
+    assert sess.stop_flag.is_set(), "the session was still running at quit"
+
+    # a relay that answers still gets its goodbye before the player stops
+    order = []
+    ctl, stream, player, clock, q = make()
+    ctl.session = SlowSession(hang=0.2, order=order)
+    player.stop = lambda: order.append("player")
+    ctl.close()
+    assert order == ["session", "player"], order
+    print("sessions: Leave returns at once, quitting waits "
+          f"{controller.SESSION_CLOSE_WAIT:.1f} s at most")
+
+
 def test_fmt_time_carries():
     fmt = controller.fmt_time
     cases = {0: "0:00.0", 59.94: "0:59.9", 59.96: "1:00.0",
@@ -323,6 +374,7 @@ def main():
     test_false_pause_recovers()
     test_real_pause_and_resume()
     test_viewer_nudge_goes_to_session()
+    test_session_teardown_does_not_block()
     test_fmt_time_carries()
     print("CONTROLLER TEST PASSED")
 
