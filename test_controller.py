@@ -318,7 +318,9 @@ class FilmPlayer(Player):
         super().sync_seek(match_t, t0, offset)
 
 
-def test_switch_back_loads_the_film():
+def switchable():
+    """A controller whose players both need the film loaded, with
+    external VLC standing by."""
     clock = Clock()
     stream = Stream(clock)
     install_fakes(stream)
@@ -329,7 +331,26 @@ def test_switch_back_loads_the_film():
     ctl._now = clock
     ctl._log = lambda *a, **k: None
     ctl.external = external             # no real VLC to start
+    return ctl, stream, embedded, external, q
 
+
+def test_switch_back_loads_the_film():
+    # the usual way: a film opened in the built-in player, synced and
+    # paused, is neither reloaded nor restarted by a trip to VLC and back
+    ctl, stream, embedded, external, q = switchable()
+    ctl.load_file("film.mkv")
+    run_sync(ctl, ctl.sync, "", "", "audio")
+    assert embedded.seeks, statuses(q)
+    embedded.pause()
+    here = embedded.pos()
+    run_sync(ctl, ctl.use_external, False)
+    assert external.films == ["film.mkv"]
+    ctl.use_embedded()
+    assert embedded.films == ["film.mkv"] and embedded.pos() == here, \
+        f"switching back reloaded the film opened in the built-in " \
+        f"player: {embedded.films}, at {embedded.pos()} not {here}"
+
+    ctl, stream, embedded, external, q = switchable()
     # a film opened while external VLC has playback goes to VLC alone...
     run_sync(ctl, ctl.use_external, False)
     run_sync(ctl, ctl.load_file, "film.mkv")
@@ -359,7 +380,7 @@ def test_switch_back_loads_the_film():
     ctl.use_embedded()
     assert embedded.films == ["film.mkv", "sequel.mkv"], \
         f"the built-in player kept the film it had before: {embedded.films}"
-    print("player switch: the built-in player gets the film opened in VLC")
+    print("player switch: the built-in player keeps its film, gets VLC's")
 
 
 def main():
