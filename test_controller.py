@@ -23,8 +23,9 @@ to leave playback alone:
 - a film that cannot be read (its drive unplugged) is not taken for a
   paused stream: the same failure three times running is reported once
   and switches auto mode off - whether the film was playing or auto mode
-  had paused it and was waiting for the stream - while a silent capture
-  is still a pause;
+  had paused it and was waiting for the stream - while failures that
+  differ, in type or in message, are not a run, and a silent capture is
+  still a pause;
 - nudges during a watch party go to the session, which would otherwise
   undo them, and a session that takes the playhead while auto mode is
   listening is not overruled by what auto mode then finds;
@@ -619,9 +620,13 @@ def test_give_up_needs_a_run():
     ctl, offs, left = run([a, a, None] * 3)
     assert not offs and ctl.auto_enabled and not left, offs
     assert len(controller.diagnostics.blocks) == 3   # one per streak
-    # different failures in turn are not the same failure repeating
-    ctl, offs, left = run([a, b] * 4)
-    assert not offs and ctl.auto_enabled and not left, offs
+    # different failures in turn are not the same failure repeating - and
+    # a failure is what went wrong, not just its type: one kind with two
+    # messages is two failures, and so is one message from two kinds
+    other = controller.matcher.MatchError("Audio scan produced no candidates.")
+    for c in (b, other, RuntimeError(str(a))):
+        ctl, offs, left = run([a, c] * 4)
+        assert not offs and ctl.auto_enabled and not left, (c, offs)
     # an idle spell (unticked, re-ticked) starts the count over...
     ctl, offs, left = run([a] * 5, [(45, False), (50, True)])
     assert len(offs) == 1 and not left, (offs, left)
