@@ -13,8 +13,9 @@ On real libvlc the same code measured: sync error 5-9 ms median (was
 seek-based nudge netted about -170 ms). This test holds the logic to
 that without needing VLC installed.
 
-It also pins what loading a film sends external VLC - its HTTP commands
-and its command line - with a fake that records them.
+It also pins what loading a film sends each player - external VLC's HTTP
+commands and command line, the embedded player's drawable - with fakes
+that record the calls.
 """
 
 import os
@@ -290,6 +291,98 @@ def external_load():
             p.stop()
 
 
+class AnchorMP:
+    """The libvlc media player calls a load and a fullscreen make, in order."""
+
+    def __init__(self):
+        self.calls = []
+
+    def event_manager(self):
+        return types.SimpleNamespace(event_attach=lambda _type, cb: None)
+
+    def set_media(self, m):
+        self.calls.append(("set_media", m))
+
+    def set_hwnd(self, h):
+        self.calls.append(("set_hwnd", h))
+
+    def set_nsobject(self, v):
+        self.calls.append(("set_nsobject", v))
+
+    def set_fullscreen(self, flag):
+        self.calls.append(("set_fullscreen", flag))
+
+    def video_set_mouse_input(self, flag):
+        pass
+
+    def video_set_key_input(self, flag):
+        pass
+
+
+class AnchorInstance:
+    def __init__(self, mp):
+        self.mp = mp
+
+    def media_player_new(self):
+        return self.mp
+
+    def media_new(self, path):
+        return ("media", path)
+
+
+def embedded_anchor():
+    """Every load hands libvlc our drawable again and turns its own
+    fullscreen off - a guard only, as real libvlc keeps both across loads
+    already. And once a drawable is set, set_fullscreen reports that it
+    does nothing rather than pretend."""
+    saved = players.vlc, players._tk_nsview
+    try:
+        # Windows: the hwnd is given to the constructor
+        mp = AnchorMP()
+        players.vlc = types.SimpleNamespace(
+            Instance=lambda *args: AnchorInstance(mp),
+            EventType=FAKE_VLC.EventType, State=FAKE_VLC.State)
+        p = players.EmbeddedPlayer(0x1234)
+        for film in ("one.mkv", "two.mkv"):
+            mp.calls.clear()
+            p.load(film)
+            assert mp.calls == [("set_media", ("media", film)),
+                                ("set_hwnd", 0x1234),
+                                ("set_fullscreen", False)], mp.calls
+        mp.calls.clear()
+        assert p.set_fullscreen(True) is False
+        assert mp.calls == [], mp.calls
+        print("embedded, Windows: every load re-anchors the hwnd, libvlc "
+              "fullscreen off; set_fullscreen reports a no-op")
+
+        # macOS: the NSView arrives later, through attach_tk
+        mp = AnchorMP()
+        p = players.EmbeddedPlayer._around(AnchorInstance(mp), mp)
+        players._tk_nsview = lambda wid: 0xD0A
+        assert p.attach_tk(42) is True
+        mp.calls.clear()
+        p.load("one.mkv")
+        assert mp.calls == [("set_media", ("media", "one.mkv")),
+                            ("set_nsobject", 0xD0A),
+                            ("set_fullscreen", False)], mp.calls
+        mp.calls.clear()
+        assert p.set_fullscreen(True) is False
+        assert mp.calls == [], mp.calls
+        print("embedded, macOS: every load re-anchors the NSView too")
+
+        # no drawable: the window is libvlc's own, and so is fullscreen
+        mp = AnchorMP()
+        p = players.EmbeddedPlayer._around(AnchorInstance(mp), mp)
+        p.load("one.mkv")
+        assert mp.calls == [("set_media", ("media", "one.mkv"))], mp.calls
+        assert p.set_fullscreen(True) is True
+        assert mp.calls[-1] == ("set_fullscreen", True), mp.calls
+        print("embedded, no drawable: load leaves it alone, fullscreen is "
+              "libvlc's")
+    finally:
+        players.vlc, players._tk_nsview = saved
+
+
 def main():
     # 1. the clock: dated position vs truth, despite stale, late events
     p, mp = make()
@@ -345,6 +438,9 @@ def main():
 
     # 5. external VLC: a second film, a fresh spawn, a Tk path
     external_load()
+
+    # 6. embedded: the drawable is re-anchored on every load
+    embedded_anchor()
     print("PLAYERS TEST PASSED")
 
 
