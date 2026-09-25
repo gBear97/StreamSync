@@ -13,6 +13,8 @@ import ast
 import os
 import sys
 import tempfile
+import threading
+import types
 
 import diagnostics
 
@@ -157,12 +159,16 @@ try:
        os.path.getsize(diagnostics.LOG_FILE) < 1000)
 
     # The whole point is evidence surviving a crash nobody watched.
-    saved_hook = sys.excepthook
+    saved_hook, saved_thread_hook = sys.excepthook, threading.excepthook
     try:
-        # Silence the hook we chain to, so a passing run prints no
+        # Silence the hooks we chain to, so a passing run prints no
         # traceback and a real failure is the only thing on screen.
-        chained = []
+        chained, thread_chained = [], []
         sys.excepthook = lambda *a: chained.append(a)
+        threading.excepthook = thread_chained.append
+        diagnostics.install_excepthook()
+        # streamsync.py installs the hooks, then the shell again: that
+        # must not log every crash twice.
         diagnostics.install_excepthook()
         inner = sys.excepthook
         try:
@@ -174,8 +180,66 @@ try:
         ok("an uncaught exception reaches the log",
            "UNCAUGHT EXCEPTION" in body and "boom" in body)
         ok("and is still passed on to the previous hook", len(chained) == 1)
+        check("installing the hooks twice logs a crash once",
+              body.count("ValueError: boom"), 1)
+
+        # Where the app's crashes actually happen: listening, matching
+        # and seeking all run on worker threads, whose exceptions never
+        # reach sys.excepthook.
+        def listen():
+            raise RuntimeError("worker boom")
+
+        worker = threading.Thread(target=listen, name="audio-worker")
+        worker.start()
+        worker.join()
+        with open(diagnostics.LOG_FILE) as f:
+            body = f.read()
+        ok("a worker thread's exception reaches the log",
+           "RuntimeError: worker boom" in body)
+        ok("with its full traceback",
+           "Traceback (most recent call last)" in body
+           and "in listen" in body)
+        ok("naming the thread it killed", "'audio-worker'" in body)
+        check("and is still passed on to the previous thread hook",
+              [a.exc_type for a in thread_chained], [RuntimeError])
+
+        # A thread quitting on purpose is not a crash.
+        quitter = threading.Thread(target=sys.exit, name="quitter")
+        quitter.start()
+        quitter.join()
+        with open(diagnostics.LOG_FILE) as f:
+            ok("a thread's SystemExit is not logged as a crash",
+               "'quitter'" not in f.read())
     finally:
-        sys.excepthook = saved_hook
+        sys.excepthook, threading.excepthook = saved_hook, saved_thread_hook
+
+    # A Tk callback's exception is caught by Tk itself and printed to a
+    # stderr the windowed build does not have - the button just does
+    # nothing. Driven through tkinter's own callback wrapper on a root
+    # that never opens a window.
+    def on_click():
+        raise KeyError("tk boom")
+
+    try:
+        import tkinter
+    except ImportError:          # a Python built without Tk: call it as Tk would
+        tk_root = types.SimpleNamespace()
+        diagnostics.install_tk_hook(tk_root)
+        try:
+            on_click()
+        except KeyError:
+            tk_root.report_callback_exception(*sys.exc_info())
+    else:
+        tk_root = tkinter.Tk.__new__(tkinter.Tk)
+        tk_root.master = None
+        diagnostics.install_tk_hook(tk_root)
+        tkinter.CallWrapper(on_click, None, tk_root)()
+    with open(diagnostics.LOG_FILE) as f:
+        body = f.read()
+    ok("a Tk callback's exception reaches the log",
+       "UNCAUGHT EXCEPTION in a Tk callback" in body
+       and "KeyError: 'tk boom'" in body)
+    ok("with its full traceback", "in on_click" in body)
 
     # A read-only log directory must not take the app down with it.
     diagnostics.LOG_FILE = "/nonexistent/nowhere/streamsync.log"
@@ -186,6 +250,21 @@ try:
         fails.append(f"log raised when it could not write: {e!r}")
 finally:
     diagnostics.LOG_DIR, diagnostics.LOG_FILE = saved_dir, saved_file
+
+# --- both shells install the hooks ---------------------------------------
+# A shell can be launched directly (`python app.py`, and CI's --selftest)
+# without streamsync.py, and only a shell holds the Tk root. Read rather
+# than run: main() opens the real window.
+for shell in ("app.py", "mac_app.py"):
+    tree = ast.parse(open(shell, encoding="utf-8").read(), shell)
+    main_fn = next(n for n in tree.body
+                   if isinstance(n, ast.FunctionDef) and n.name == "main")
+    called = {f"{n.func.value.id}.{n.func.attr}" for n in ast.walk(main_fn)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+              and isinstance(n.func.value, ast.Name)}
+    for hook in ("diagnostics.install_excepthook",
+                 "diagnostics.install_tk_hook"):
+        ok(f"{shell} main() calls {hook}", hook in called)
 
 # --- probing must never be what breaks the app ---------------------------
 # It runs while diagnosing an already-broken machine, so every part of it
@@ -204,8 +283,6 @@ finally:
 # match" - with playback into a window that did not exist, because libvlc's
 # macOS output renders nothing until handed an NSView. attach_tk is that
 # handoff; these pin its contract without needing a Mac or VLC.
-import types
-
 import players
 
 if sys.platform != "darwin":
