@@ -433,9 +433,10 @@ class SyncController:
     def auto_step(self, state):
         """One pass of auto mode; returns seconds until the next pass.
 
-        `state` carries mode ("normal" or "probe"), failures, pause_point
-        and paused_at across passes. Split out of the loop so tests can
-        drive it without threads or sleeps.
+        `state` carries mode ("normal" or "probe"), failures, pause_point,
+        paused_at and film (what auto mode paused) across passes; held
+        marks a pause kept while auto mode stood aside. Split out of the
+        loop so tests can drive it without threads or sleeps.
         """
         player = self.player
         gen = self._gen
@@ -475,12 +476,21 @@ class SyncController:
                 player.pause()
                 state.update(mode="probe",
                              pause_point=state.get("miss_point", here),
-                             paused_at=self._now())
+                             paused_at=self._now(),
+                             film=(self.video_path, player))
                 self.q.put(("swap", True))
                 self._say("Auto: film audio not found on the stream - "
                           "assuming pause. Watching for resume...")
                 return 8
             return 10
+        if state.pop("held", False) and (
+                state["film"] != (self.video_path, player)
+                or player.is_playing()):
+            # auto mode stood aside with this film paused, and meanwhile it
+            # was played (a manual sync that applied, the user) or another
+            # film loaded: the pause is not auto mode's to lift any more
+            state.update(mode="normal", failures=0)
+            return 1
         # probe: paused, waiting for the stream to resume. If the "pause"
         # was really a stretch the matcher could not hear, the stream kept
         # playing - so the window grows with the time since, or the film
@@ -524,7 +534,13 @@ class SyncController:
             time.sleep(0.5)
             if (not self.auto_enabled or self._busy or not self.video_path
                     or self.session_running()):  # sessions own the playhead
-                state.update(mode="normal", failures=0)
+                if state["mode"] == "probe":
+                    # a pause auto mode made is still its to lift: nobody
+                    # else will, and a weak Resync (not applied) leaves the
+                    # film paused where normal mode would ignore it for good
+                    state["held"] = True
+                else:
+                    state.update(mode="normal", failures=0)
                 continue
             if time.monotonic() < next_at:
                 continue

@@ -12,6 +12,9 @@ judgement - when to seek, how far, and when to leave playback alone:
 - a weak match on Resync does not move the film; the very first sync
   still uses its best guess;
 - a weak first look listens longer before giving up;
+- a pause auto mode made survives a manual sync that was not applied
+  (the film once stayed paused for good), and is handed back when the
+  interruption plays the film;
 - a false pause (a stretch the matcher cannot hear while the stream keeps
   playing) recovers, because the resume search grows with time - in
   steps, and only so far, so a long real pause does not decode ever more
@@ -27,6 +30,7 @@ judgement - when to seek, how far, and when to leave playback alone:
 import queue
 import threading
 import time
+import types
 
 import controller
 import session
@@ -197,6 +201,50 @@ def run_sync(ctl, fn, *args):
         controller.threading.Thread = real
 
 
+def press(ctl, fn, *args):
+    """A sync button pressed: claimed now, as the UI thread does, with its
+    worker handed back to run later - so an auto loop in between sees the
+    sync running."""
+    workers = []
+    real = threading.Thread
+
+    class Deferred:
+        def __init__(self, target, args=(), daemon=None):
+            workers.append(lambda: target(*args))
+
+        def start(self):
+            pass
+    controller.threading.Thread = Deferred
+    try:
+        assert fn(*args), "the sync did not start"
+    finally:
+        controller.threading.Thread = real
+    return workers[0]
+
+
+def run_loop(ctl, clock, seconds, events=()):
+    """Run the real _auto_loop, on this thread, for `seconds` of simulated
+    time. Its sleeps advance the clock; `events` are (after, fn) pairs run
+    once `after` seconds have passed, so the loop meets a button press or
+    a session start between its passes, as it would live."""
+    start = clock.now
+    todo = sorted(events, key=lambda e: e[0])
+
+    def sleep(dt):
+        clock.now += dt
+        while todo and clock.now - start >= todo[0][0]:
+            todo.pop(0)[1]()
+        if clock.now - start >= seconds:
+            ctl._closing = True
+    real = controller.time
+    controller.time = types.SimpleNamespace(sleep=sleep, monotonic=clock)
+    ctl._closing = False
+    try:
+        ctl._auto_loop()
+    finally:
+        controller.time = real
+
+
 def statuses(q):
     out = []
     while not q.empty():
@@ -310,6 +358,55 @@ def test_long_pause_window_bounded():
     assert state["mode"] == "normal" and abs(player.pos() - stream.pos()) < 1e-6
     print(f"long pause: {len(windows)} looks in an hour used {len(shapes)} "
           f"windows reaching {reach:.0f} s ahead, then resumed in place")
+
+
+def test_auto_pause_survives_weak_resync():
+    ctl, stream, player, clock, q = make()
+    ctl.auto_enabled = True
+    run_sync(ctl, ctl.sync, "", "", "audio")
+    seen = {}
+    sync = []
+
+    def paused():
+        assert not player.playing, "auto mode did not follow the pause"
+        seen["seeks"] = len(player.seeks)
+
+    def still_paused():
+        # the stream is still paused, so the Resync was weak: not applied
+        assert any("NOT applied" in m for m in statuses(q))
+        assert not player.playing and len(player.seeks) == seen["seeks"]
+
+    def resumed():
+        assert player.playing, "the film auto mode paused was never resumed"
+        assert abs(player.pos() - stream.pos()) < 1e-6
+
+    def resynced_by_hand():
+        sync.pop()()            # the stream is back, so this one applies
+        assert player.playing
+        seen["seeks"] = len(player.seeks)
+
+    def handed_back():
+        assert len(player.seeks) == seen["seeks"], \
+            "auto mode 'resumed' a film a manual sync had already resumed"
+    run_loop(ctl, clock, 330, [
+        (0, stream.pause),
+        (60, paused),
+        (60, lambda: sync.append(press(ctl, ctl.resync, "", "2:00", "audio"))),
+        (70, lambda: sync.pop()()),
+        (75, still_paused),
+        (100, stream.play),
+        (140, resumed),
+        # paused again, and this time Resync is pressed as the stream
+        # comes back, so it is the manual sync that resumes the film
+        (150, stream.pause),
+        (230, paused),
+        (240, lambda: sync.append(press(ctl, ctl.resync, "", "2:00", "audio"))),
+        (240, stream.play),
+        (255, resynced_by_hand),
+        (330, handed_back)])
+    assert player.playing and abs(player.pos() - stream.pos()) < 1e-6
+    print("auto pause: kept across a weak Resync and resumed with the "
+          "stream; handed back when a Resync resumed it")
 
 
 def test_real_pause_and_resume():
@@ -449,6 +546,7 @@ def main():
     test_weak_first_look_listens_longer()
     test_false_pause_recovers()
     test_real_pause_and_resume()
+    test_auto_pause_survives_weak_resync()
     test_long_pause_window_bounded()
     test_viewer_nudge_goes_to_session()
     test_session_start_mid_listen_wins()
