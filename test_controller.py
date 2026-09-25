@@ -15,7 +15,8 @@ judgement - when to seek, how far, and when to leave playback alone:
 - a false pause (a stretch the matcher cannot hear while the stream keeps
   playing) recovers, because the resume search grows with time;
 - nudges during a watch party go to the session, which would otherwise
-  undo them.
+  undo them;
+- the time readout carries its rounding (119.96 s once read "1:60.0").
 """
 
 import queue
@@ -296,6 +297,24 @@ def test_viewer_nudge_goes_to_session():
     print("watch party: nudges go to the session's offset")
 
 
+def test_fmt_time_carries():
+    fmt = controller.fmt_time
+    cases = {0: "0:00.0", 59.94: "0:59.9", 59.96: "1:00.0",
+             119.96: "2:00.0", 3599.96: "1:00:00.0", 3661.2: "1:01:01.2",
+             -3.0: "0:00.0"}
+    for s, want in cases.items():
+        assert fmt(s) == want, f"fmt_time({s}) = {fmt(s)!r}, want {want!r}"
+    for m in range(1, 150):              # every minute mark to 2.5 h
+        for k in range(-10, 10):
+            s = m * 60 + k / 100
+            out = fmt(s)
+            *hm, sec = out.split(":")
+            assert float(sec) < 60 and all(int(p) < 60 for p in hm[1:]), \
+                f"fmt_time({s}) = {out!r}"
+            assert abs(controller.parse_time(out) - s) <= 0.05 + 1e-9, out
+    print("clock: 119.96 s reads 2:00.0, and no minute mark shows :60")
+
+
 def main():
     test_nudged_film_left_alone()
     test_drift_corrected()
@@ -304,6 +323,7 @@ def main():
     test_false_pause_recovers()
     test_real_pause_and_resume()
     test_viewer_nudge_goes_to_session()
+    test_fmt_time_carries()
     print("CONTROLLER TEST PASSED")
 
 
