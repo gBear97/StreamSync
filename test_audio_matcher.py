@@ -13,8 +13,9 @@ find_match_audio recovers the timestamp. Also covers:
 - a quiet scene inside a loud search window, where uncentered scoring once
   pushed the right answer under the trust gates;
 - an 18 s capture swept across a chunk boundary of a whole-film search,
-  which once hid a 10 s band before every boundary, and the retry
-  ladder's 6/12/18 s looks reusing one decode.
+  which once hid a 10 s band before every boundary, the retry ladder's
+  6/12/18 s looks reusing one decode, and a 25 s capture, which widens
+  the overlap to fit.
 
 bench_audio.py measures real-world accuracy; this only guards regressions.
 """
@@ -169,8 +170,9 @@ def chunk_boundary(clip):
     A search longer than CHUNK_S is cut into chunks, and a capture is only
     found where it fits entirely inside one. With an 8 s overlap, the 18 s
     retry listen could not be found in the 10 s before every boundary - it
-    was answered from somewhere else. The chunks are shrunk to 60 s here
-    so the 3-minute clip has boundaries to sweep across.
+    was answered from somewhere else. A capture too long for the overlap
+    widens it, or the same would happen to it. The chunks are shrunk to
+    60 s here so the 3-minute clip has boundaries to sweep across.
     """
     ladder = (controller.AUDIO_SYNC_SECONDS,) + controller.AUDIO_RETRY_SECONDS
     saved = audio_matcher.CHUNK_S
@@ -198,17 +200,24 @@ def chunk_boundary(clip):
         print(f"chunk cache: {len(chunks)} chunks decoded once for "
               f"{'/'.join(f'{s:.0f}' for s in ladder)} s looks")
 
-        seconds = max(ladder)
-        missed = []
-        for truth in np.arange(38.3, 57.0, 1.0):   # across the one at 60 s
-            t, score, z = look(truth, seconds)
-            if not (abs(t - truth) < 0.12 and score >= audio_matcher.SCORE_OK
-                    and z >= audio_matcher.Z_OK):
-                missed.append(f"{truth:.1f}s -> {t:.1f}s (score {score:.1f}, "
-                              f"z {z:.1f})")
-        print(f"{seconds:.0f} s capture swept across a chunk boundary: "
-              f"{len(missed)} missed")
-        assert not missed, "blind band at a chunk boundary: " + ", ".join(missed)
+        def sweep(seconds, truths):
+            missed = []
+            for truth in truths:
+                t, score, z = look(truth, seconds)
+                if not (abs(t - truth) < 0.12 and score >= audio_matcher.SCORE_OK
+                        and z >= audio_matcher.Z_OK):
+                    missed.append(f"{truth:.1f}s -> {t:.1f}s (score {score:.1f}, "
+                                  f"z {z:.1f})")
+            print(f"{seconds:.0f} s capture swept across a chunk boundary: "
+                  f"{len(missed)} missed")
+            assert not missed, (f"blind band at a chunk boundary ({seconds:.0f} s "
+                                "capture): " + ", ".join(missed))
+
+        sweep(max(ladder), np.arange(38.3, 57.0, 1.0))   # across the one at 60 s
+        # a capture too long for OVERLAP_S widens the overlap to its own
+        # length plus a second; at a fixed 20 s, a 25 s one could not be
+        # found starting 35-40 s, before the boundary at 60 s
+        sweep(25.0, np.arange(34.3, 41.0, 1.0))
     finally:
         audio_matcher.CHUNK_S = saved
 
