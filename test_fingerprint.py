@@ -2,7 +2,8 @@
 
 Covers: hash robustness across re-encodes, rejection of wrong media,
 verify_media offset detection, stream-delay measurement from chunked
-voice fingerprints, and the listen-mode host's pause bookkeeping.
+voice fingerprints, the viewer's measure loop, and the listen-mode
+host's pause bookkeeping.
 
 Delays and offsets are deliberately NOT multiples of the 250 ms
 fingerprint hop: the first version of this test used 7.25 s, which the
@@ -11,8 +12,10 @@ never saw errors of up to 125 ms everywhere else.
 """
 
 import os
+import queue
 import subprocess
 import tempfile
+import time
 import wave
 
 import numpy as np
@@ -202,6 +205,7 @@ def main():
     print("timeline math: delayed pause lands correctly")
 
     listen_mode_pause()
+    measure_loop()
 
     print("FINGERPRINT TEST PASSED")
 
@@ -255,6 +259,79 @@ def listen_mode_pause():
     tr2.miss(1004.0, 1004.0)
     tr2.miss(1008.0, 1004.0)
     assert tr2.hit(900.0, 1020.0) == (900.0, 1020.0, True)
+
+
+def measure_loop():
+    """ViewerSession._measure_loop, fed by a fake loopback monitor.
+
+    A probe ends while the host is still recording the voice it ends on,
+    and the host sends that voice only once its block is whole: measured
+    straight away, the reference is missing the probe's tail and a short
+    delay cannot align (3b). The loop has to wait VOICE_SETTLE first -
+    and, if the viewer leaves meanwhile, not measure at all.
+    """
+    settle = 0.3
+    saved = {k: getattr(session, k, None) for k in
+             ("VOICE_SETTLE", "MEASURE_INTERVAL", "measure_delay")}
+    saved_monitor = session.audio_capture.AudioMonitor
+
+    class UtcClock:
+        def perf_to_utc(self, perf):
+            return perf         # the fake probes are dated in UTC already
+
+    def run(probes, leave=None):
+        """A viewer's measure loop over probes heard from each UTC in
+        `probes`; the viewer leaves as probe `leave` ends. Returns, per
+        measurement, (seconds after its probe ended, probe_t0)."""
+        viewer = session.ViewerSession("ws://unused", "ROOM", None, None,
+                                       queue.Queue())
+        viewer.clock = UtcClock()
+        probes = list(probes)
+        ended, measured = [], []
+
+        class Monitor:
+            def mark(self):
+                return None
+
+            def capture_span(self, seconds, start=None):
+                if not probes:
+                    viewer.stop_flag.set()
+                    raise RuntimeError("no more probes")
+                if len(ended) == leave:
+                    viewer.stop_flag.set()
+                ended.append(time.perf_counter())
+                return (np.zeros(int(seconds * SR), np.float32), SR,
+                        probes.pop(0), None)
+
+            def stop(self):
+                pass
+
+        def measure(voice_buf, samples, sr, probe_t0):
+            measured.append((time.perf_counter() - ended[-1], probe_t0))
+            return None
+
+        session.audio_capture.AudioMonitor = lambda *a, **kw: Monitor()
+        session.measure_delay = measure
+        viewer._measure_loop()
+        return measured
+
+    try:
+        session.VOICE_SETTLE = settle
+        # no pause between probes beyond the settle wait
+        session.MEASURE_INTERVAL = session.MEASURE_SECONDS + settle
+        measured = run([1020.0, 1045.0, 1070.0])
+        assert [t for _, t in measured] == [1020.0, 1045.0, 1070.0], measured
+        assert min(dt for dt, _ in measured) > 0.8 * settle, measured
+        print(f"measure loop: measures {min(dt for dt, _ in measured):.2f} s "
+              f"after each probe ends (VOICE_SETTLE {settle} s here)")
+        measured = run([1020.0, 1045.0], leave=1)
+        assert [t for _, t in measured] == [1020.0], measured
+        print("measure loop: a viewer who leaves while the voice settles "
+              "does not measure")
+    finally:
+        for k, v in saved.items():
+            setattr(session, k, v)
+        session.audio_capture.AudioMonitor = saved_monitor
 
 
 if __name__ == "__main__":
