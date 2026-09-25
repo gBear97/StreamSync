@@ -504,10 +504,11 @@ class SyncController:
         # playing - so the window grows with the time since, or the film
         # would wait forever for audio that has already gone by. It grows
         # a step at a time, because the film's decode is cached by window
-        # and a window that changed every probe was decoded afresh every
-        # probe; and only so far, because a real pause - hours of one, if
-        # the streamer is away - resumes where it stopped, and a search
-        # that kept growing re-decoded more of the film at every look.
+        # (in chunks of up to 900 s) and an edge that moved every probe had
+        # its chunk decoded afresh every probe; and only so far, because a
+        # real pause - hours of one, if the streamer is away - resumes
+        # where it stopped, and a search that kept growing scanned ever
+        # more of the film at every look.
         since = self._now() - state["paused_at"]
         grow = min(math.ceil(since / PAUSE_GROW_STEP) * PAUSE_GROW_STEP,
                    PAUSE_GROW_MAX)
