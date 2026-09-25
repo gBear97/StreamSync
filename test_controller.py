@@ -13,7 +13,9 @@ judgement - when to seek, how far, and when to leave playback alone:
   still uses its best guess;
 - a weak first look listens longer before giving up;
 - a false pause (a stretch the matcher cannot hear while the stream keeps
-  playing) recovers, because the resume search grows with time;
+  playing) recovers, because the resume search grows with time - in
+  steps, and only so far, so a long real pause does not decode ever more
+  of the film at every look;
 - nudges during a watch party go to the session, which would otherwise
   undo them, and a session that takes the playhead while auto mode is
   listening is not overruled by what auto mode then finds;
@@ -278,6 +280,38 @@ def test_false_pause_recovers():
           f"{stream.pos() - state['pause_point']:.0f} s past the pause point")
 
 
+def test_long_pause_window_bounded():
+    ctl, stream, player, clock, q = make()
+    run_sync(ctl, ctl.sync, "", "", "audio")
+    windows = []
+    hear = controller.audio_matcher.find_match_audio
+
+    def spy(path, feats, lo=None, hi=None, progress=None):
+        windows.append((lo, hi))
+        return hear(path, feats, lo, hi, progress)
+    controller.audio_matcher.find_match_audio = spy
+    state = new_state()
+    stream.pause()                    # the streamer steps away for an hour
+    for _ in range(3):
+        clock.now += ctl.auto_step(state)
+    assert state["mode"] == "probe" and not player.playing
+    del windows[:]
+    start = clock.now
+    while clock.now - start < 3600:
+        clock.now += ctl.auto_step(state)
+    shapes = set(windows)
+    assert len(shapes) <= 12, \
+        f"{len(windows)} looks asked for {len(shapes)} different windows"
+    reach = max(hi for lo, hi in windows) - state["pause_point"]
+    limit = controller.PAUSE_LOOK_AHEAD + controller.PAUSE_GROW_MAX
+    assert reach <= limit, f"an hour in, the search reaches {reach:.0f} s ahead"
+    stream.play()
+    clock.now += ctl.auto_step(state)
+    assert state["mode"] == "normal" and abs(player.pos() - stream.pos()) < 1e-6
+    print(f"long pause: {len(windows)} looks in an hour used {len(shapes)} "
+          f"windows reaching {reach:.0f} s ahead, then resumed in place")
+
+
 def test_real_pause_and_resume():
     ctl, stream, player, clock, q = make()
     run_sync(ctl, ctl.sync, "", "", "audio")
@@ -415,6 +449,7 @@ def main():
     test_weak_first_look_listens_longer()
     test_false_pause_recovers()
     test_real_pause_and_resume()
+    test_long_pause_window_bounded()
     test_viewer_nudge_goes_to_session()
     test_session_start_mid_listen_wins()
     test_session_teardown_does_not_block()
