@@ -19,6 +19,9 @@ judgement - when to seek, how far, and when to leave playback alone:
   playing) recovers, because the resume search grows with time - in
   steps, and only so far, so a long real pause does not decode ever more
   of the film at every look;
+- a film that cannot be read (its drive unplugged) is not taken for a
+  paused stream: the same failure three times running is reported once
+  and switches auto mode off, while a silent capture is still a pause;
 - nudges during a watch party go to the session, which would otherwise
   undo them, and a session that takes the playhead while auto mode is
   listening is not overruled by what auto mode then finds;
@@ -164,10 +167,39 @@ def install_fakes(stream):
     controller.audio_matcher.find_match_audio = find
 
 
+def failing_matcher(errors):
+    """Make each look at the film raise the next of `errors` (None: hear
+    the stream as usual). Returns the ones not yet raised."""
+    hear = controller.audio_matcher.find_match_audio
+    todo = list(errors)
+
+    def find(path, feats, lo=None, hi=None, progress=None):
+        e = todo.pop(0) if todo else None
+        if e is not None:
+            raise e
+        return hear(path, feats, lo, hi, progress)
+    controller.audio_matcher.find_match_audio = find
+    return todo
+
+
+class Log:
+    """Stands in for diagnostics: what would have gone to the user's log."""
+    def __init__(self):
+        self.lines = []
+        self.blocks = []          # (title, text), e.g. a traceback
+
+    def log(self, message):
+        self.lines.append(message)
+
+    def log_block(self, title, text):
+        self.blocks.append((title, text))
+
+
 def make(offset=0.0):
     clock = Clock()
     stream = Stream(clock)
     install_fakes(stream)
+    controller.diagnostics = Log()
     player = Player(clock)
     q = queue.Queue()
     ctl = controller.SyncController(q, player,
@@ -245,13 +277,15 @@ def run_loop(ctl, clock, seconds, events=()):
         controller.time = real
 
 
-def statuses(q):
+def drain(q):
     out = []
     while not q.empty():
-        item = q.get()
-        if item[0] == "status":
-            out.append(item[1])
+        out.append(q.get())
     return out
+
+
+def statuses(q):
+    return [item[1] for item in drain(q) if item[0] == "status"]
 
 
 def test_nudged_film_left_alone():
@@ -424,6 +458,83 @@ def test_real_pause_and_resume():
     print("real pause: followed, then resumed in place")
 
 
+def test_vanished_film_gives_up():
+    ctl, stream, player, clock, q = make()
+    ctl.auto_enabled = True
+    run_sync(ctl, ctl.sync, "", "", "audio")
+    drain(q)
+    gone = controller.matcher.MatchError(
+        "ffmpeg could not read this file as a video.")  # drive unplugged
+    failing_matcher([gone] * 100)
+    run_loop(ctl, clock, 600)
+    got = drain(q)
+    offs = [e[1] for e in got if e[0] == "auto_off"]
+    assert offs, "auto mode never gave up on a film it could not read"
+    assert len(offs) == 1 and "still available" in offs[0], offs
+    assert not ctl.auto_enabled
+    assert player.playing, "an unreadable film was taken for a stream pause"
+    failed = [e for e in got if e[0] == "status" and "check failed" in e[1]]
+    assert len(failed) == 1, failed
+    log = controller.diagnostics
+    assert len(log.blocks) == 1 and "MatchError" in log.blocks[0][1], \
+        "want one traceback per failure streak"
+    assert len(log.lines) == 2, log.lines     # one repeat, then giving up
+    print("vanished film: one report, one traceback, then auto re-sync off")
+
+
+def test_give_up_needs_a_run():
+    a = controller.matcher.MatchError("Could not decode audio from the file "
+                                      "in that range.")
+    b = OSError("[Errno 2] No such file or directory")
+
+    def run(errors, arm=()):
+        """`arm`: (after, on) pairs ticking Auto on or off meanwhile."""
+        ctl, stream, player, clock, q = make()
+        ctl.auto_enabled = True
+        run_sync(ctl, ctl.sync, "", "", "audio")
+        drain(q)
+        left = failing_matcher(errors)
+        run_loop(ctl, clock, 400, [
+            (after, lambda on=on: setattr(ctl, "auto_enabled", on))
+            for after, on in arm])
+        offs = [e[1] for e in drain(q) if e[0] == "auto_off"]
+        return ctl, offs, left
+
+    # a clean check in between: a blip each time, never permanent
+    ctl, offs, left = run([a, a, None] * 3)
+    assert not offs and ctl.auto_enabled and not left, offs
+    assert len(controller.diagnostics.blocks) == 3   # one per streak
+    # different failures in turn are not the same failure repeating
+    ctl, offs, left = run([a, b] * 4)
+    assert not offs and ctl.auto_enabled and not left, offs
+    # an idle spell (unticked, re-ticked) starts the count over...
+    ctl, offs, left = run([a] * 5, [(45, False), (50, True)])
+    assert len(offs) == 1 and not left, (offs, left)
+    # ...and anything else gives up too, just worded for what it is
+    ctl, offs, left = run([ValueError("bad window")] * 3)
+    assert len(offs) == 1 and "bad window" in offs[0], offs
+    assert "still available" not in offs[0]
+    print("give-up: only the same failure three times running, counted "
+          "afresh after a clean check or an idle spell")
+
+
+def test_silent_capture_is_a_miss():
+    ctl, stream, player, clock, q = make()
+    ctl.auto_enabled = True
+    run_sync(ctl, ctl.sync, "", "", "audio")
+    drain(q)
+
+    def silence():
+        raise RuntimeError("Captured only silence.")
+    ctl._loopback().on_capture = silence
+    run_loop(ctl, clock, 120)
+    got = drain(q)
+    assert not player.playing, "a silent stream was not followed as a pause"
+    assert not any(e[0] == "auto_off" for e in got)
+    assert not any("check failed" in e[1] for e in got if e[0] == "status")
+    print("silent capture: a stream pause, not a failure")
+
+
 def test_viewer_nudge_goes_to_session():
     ctl, stream, player, clock, q = make()
     viewer = session.ViewerSession("ws://x", "CODE", "film.mkv", player, q)
@@ -548,6 +659,9 @@ def main():
     test_real_pause_and_resume()
     test_auto_pause_survives_weak_resync()
     test_long_pause_window_bounded()
+    test_vanished_film_gives_up()
+    test_give_up_needs_a_run()
+    test_silent_capture_is_a_miss()
     test_viewer_nudge_goes_to_session()
     test_session_start_mid_listen_wins()
     test_session_teardown_does_not_block()

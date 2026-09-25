@@ -897,6 +897,12 @@ class MacApp:
                 elif kind == "busy_off":
                     self.sync_btn.state(["!disabled"])
                     self.resync_btn.state(["!disabled"])
+                elif kind == "auto_off":
+                    # auto mode gave up (details in the log): untick it
+                    # exactly as a manual uncheck would, then say why
+                    self.auto_var.set(False)
+                    self._on_auto_toggle()
+                    self._set_status(payload[0])
         except queue.Empty:
             pass
         self.root.after(80, self._poll_queue)

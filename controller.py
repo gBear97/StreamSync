@@ -16,6 +16,8 @@ It talks to its shell only through the event queue, with the same
     ("show", token)      re-show windows hidden for a screen capture
     ("preview", image)   the frame a video sync captured
     ("busy_off",)        a manual sync finished; re-enable its buttons
+    ("auto_off", text)   auto mode gave up and switched itself off; untick
+                         it as a manual uncheck would, and show `text`
 """
 
 import json
@@ -23,6 +25,7 @@ import math
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +45,8 @@ AUDIO_SYNC_SECONDS = 6.0   # manual sync recording length...
 AUDIO_RETRY_SECONDS = (12.0, 18.0)  # ...extended this far when it is weak
 AUTO_RECORD_SECONDS = 4.0  # auto-mode recording length
 AUTO_RETRY_SECONDS = 8.0   # one longer look before counting a failure
+AUTO_FAIL_GIVEUP = 3       # an auto check failing the same way this many
+                           # times running is not a blip: stop, and say so
 LOW_CONFIDENCE = 0.55      # video-match trust threshold
 DRIFT_TOLERANCE = 0.35
 PAUSE_LOOK_BACK = 25.0     # resume search: behind the pause point...
@@ -415,17 +420,19 @@ class SyncController:
         None. A weak first look gets one longer look before it counts as a
         miss, so a quiet line of dialogue is not mistaken for a pause.
         Silence counts as a miss: a silent stream is a paused stream as far
-        as syncing is concerned."""
+        as syncing is concerned. A film that cannot be read does not: its
+        errors propagate, or a vanished film would pass for a paused
+        stream and be waited on forever."""
         mon = self._loopback()
         start = mon.mark()
         for seconds in (AUTO_RECORD_SECONDS, AUTO_RETRY_SECONDS):
             try:
                 samples, sr, t0 = mon.capture(seconds, start=start)
                 feats = audio_matcher.prep_capture(samples, sr)
-                t, score, z = audio_matcher.find_match_audio(
-                    self.video_path, feats, lo, hi)
-            except (RuntimeError, matcher.MatchError):
+            except RuntimeError:    # heard nothing usable: a miss
                 return None
+            t, score, z = audio_matcher.find_match_audio(
+                self.video_path, feats, lo, hi)
             if trusted(score, z):
                 return t, score, z, t0
         return None
@@ -526,9 +533,39 @@ class SyncController:
         8 s, matching after each look, before it acts."""
         return self._busy or self._gen != gen or self.session_running()
 
+    def _auto_failed(self, state, e):
+        """A pass that raised `e`; returns seconds until the next. The same
+        failure every time is not a blip - the film's drive unplugged, the
+        file moved - and reporting it every interval forever helps no one.
+        The first of a run is reported, with one traceback in the log;
+        repeats get a log line; the AUTO_FAIL_GIVEUP-th in a row says what
+        is wrong once and switches auto mode off."""
+        sig = (type(e).__name__, str(e))
+        n = state["fail_n"] + 1 if sig == state["fail_sig"] else 1
+        state.update(fail_sig=sig, fail_n=n)
+        if n == 1:
+            self._say(f"Auto-resync check failed: {e}")
+            diagnostics.log_block("auto re-sync check failed:",
+                                  "".join(traceback.format_exception(e)))
+        elif n < AUTO_FAIL_GIVEUP:
+            diagnostics.log(f"auto re-sync check failed again "
+                            f"({n}/{AUTO_FAIL_GIVEUP}): {sig[0]}: {e}")
+        else:
+            diagnostics.log(f"auto re-sync gave up after {n} identical "
+                            f"failures: {sig[0]}: {e}")
+            if isinstance(e, (OSError, matcher.MatchError)):
+                why = ("can't read the film's audio - check the file is "
+                       "still available")
+            else:
+                why = f"the same error kept coming back ({e})"
+            self.auto_enabled = False
+            self.q.put(("auto_off", f"Auto re-sync stopped: {why}. "
+                                    "Tick Auto re-sync again to retry."))
+        return max(self.auto_interval, 20)
+
     def _auto_loop(self):
         state = {"mode": "normal", "failures": 0, "pause_point": None,
-                 "paused_at": None}
+                 "paused_at": None, "fail_sig": None, "fail_n": 0}
         next_at = 0.0
         while not self._closing:
             time.sleep(0.5)
@@ -541,14 +578,19 @@ class SyncController:
                     state["held"] = True
                 else:
                     state.update(mode="normal", failures=0)
+                # standing aside ends a failure streak: a user retrying
+                # (or re-ticking Auto) gets the full tries again
+                state.update(fail_sig=None, fail_n=0)
                 continue
             if time.monotonic() < next_at:
                 continue
             try:
-                next_at = time.monotonic() + self.auto_step(state)
+                wait = self.auto_step(state)
             except Exception as e:
-                self._say(f"Auto-resync check failed: {e}")
-                next_at = time.monotonic() + max(self.auto_interval, 20)
+                wait = self._auto_failed(state, e)
+            else:
+                state.update(fail_sig=None, fail_n=0)   # a clean check
+            next_at = time.monotonic() + wait
 
     # ----------------------------------------------------------- sessions
 
