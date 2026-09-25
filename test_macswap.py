@@ -21,7 +21,9 @@ thread each System Events round trip ran on. What is tested:
   results interleave with new pauses;
 - closing stops the swap worker before the controller shuts down;
 - a video-capture sync takes the film window off screen too, so the
-  matcher cannot find our own picture inside the capture region.
+  matcher cannot find our own picture inside the capture region;
+- switching back to the built-in player shows its film window and hands
+  libvlc the view, as opening a film does.
 """
 
 import threading
@@ -505,6 +507,38 @@ def test_video_sync_hides_the_film_window():
     print("video sync: the film window is off screen for the capture")
 
 
+def switch(app, kind):
+    app.player_var.set(kind)
+    app._apply_player_choice()
+
+
+def test_switch_to_embedded_shows_the_film_window():
+    # a film opened while External VLC was in use never got a window
+    app, mac = make(film=False)
+    switch(app, "external")
+    app._choose_file()
+    assert not app.video_win.shown and not app.player_backend.attached
+    switch(app, "embedded")
+    assert app.video_win.shown, \
+        "switching to the built-in player left its film window hidden"
+    assert app.player_backend.attached == [app.video_frame.winfo_id()], \
+        "the built-in player was never given the film window's view"
+
+    # a film window closed during External playback comes back, attached once
+    app, mac = make()
+    app.video_win.withdraw()
+    switch(app, "external")
+    switch(app, "embedded")
+    assert app.video_win.shown and len(app.player_backend.attached) == 1
+
+    # no film yet: no empty window
+    app, mac = make(film=False)
+    switch(app, "external")
+    switch(app, "embedded")
+    assert not app.video_win.shown
+    print("player switch: the built-in player gets its film window back")
+
+
 def main():
     test_fullscreen_goes_through_the_film_window()
     test_failed_swap_gives_fullscreen_back()
@@ -513,6 +547,7 @@ def main():
     test_fullscreen_debt_survives_overlapping_swaps()
     test_worker_stops_before_the_controller_closes()
     test_video_sync_hides_the_film_window()
+    test_switch_to_embedded_shows_the_film_window()
     print("MAC SWAP TEST PASSED")
 
 

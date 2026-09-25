@@ -530,6 +530,11 @@ class MacApp:
                 return
         else:
             self.ctl.use_embedded()
+            if self.ctl.video_path:
+                # The show-and-attach every other way into the built-in
+                # player does: a film opened while External VLC was in use
+                # never got a window, and one closed meanwhile stays shut.
+                self._show_video_window()
         self._on_mute_toggle()
         self._save_config()
 
