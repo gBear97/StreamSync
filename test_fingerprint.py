@@ -164,6 +164,33 @@ def main():
         assert d is not None and d < 0.04, (phase, d)
     print("short delay: the voice a probe ends on has arrived when it is measured")
 
+    # 3c. a young session: the viewer holds only the voice sent since it
+    # joined (at base_utc here). Coverage scored over the whole 90 s
+    # look-back kept every viewer on the host's hint for its first ~80 s.
+    for start, true_delay in ((4.0, 2.07), (8.5, 3.96), (13.0, 0.96)):
+        probe_t0 = base_utc + start
+        at = probe_t0 + session.MEASURE_SECONDS + session.VOICE_SETTLE
+        d = session.measure_delay(held(by=at), heard(start - true_delay), SR,
+                                  probe_t0)
+        assert d is not None, f"{at - base_utc:.1f} s in: inconclusive"
+        print(f"young session: {at - base_utc:.1f} s in, true {true_delay:.3f}s, "
+              f"measured {d:.3f}s")
+        assert abs(d - true_delay) < 0.04, (start, true_delay, d)
+
+    # 3d. ...while a real gap in the host's voice still fails the coverage
+    # gate: the host's mic died for 40 s of the look-back, even though the
+    # voice this probe heard came through
+    probe = heard(95.0 - 7.25)
+    d = session.measure_delay(buf, probe, SR, base_utc + 95.0)
+    assert d is not None and abs(d - 7.25) < 0.04, d
+    holed = held()
+    with holed.lock:
+        holed.blocks = [b for b in holed.blocks
+                        if not base_utc + 40 <= b[0] < base_utc + 80]
+    d = session.measure_delay(holed, probe, SR, base_utc + 95.0)
+    assert d is None, f"measured {d} across a 40 s voice dropout"
+    print("coverage gate: a 40 s voice dropout is still rejected")
+
     # 4. timeline math: delayed rendering delays pauses too
     tl = session.StateTimeline()
     tl.add({"pos": 100.0, "utc": 1000.0, "playing": True, "default_delay": 8})
