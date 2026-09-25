@@ -8,7 +8,7 @@ clock. Internet time is skipped (both ends share this machine's clock).
 
 Checks the things that only show up with everything running:
 - the viewer verifies its copy and measures the stream delay from the
-  host's voice, to within tens of milliseconds;
+  host's voice, to within tens of milliseconds, at production settings;
 - the viewer's player follows the host's timeline, delayed by that delay
   and shifted by the user's nudge;
 - a dropped host connection resumes the same room, a dropped viewer
@@ -166,9 +166,9 @@ def main():
 
     session.audio_capture.AudioMonitor = monitor
     session.SharedClock = LocalClock
-    session.MEASURE_LOOKBACK = 20.0
-    session.MEASURE_SECONDS = 6.0
-    session.MEASURE_INTERVAL = 7.0
+    # MEASURE_* stay at production values: a shorter probe and look-back
+    # here once hid that no viewer under ~5 s behind, or in its first
+    # ~80 s of a session, ever measured its delay
     session.VERIFY_WINDOW = 20.0
 
     relay = subprocess.Popen([sys.executable, "relay_server.py",

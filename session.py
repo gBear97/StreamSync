@@ -156,6 +156,11 @@ class VoiceBuffer:
             cutoff = self.blocks[-1][0] - 240.0
             self.blocks = [b for b in self.blocks if b[0] >= cutoff]
 
+    def first_utc(self):
+        """UTC the oldest block held starts at, or None while empty."""
+        with self.lock:
+            return self.blocks[0][0] if self.blocks else None
+
     def timeline(self, t_from, t_to):
         """(words, base_utc, coverage 0..1) for the requested span.
 
@@ -190,10 +195,18 @@ def measure_delay(voice_buf, samples, sr, probe_t0):
     runs past the probe's end. One that stopped 5 s after a 10 s probe
     began could only align streams 5 s or more behind. Callers wait
     VOICE_SETTLE after the probe first, or that tail has not arrived.
+
+    The look-back stops at the oldest voice held. A viewer who joined
+    30 s ago holds no host voice from 90 s ago - the relay does not
+    replay it - and scoring that as a dropout kept every viewer under
+    the coverage gate for its first ~80 s.
     """
+    first = voice_buf.first_utc()
+    if first is None:
+        return None
     probe_end = probe_t0 + len(samples) / sr
-    ref, base, cov = voice_buf.timeline(probe_t0 - MEASURE_LOOKBACK,
-                                        probe_end + MEASURE_EARLY)
+    ref, base, cov = voice_buf.timeline(
+        max(probe_t0 - MEASURE_LOOKBACK, first), probe_end + MEASURE_EARLY)
     probe_words = int(len(samples) / sr / FP_HOP)
     if cov < 0.8 or len(ref) < probe_words + 20:
         return None
