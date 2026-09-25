@@ -15,7 +15,9 @@ judgement - when to seek, how far, and when to leave playback alone:
 - a false pause (a stretch the matcher cannot hear while the stream keeps
   playing) recovers, because the resume search grows with time;
 - nudges during a watch party go to the session, which would otherwise
-  undo them.
+  undo them;
+- switching back from external VLC hands the built-in player a film
+  opened meanwhile, and leaves one it already holds where it is.
 """
 
 import queue
@@ -296,6 +298,70 @@ def test_viewer_nudge_goes_to_session():
     print("watch party: nudges go to the session's offset")
 
 
+class FilmPlayer(Player):
+    """A player that has to be given the film first, as EmbeddedPlayer
+    and ExternalPlayer do: until then a sync fails the way theirs does."""
+    def __init__(self, clock):
+        super().__init__(clock)
+        self.films = []
+
+    def load(self, path):
+        self.films.append(path)
+        self.anchor, self.playing = None, False
+
+    def seek(self, t):
+        self.anchor = (t, self.now())
+
+    def sync_seek(self, match_t, t0, offset):
+        if not self.films:
+            raise controller.VLCError("No video file loaded.")
+        super().sync_seek(match_t, t0, offset)
+
+
+def test_switch_back_loads_the_film():
+    clock = Clock()
+    stream = Stream(clock)
+    install_fakes(stream)
+    embedded, external = FilmPlayer(clock), FilmPlayer(clock)
+    q = queue.Queue()
+    ctl = controller.SyncController(q, embedded,
+                                    monitor_factory=lambda name: Monitor(clock))
+    ctl._now = clock
+    ctl._log = lambda *a, **k: None
+    ctl.external = external             # no real VLC to start
+
+    # a film opened while external VLC has playback goes to VLC alone...
+    run_sync(ctl, ctl.use_external, False)
+    run_sync(ctl, ctl.load_file, "film.mkv")
+    assert external.films == ["film.mkv"] and embedded.films == []
+    # ...and reaches the built-in player when that takes over again
+    ctl.use_embedded()
+    assert ctl.player is embedded
+    assert embedded.films == ["film.mkv"], \
+        "switching back left the built-in player without the film"
+    statuses(q)
+    run_sync(ctl, ctl.sync, "", "", "audio")
+    msgs = statuses(q)
+    assert embedded.seeks and abs(embedded.pos() - stream.pos()) < 1e-6, msgs
+
+    # a film it already holds is not reloaded: it keeps its place
+    embedded.pause()
+    here = embedded.pos()
+    run_sync(ctl, ctl.use_external, False)
+    ctl.use_embedded()
+    ctl.use_embedded()                  # the menu item picked again
+    assert embedded.films == ["film.mkv"] and embedded.pos() == here, \
+        f"switching back reloaded the film: {embedded.films}"
+
+    # a film opened in VLC meanwhile replaces the one it had
+    run_sync(ctl, ctl.use_external, False)
+    run_sync(ctl, ctl.load_file, "sequel.mkv")
+    ctl.use_embedded()
+    assert embedded.films == ["film.mkv", "sequel.mkv"], \
+        f"the built-in player kept the film it had before: {embedded.films}"
+    print("player switch: the built-in player gets the film opened in VLC")
+
+
 def main():
     test_nudged_film_left_alone()
     test_drift_corrected()
@@ -304,6 +370,7 @@ def main():
     test_false_pause_recovers()
     test_real_pause_and_resume()
     test_viewer_nudge_goes_to_session()
+    test_switch_back_loads_the_film()
     print("CONTROLLER TEST PASSED")
 
 
