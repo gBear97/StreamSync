@@ -384,6 +384,17 @@ def measure_loop():
         print("measure loop: a young viewer's delay is used from the second "
               "probe, and a later chance alignment is not averaged in")
 
+        # Agreeing means within MEASURE_AGREE, 0.5 s. Two readings of one
+        # delay differ by tens of ms here, and by more on a real stream:
+        # 0.3 s apart must agree. The wider it is, the likelier two chance
+        # alignments agree: 0.7 s apart must not.
+        m = run([1020.0, 1030.0, 1040.0], results=[2.07, 2.77, 3.07],
+                held_from=1000.0)
+        assert [x["delay"] for x in m] == [None, None, 3.07], m
+        assert [x["follow"] for x in m] == [True, True, False], m
+        print("measure loop: a young viewer's measurements 0.3 s apart "
+              "agree, 0.7 s apart do not")
+
         # once the voice held spans the whole look-back, a measurement is
         # used outright, as in v1.0.7 - whatever came before it. (Joined
         # at 999: the look-back from 1080 starts before that, from 1090
