@@ -650,9 +650,13 @@ class ExternalPlayer(_ClosedLoop):
             else:
                 raise VLCError("External VLC did not come up with its HTTP "
                                "interface enabled.")
-        # Only now that VLC has the new film: the poller turns its position
-        # fraction into seconds with this, and the new film's length over
-        # the old film's playback is a wrong clock for everything reading it.
+        # Only once VLC has accepted the new film (in_play returned, or the
+        # spawned VLC answered): the poller turns its position fraction
+        # into seconds with this, and the new film's length over the old
+        # film's playback is a wrong clock for everything reading it.
+        # Accepted is not yet switched - VLC changes film on its own thread
+        # after in_play, so for a moment its status can still show the old
+        # one, scaled by this. That window is left open.
         self.duration = duration
         self.has_media = True
         self._clk.reset()

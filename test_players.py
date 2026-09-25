@@ -212,7 +212,8 @@ FILM_LENGTHS = {"First Film.mkv": 5400.0, "Second Film.mkv": 7200.0,
 def external_load():
     """External VLC loads: the second film really reaches VLC, the
     spawn suits the platform, Tk's forward-slash paths arrive native,
-    and the length the clock scales by changes with the film VLC has."""
+    and the length the clock scales by changes only once VLC has
+    accepted the film."""
     def probe(path):
         return FILM_LENGTHS[pathlib.Path(path).name], 0.0
 
