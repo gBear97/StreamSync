@@ -11,7 +11,10 @@ find_match_audio recovers the timestamp. Also covers:
 - the same film remuxed with container timestamps starting at 5 s and at
   600 s (.m2ts-style), which once shifted every match by the start time;
 - a quiet scene inside a loud search window, where uncentered scoring once
-  pushed the right answer under the trust gates.
+  pushed the right answer under the trust gates;
+- an 18 s capture swept across a chunk boundary of a whole-film search,
+  which once hid a 10 s band before every boundary, and the retry
+  ladder's 6/12/18 s looks reusing one decode.
 
 bench_audio.py measures real-world accuracy; this only guards regressions.
 """
@@ -25,6 +28,7 @@ import numpy as np
 import imageio_ffmpeg
 
 import audio_matcher
+import controller
 import matcher
 
 TRUTH = 97.4
@@ -116,6 +120,7 @@ def main():
         assert err < 0.12, f"{name}: start time mishandled, err {err:.3f}s"
 
     quiet_scene(tmp)
+    chunk_boundary(clip)
     print("AUDIO MATCHER TEST PASSED")
 
 
@@ -156,6 +161,56 @@ def quiet_scene(tmp):
         assert abs(t - truth) < 0.12, f"quiet scene: wrong match {t:.3f}s"
         assert score >= audio_matcher.SCORE_OK and z >= audio_matcher.Z_OK, \
             f"quiet scene: correct match not trusted (score {score:.3f}, z {z:.1f})"
+
+
+def chunk_boundary(clip):
+    """Long listens across the chunk boundaries of a whole-film search.
+
+    A search longer than CHUNK_S is cut into chunks, and a capture is only
+    found where it fits entirely inside one. With an 8 s overlap, the 18 s
+    retry listen could not be found in the 10 s before every boundary - it
+    was answered from somewhere else. The chunks are shrunk to 60 s here
+    so the 3-minute clip has boundaries to sweep across.
+    """
+    ladder = (controller.AUDIO_SYNC_SECONDS,) + controller.AUDIO_RETRY_SECONDS
+    saved = audio_matcher.CHUNK_S
+    audio_matcher.CHUNK_S = 60.0
+    try:
+        def look(truth, seconds):
+            c = audio_matcher.decode_audio(clip, truth, seconds)
+            noise = np.convolve(np.random.default_rng(int(truth * 10)).standard_normal(c.size),
+                                np.hamming(65), "same")
+            noise *= 1.2 * np.sqrt((c * c).mean()) / np.sqrt((noise * noise).mean())
+            feats = audio_matcher.prep_capture((c + noise).astype(np.float32),
+                                               audio_matcher.SR)
+            return audio_matcher.find_match_audio(clip, feats, None, None)
+
+        # the controller's weak-match ladder listens longer over the same
+        # window; every look must cut the same chunks, so the retries reuse
+        # the first look's decode instead of decoding the film again
+        audio_matcher._cache.clear()
+        for seconds in ladder:
+            look(100.3, seconds)
+            if seconds == ladder[0]:
+                chunks = set(audio_matcher._cache)
+            assert set(audio_matcher._cache) == chunks, \
+                f"a {seconds:.0f} s look re-decoded the film in new chunks"
+        print(f"chunk cache: {len(chunks)} chunks decoded once for "
+              f"{'/'.join(f'{s:.0f}' for s in ladder)} s looks")
+
+        seconds = max(ladder)
+        missed = []
+        for truth in np.arange(38.3, 57.0, 1.0):   # across the one at 60 s
+            t, score, z = look(truth, seconds)
+            if not (abs(t - truth) < 0.12 and score >= audio_matcher.SCORE_OK
+                    and z >= audio_matcher.Z_OK):
+                missed.append(f"{truth:.1f}s -> {t:.1f}s (score {score:.1f}, "
+                              f"z {z:.1f})")
+        print(f"{seconds:.0f} s capture swept across a chunk boundary: "
+              f"{len(missed)} missed")
+        assert not missed, "blind band at a chunk boundary: " + ", ".join(missed)
+    finally:
+        audio_matcher.CHUNK_S = saved
 
 
 if __name__ == "__main__":
