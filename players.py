@@ -356,8 +356,11 @@ class EmbeddedPlayer(_ClosedLoop):
         self._init_loop(EMBED_STALL_GUESS)
         self._watch_time()
         self.embedded = False
+        # the drawable, kept so load() can hand it back to libvlc
+        self.hwnd = self.nsview = None
         if hwnd is not None:
-            self.mp.set_hwnd(int(hwnd))
+            self.hwnd = int(hwnd)
+            self.mp.set_hwnd(self.hwnd)
             # let Tk keep mouse/keyboard events, not the VLC child window
             self.mp.video_set_mouse_input(False)
             self.mp.video_set_key_input(False)
@@ -384,6 +387,7 @@ class EmbeddedPlayer(_ClosedLoop):
         self._init_loop(EMBED_STALL_GUESS)
         self._watch_time()
         self.embedded = False
+        self.hwnd = self.nsview = None
         self.has_media = False
         return self
 
@@ -414,11 +418,24 @@ class EmbeddedPlayer(_ClosedLoop):
         if not view:
             return False
         self.mp.set_nsobject(view)
+        self.nsview = view
         self.embedded = True
         return True
 
     def load(self, path):
         self.mp.set_media(self.instance.media_new(path))
+        # Each media gets a fresh vout, and VLC's D3D11 output can come up
+        # DETACHED - its own hidden top-level "VLC (Direct3D11 output)"
+        # window, via its leaky double-click fullscreen or a hidden-window
+        # fallback - leaving 1x1 husks in our frame and a black picture it
+        # never recovers from. Re-anchoring the drawable and forcing
+        # libvlc fullscreen off costs nothing.
+        if self.hwnd is not None:
+            self.mp.set_hwnd(self.hwnd)
+            self.mp.set_fullscreen(False)
+        elif self.nsview is not None:
+            self.mp.set_nsobject(self.nsview)
+            self.mp.set_fullscreen(False)
         self.has_media = True
 
     def ensure_playing(self, timeout=6.0):
@@ -493,8 +510,18 @@ class EmbeddedPlayer(_ClosedLoop):
         self.mp.audio_set_mute(bool(mute))
 
     def set_fullscreen(self, flag):
-        """Fullscreen for the libvlc-owned video window (macOS mode)."""
+        """Fullscreen for a libvlc-owned video window. Returns whether it
+        did anything.
+
+        Once a drawable is set the window is ours, not libvlc's, and
+        whoever owns it has to resize it: on macOS libvlc accepts the
+        call, reports the new state and changes nothing, and on Windows
+        its fullscreen is the way out of our window that load() guards
+        against. So the call is not made."""
+        if self.hwnd is not None or self.nsview is not None:
+            return False
         self.mp.set_fullscreen(bool(flag))
+        return True
 
     def is_playing(self):
         return bool(self.mp.is_playing())
