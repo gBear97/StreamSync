@@ -305,6 +305,93 @@ try:
        os.path.getsize(diagnostics.LOG_FILE) < 1000)
     ok("each log may reach 2 MB", diagnostics.MAX_LOG_BYTES >= 2_000_000)
 
+    # On Windows a file another program holds open without delete sharing
+    # - a Python open() of it, or .NET's File.OpenRead - cannot be renamed,
+    # nor replaced by a rename. A rotation that cannot finish must lose
+    # none of the old logs, whichever one is held, and must not be tried
+    # again on every line. A stand-in os.replace refuses the held file.
+    held, tried, real_replace = set(), [], os.replace
+
+    def replace(src, dst):
+        tried.extend((src, dst))
+        if src in held or dst in held:
+            raise PermissionError(13, "in use by another process", src)
+        real_replace(src, dst)
+
+    def backups():
+        return [generation(diagnostics.LOG_FILE + f".{n}") for n in (1, 2, 3)]
+
+    with open(diagnostics.LOG_FILE, "w") as f:
+        f.write("generation 6\n" + "x" * diagnostics.MAX_LOG_BYTES)
+    os.replace = replace
+    try:
+        held.add(diagnostics.LOG_FILE)
+        for _ in range(5):
+            diagnostics.log("while the log is held open")
+        check("a live log that will not move leaves every old log in place",
+              backups(), ["generation 5", "generation 4", "generation 3"])
+        with open(diagnostics.LOG_FILE) as f:
+            live = f.read()
+        ok("and keeps writing on the end of itself",
+           live.startswith("generation 6")
+           and live.count("while the log is held open") == 5)
+        check("and is not tried again on every line",
+              tried.count(diagnostics.LOG_FILE), 1)
+
+        # The reader lets go; the next try, once the log has grown a
+        # little more, rotates as if nothing had happened.
+        held.clear()
+        with open(diagnostics.LOG_FILE, "a") as f:
+            f.write("x" * getattr(diagnostics, "ROTATE_RETRY_BYTES", 0))
+        diagnostics.log("let go")
+        check("then rotates, one generation down",
+              backups(), ["generation 6", "generation 5", "generation 4"])
+
+        # Nor may an old log that will not move cost any of them, whichever
+        # it is: the newest, the one after it, or the oldest. The rotation
+        # that just worked has cleared the wait the failed one set: this
+        # log is no bigger than that one was, so without that the first
+        # case (.1 held) would not even be tried, and its "nothing moved"
+        # would prove nothing.
+        with open(diagnostics.LOG_FILE, "w") as f:
+            f.write("generation 7\n" + "x" * diagnostics.MAX_LOG_BYTES)
+        for n in (1, 2, 3):
+            for k in (1, 2, 3):  # each case starts from the same old logs
+                with open(diagnostics.LOG_FILE + f".{k}", "w") as f:
+                    f.write(f"generation {7 - k}\n")
+            old = diagnostics.LOG_FILE + f".{n}"
+            held.clear()
+            held.add(old)
+            tried.clear()
+            diagnostics.log(f"while .{n} is held open")
+            ok(f"with .{n} held, a full log still tries to rotate",
+               old in tried)
+            check(f"with .{n} held, no old log is lost or moved",
+                  backups(), ["generation 6", "generation 5", "generation 4"])
+            check(f"with .{n} held, the live log stays where it was",
+                  generation(diagnostics.LOG_FILE), "generation 7")
+            check(f"with .{n} held, nothing is left half-moved",
+                  sorted(os.listdir(tmp)),
+                  ["streamsync.log", "streamsync.log.1", "streamsync.log.2",
+                   "streamsync.log.3"])
+            with open(diagnostics.LOG_FILE, "a") as f:  # past the wait
+                f.write("x" * getattr(diagnostics, "ROTATE_RETRY_BYTES", 0))
+        held.clear()
+        diagnostics.log("all let go")
+        check("once let go, it rotates one generation down",
+              backups(), ["generation 7", "generation 6", "generation 5"])
+
+        # A missing old log is a gap the rotation fills: the ones beyond
+        # it stay, rather than the oldest being dropped to make room.
+        os.remove(diagnostics.LOG_FILE + ".1")
+        with open(diagnostics.LOG_FILE, "w") as f:
+            f.write("generation 8\n" + "x" * diagnostics.MAX_LOG_BYTES)
+        diagnostics.log("after .1 was deleted")
+        check("a gap in the old logs is filled, and none beyond it dropped",
+              backups(), ["generation 8", "generation 6", "generation 5"])
+    finally:
+        os.replace = real_replace
+
     # Every run's first line says what it ran on - on Windows too, where
     # describe() has no OS version to offer.
     diagnostics.log_session_start()

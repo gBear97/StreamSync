@@ -69,23 +69,67 @@ def _run(cmd, timeout=10):
 
 _write_lock = threading.Lock()
 
+# A rotation that cannot happen - on Windows, while another program holds
+# one of the logs open without delete sharing, as a Python open() or .NET's
+# File.OpenRead does - is tried again once the log has grown this much
+# more, rather than on every line.
+ROTATE_RETRY_BYTES = 64_000
+_rotate_retry = (None, 0)  # (log file, size it must reach first)
+
+
+def _shift_aside():
+    """streamsync.log -> .1 -> .2 -> .3, the oldest dropped; True if done.
+
+    Any of those renames can fail, and a failed rotation must lose
+    nothing, whichever log would not move. So nothing is written over
+    until every log that moves has first been renamed aside, to its own
+    name plus ".rotating". If one will not go, those already aside go
+    back and nothing has changed. Once all are aside, the oldest is
+    dropped and the rest take their new names, every one of them free by
+    then. A missing old log ends the shift: nothing lands on the ones
+    beyond it, so they stay."""
+    names = [LOG_FILE] + [f"{LOG_FILE}.{n}" for n in range(1, LOG_BACKUPS + 1)]
+    aside = []
+    for name in names:
+        try:
+            os.replace(name, name + ".rotating")
+        except FileNotFoundError:
+            break
+        except OSError:
+            for moved in reversed(aside):
+                try:
+                    os.replace(moved + ".rotating", moved)
+                except OSError:
+                    pass
+            return False
+        aside.append(name)
+    if len(aside) == len(names):
+        try:
+            os.remove(aside.pop() + ".rotating")  # the oldest
+        except OSError:
+            pass
+    for n in range(len(aside), 0, -1):  # oldest first
+        try:
+            os.replace(aside[n - 1] + ".rotating", names[n])
+        except OSError:
+            pass
+    return True
+
 
 def _rotate():
+    global _rotate_retry
     try:
-        if os.path.getsize(LOG_FILE) < MAX_LOG_BYTES:
-            return
+        size = os.path.getsize(LOG_FILE)
     except OSError:
         return
-    # .2 -> .3 before .1 -> .2, so only the oldest is ever overwritten
-    for n in range(LOG_BACKUPS - 1, 0, -1):
-        try:
-            os.replace(f"{LOG_FILE}.{n}", f"{LOG_FILE}.{n + 1}")
-        except OSError:
-            pass  # no such backup yet
-    try:
-        os.replace(LOG_FILE, LOG_FILE + ".1")
-    except OSError:
-        pass
+    if size < MAX_LOG_BYTES:
+        return
+    if _rotate_retry[0] == LOG_FILE and size < _rotate_retry[1]:
+        return  # it failed a moment ago; this line goes on the end
+    if _shift_aside():
+        _rotate_retry = (None, 0)
+    else:
+        _rotate_retry = (LOG_FILE, size + ROTATE_RETRY_BYTES)
 
 
 def log(message, echo=True):
