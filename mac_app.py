@@ -683,8 +683,9 @@ class MacApp:
             self.external.fullscreen_toggle()
 
     def _set_fullscreen(self, flag):
-        """Fullscreen for the built-in player - the one way in or out, so
-        self.fullscreen always says what the screen shows."""
+        """Fullscreen for the built-in player - the one way the app asks
+        its way in or out. _settle_fullscreen sees that the window follows,
+        so self.fullscreen says what the screen shows, or is about to."""
         self.fullscreen = bool(flag)
         if self.player_backend.embedded:
             # The video lives in our own window now, so fullscreen is
@@ -717,7 +718,8 @@ class MacApp:
         wanted until the two agree. Not straight after a request, though:
         for an instant after a dropped request to enter, Tk reports the
         window fullscreen (and screen-sized) before going back to the
-        truth, so nothing is read until FULLSCREEN_RETRY after asking.
+        truth, so this check reads nothing until FULLSCREEN_RETRY after
+        asking. (_stream_swap does read as it asks to leave - see there.)
         Asking again is safe: Tk only passes on a request that differs
         from the window's state, and macOS drops it again if it is still
         not ready. A window that never takes it is believed instead, so
@@ -897,25 +899,40 @@ class MacApp:
         self._swap_target = show
         self._swap_seq += 1
         embedded = self.player is self.player_backend
-        if show and embedded and self.fullscreen:
-            # Leave fullscreen before the browser is raised: a fullscreen
-            # window would keep it behind the film. The flag means "we owe
-            # the user fullscreen back", so it is only ever set when we
-            # actually take it away - reading self.fullscreen here would
-            # record False for a second pause that arrives before the
-            # first one's restore has run, and the debt would be forgotten.
-            self._was_fullscreen = True
-            self._set_fullscreen(False)
-            if self._window_fullscreen():
-                # macOS did not take it: the film was still on its way
-                # into fullscreen (a pause straight after a resume). It
-                # leaves once _settle_fullscreen asks again, and the
-                # browser must not be raised before then - a window that
-                # leaves fullscreen brings its app to the front, so the
-                # film would end up over the browser raised a moment
-                # earlier. The worker waits for this. (Unlike a dropped
-                # request to enter, this reading is true straight away.)
+        if show and embedded:
+            if self.fullscreen:
+                # Leave fullscreen before the browser is raised: a
+                # fullscreen window would keep it behind the film. The
+                # flag means "we owe the user fullscreen back", so it is
+                # only ever set when we actually take it away - reading
+                # self.fullscreen here would record False for a second
+                # pause that arrives before the first one's restore has
+                # run, and the debt would be forgotten.
+                self._was_fullscreen = True
+                self._set_fullscreen(False)
+            if self._fs_until is not None and self._window_fullscreen():
+                # macOS has not taken a request to leave: this pause's,
+                # made while the film was still on its way into fullscreen
+                # (a pause straight after a resume), or the user's own
+                # Cmd-Shift-F a moment ago. The film leaves once
+                # _settle_fullscreen asks again, and the browser must not
+                # be raised before then - a window that leaves fullscreen
+                # brings its app to the front, so the film would end up
+                # over the browser raised a moment earlier. The worker
+                # waits for this. A dropped request to leave reads true
+                # straight away; if a request to enter was dropped an
+                # instant ago this can read fullscreen when it is not,
+                # and the pause then waits one FULLSCREEN_RETRY for
+                # _settle_fullscreen to look.
                 self._left_fullscreen.clear()
+        elif not show and not self._left_fullscreen.is_set():
+            # This resume has overtaken a pause that is still waiting for
+            # the film to leave fullscreen. Call the leave off - the film
+            # would drop out of fullscreen for a pause that is over - and
+            # let the worker go: it sees that its pause was overtaken and
+            # raises nothing.
+            self._repay_fullscreen()
+            self._left_fullscreen.set()
         self._swap_q.put((self._swap_seq, show, embedded))
 
     def _resolve_stream_app(self):
@@ -963,6 +980,12 @@ class MacApp:
                 if show:
                     # set, unless the film is still leaving fullscreen
                     self._left_fullscreen.wait(FULLSCREEN_SETTLE)
+                    if seq != self._swap_seq:
+                        # Overtaken while it waited, by a resume or by
+                        # the app closing: the browser would come up over
+                        # a film that is playing again. Whatever overtook
+                        # it settles the screen.
+                        continue
                     macwindowctl.activate_app(app_name)
                     shown = True
                 else:
@@ -1169,7 +1192,12 @@ class MacApp:
     def _on_close(self):
         # Stop the swap worker first: raising or hiding a browser is not
         # wanted once we are going, and it must not front a closing app.
+        # A pause still waiting for the film to leave fullscreen is called
+        # off (the worker checks _swap_seq when its wait ends) and its wait
+        # ended here: nothing pumps _settle_fullscreen for it any more.
+        self._swap_seq += 1
         self._swap_q.put(None)
+        self._left_fullscreen.set()
         self._save_config()
         self.ctl.close()
         self.root.destroy()
