@@ -387,6 +387,20 @@ def script():
     check("A10 and resumes: film fullscreen and in front", dict(
         owes_fullscreen=False, **FULL, **FILM_FRONT))
 
+    # ...and a pause like that one, overtaken by its resume while it is
+    # still waiting for the film to leave: it is called off
+    app.q.put(("swap", True))
+    yield 4.0
+    app.q.put(("swap", False))
+    yield from until(lambda: app.fullscreen, 4, step=0.02)
+    app.q.put(("swap", True))
+    yield 0.15
+    app.q.put(("swap", False))
+    yield 6.0
+    check("A11 pause and resume straight after fullscreen is handed back: "
+          "film stays fullscreen and in front", dict(
+              owes_fullscreen=False, swapped=False, **FULL, **FILM_FRONT))
+
     # --- B: Automation refused ----------------------------------------
     mode["refuse"] = True
     app._toggle_pause()
@@ -575,4 +589,12 @@ def run(gen):
 root.after(300000, finish)                 # never outstay five minutes
 root.after(250, _tick)
 root.after(500, lambda: run(script()))
-root.mainloop()
+try:
+    root.mainloop()
+finally:
+    # Every way through the script leaves by finish(), which does not
+    # return. Getting here means the run was stopped - the StreamSync
+    # window closed, Cmd-Q, Ctrl-C - and the helper window and VLC would
+    # otherwise be left behind.
+    errors.append((now(), "script", "stopped before the script finished"))
+    finish()
