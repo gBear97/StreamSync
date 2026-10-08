@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import tkinter as tk
@@ -40,6 +41,15 @@ from players import EmbeddedPlayer, VLCError
 BROWSERS = ("Safari", "Google Chrome", "Firefox", "Arc", "Brave Browser",
             "Microsoft Edge", "Opera", "Vivaldi")
 
+# macOS takes a moment to move a window into or out of fullscreen, and a
+# request made during that moment is dropped without a word: measured on
+# macOS 27 with Tk 8.6.16, one made up to 0.5 s after the last change was
+# lost and one made 0.8 s after it was taken. So a request is checked, and
+# made again every FULLSCREEN_RETRY seconds until it has taken - for
+# FULLSCREEN_SETTLE seconds, after which the screen is believed.
+FULLSCREEN_RETRY = 0.25
+FULLSCREEN_SETTLE = 3.0
+
 
 class MacApp:
     def __init__(self, root):
@@ -54,6 +64,11 @@ class MacApp:
         self._swap_app = ""          # resolved browser, cached across swaps
         self._swap_q = queue.Queue()
         self._was_fullscreen = False  # we owe the user fullscreen back
+        self._fs_until = None        # a fullscreen request is being checked
+        self._fs_retry = 0.0         # ...and is next looked at at this time
+        # clear while a pause waits for the film to get out of fullscreen
+        self._left_fullscreen = threading.Event()
+        self._left_fullscreen.set()
         self._preview_photo = None
 
         root.title(f"StreamSync {__version__}")
@@ -677,8 +692,52 @@ class MacApp:
             # on a window libvlc itself owns.
             self.video_win.deiconify()
             self.video_win.attributes("-fullscreen", self.fullscreen)
+            # ...which macOS may not have taken: _settle_fullscreen checks.
+            now = time.monotonic()
+            self._fs_retry = now + FULLSCREEN_RETRY
+            self._fs_until = now + FULLSCREEN_SETTLE
         else:
             self.player_backend.set_fullscreen(self.fullscreen)
+
+    def _window_fullscreen(self):
+        return bool(int(self.video_win.attributes("-fullscreen")))
+
+    def _settle_fullscreen(self):
+        """See that the film window is in the state last asked of it.
+
+        The first run on a Mac with Automation refused (macOS 27): a pause
+        took the film out of fullscreen, the swap failed 0.3 s later and
+        fullscreen was handed back - while the window was still animating
+        out. macOS dropped the request, so the film sat in a 960x540 window
+        with self.fullscreen saying True until the next pause, which then
+        "left" a fullscreen it was not in and "returned" to one for real.
+        Any change asked for inside the animation goes the same way.
+
+        So the window is asked what it is, and asked again for what was
+        wanted until the two agree. Not straight after a request, though:
+        for an instant after a dropped request to enter, Tk reports the
+        window fullscreen (and screen-sized) before going back to the
+        truth, so nothing is read until FULLSCREEN_RETRY after asking.
+        Asking again is safe: Tk only passes on a request that differs
+        from the window's state, and macOS drops it again if it is still
+        not ready. A window that never takes it is believed instead, so
+        the next Cmd-Shift-F does what it says.
+        """
+        if self._fs_until is None:
+            return
+        now = time.monotonic()
+        if now < self._fs_retry:
+            return
+        if self._window_fullscreen() == self.fullscreen:
+            self._fs_until = None
+        elif now >= self._fs_until:
+            self._fs_until = None
+            self.fullscreen = not self.fullscreen
+        else:
+            self._fs_retry = now + FULLSCREEN_RETRY
+            self.video_win.attributes("-fullscreen", self.fullscreen)
+            return
+        self._left_fullscreen.set()
 
     # ---------------------------------------------------- hosted sessions
 
@@ -847,6 +906,16 @@ class MacApp:
             # first one's restore has run, and the debt would be forgotten.
             self._was_fullscreen = True
             self._set_fullscreen(False)
+            if self._window_fullscreen():
+                # macOS did not take it: the film was still on its way
+                # into fullscreen (a pause straight after a resume). It
+                # leaves once _settle_fullscreen asks again, and the
+                # browser must not be raised before then - a window that
+                # leaves fullscreen brings its app to the front, so the
+                # film would end up over the browser raised a moment
+                # earlier. The worker waits for this. (Unlike a dropped
+                # request to enter, this reading is true straight away.)
+                self._left_fullscreen.clear()
         self._swap_q.put((self._swap_seq, show, embedded))
 
     def _resolve_stream_app(self):
@@ -892,6 +961,8 @@ class MacApp:
             shown = None
             try:
                 if show:
+                    # set, unless the film is still leaving fullscreen
+                    self._left_fullscreen.wait(FULLSCREEN_SETTLE)
                     macwindowctl.activate_app(app_name)
                     shown = True
                 else:
@@ -1018,6 +1089,7 @@ class MacApp:
                     self._set_status(payload[0])
         except queue.Empty:
             pass
+        self._settle_fullscreen()
         self.root.after(80, self._poll_queue)
 
     def _populate_audio_devices(self):
