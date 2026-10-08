@@ -129,7 +129,22 @@ _real_urlopen = urllib.request.urlopen
 
 
 def _reset(widened=False):
-    netcerts._ctx = None
+    """Start over, with a shared context built from the real root sources.
+
+    Built here rather than left for context() to build on first use: the
+    loaders are stubbed below, and where OpenSSL has no roots of its own -
+    a frozen app, or a python.org Python whose Install Certificates.command
+    was never run - _build() went on to the stubs and took the throwaway
+    root as its starting point, so widening had nothing left to add and
+    the retry it gates never ran.
+    """
+    stubbed = netcerts._load_certifi, netcerts._load_keychain
+    netcerts._load_certifi = _real_certifi
+    netcerts._load_keychain = _real_keychain
+    try:
+        netcerts._ctx = netcerts._build()
+    finally:
+        netcerts._load_certifi, netcerts._load_keychain = stubbed
     netcerts._widened = widened
 
 
