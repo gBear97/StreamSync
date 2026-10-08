@@ -446,3 +446,8 @@ Every test runs on Windows, macOS and Linux for each pull request (the
 Tests workflow). Those tests guard against regressions; for how well the
 audio matcher does on real film audio under real commentary, see
 `bench_audio.py`.
+
+Two more run by hand on a Mac, because they drive real windows:
+`test_macwindowctl.py` (bringing an app forward and hiding it) and
+`test_macapp_live.py` (the real app through pause, resume and fullscreen;
+it takes over the screen for about two minutes).

@@ -24,6 +24,17 @@ thread each System Events round trip ran on. What is tested:
 - a rapid pause/resume/pause only plays out the state it settled on;
 - the fullscreen debt survives swaps that overlap, however their
   results interleave with new pauses;
+- a fullscreen request made while the window is still animating - which
+  macOS drops without a word - is made again until the window has taken
+  it: a swap that failed fast used to leave the film in a window with
+  the app believing it fullscreen;
+- a pause straight after a resume raises the browser only once the film
+  has really left the fullscreen it was still entering - raised before,
+  the browser ends up behind the film - and the same after the user's own
+  Cmd-Shift-F;
+- a resume that overtakes a pause still waiting for that calls it off:
+  no browser over a film that is playing again, no film dropping out of
+  fullscreen for a pause that is over; and closing calls it off too;
 - closing stops the swap worker before the controller shuts down;
 - a video-capture sync takes the film window off screen too, so the
   matcher cannot find our own picture inside the capture region;
@@ -59,11 +70,22 @@ class Widget:
 
 
 class Window(Widget):
-    """A Toplevel or Frame: shown/withdrawn and fullscreen, as Tk has it."""
+    """A Toplevel or Frame: shown/withdrawn and fullscreen, as Tk has it.
+
+    A fullscreen change takes `transition` seconds, as the macOS animation
+    does, and a change asked for inside that time is dropped without a
+    word, as macOS drops it. Asked straight after a dropped request to
+    enter, the window says it is fullscreen - for an instant, as Tk 8.6.16
+    was measured to on macOS 27."""
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.shown = True          # Tk maps a new Toplevel at once
         self.fullscreen = False
+        self.transition = 0.0
+        self.dropped = 0           # requests lost to an animation
+        self.changes = 0           # ...and requests taken
+        self._moving_until = 0.0
+        self._lies_until = 0.0
 
     def withdraw(self):
         self.shown = False
@@ -75,8 +97,21 @@ class Window(Widget):
         return "normal" if self.shown else "withdrawn"
 
     def attributes(self, *args):
+        if args == ("-fullscreen",):
+            return int(self.fullscreen
+                       or time.monotonic() < self._lies_until)
         if len(args) == 2 and args[0] == "-fullscreen":
-            self.fullscreen = bool(args[1])
+            want = bool(args[1])
+            if want == self.fullscreen:
+                return             # Tk only passes on a change
+            if time.monotonic() < self._moving_until:
+                self.dropped += 1
+                if want:
+                    self._lies_until = time.monotonic() + 0.03
+                return
+            self.fullscreen = want
+            self.changes += 1
+            self._moving_until = time.monotonic() + self.transition
 
     def winfo_id(self):
         return 0x5EED
@@ -694,6 +729,192 @@ def test_fullscreen_debt_survives_overlapping_swaps():
     print("fullscreen: the debt survives overlapping swaps")
 
 
+def test_dropped_fullscreen_request_is_made_again():
+    # the first run on a Mac, Automation refused: the swap fails while the
+    # film window is still animating out of fullscreen, so the fullscreen
+    # handed back is a request macOS drops
+    app, mac = make()
+    app._toggle_fullscreen()
+    app.video_win.transition = 0.4
+    mac.fail = {"activate_app"}
+    app._stream_swap(True)
+    assert pump(app, lambda: "App swap failed" in status(app)
+                and app.fullscreen), (status(app), fullscreen(app))
+    assert app.video_win.dropped, \
+        "the request was not dropped, so this proves nothing"
+    assert pump(app, lambda: fullscreen(app) == (True, True)), \
+        f"fullscreen was handed back to a window that was still leaving " \
+        f"it, and never asked for again: {fullscreen(app)}"
+    assert not app._was_fullscreen
+    # ...and once the window has it, it is left alone
+    asked = app.video_win.dropped
+    idle(app, 0.6)
+    assert app.video_win.dropped == asked and app._fs_until is None
+
+    # the same on the way out: Cmd-Shift-F twice inside the animation
+    app, mac = make()
+    app.video_win.transition = 0.4
+    app._toggle_fullscreen()
+    app._toggle_fullscreen()
+    assert fullscreen(app) == (False, True) and app.video_win.dropped
+    assert pump(app, lambda: fullscreen(app) == (False, False)), \
+        f"the film stayed fullscreen behind the app's back: {fullscreen(app)}"
+
+    # a window that never takes it is believed, so that the next
+    # Cmd-Shift-F is one press and not two
+    app, mac = make()
+    settle, mac_app.FULLSCREEN_SETTLE = mac_app.FULLSCREEN_SETTLE, 0.5
+    try:
+        app.video_win.transition = 60.0
+        app._toggle_fullscreen()
+        app._toggle_fullscreen()            # dropped, and will stay dropped
+        assert fullscreen(app) == (False, True)
+        assert pump(app, lambda: app.fullscreen), \
+            "the app went on believing a fullscreen change that never came"
+        assert fullscreen(app) == (True, True) and app._fs_until is None
+    finally:
+        mac_app.FULLSCREEN_SETTLE = settle
+    print("fullscreen: a request dropped mid-animation is made again")
+
+
+def watch_raises(app, mac):
+    """Whether the film window was fullscreen each time the browser was
+    raised, as a list that grows."""
+    film_was_fullscreen = []
+    raise_browser = mac.activate_app
+
+    def activate_app(name):
+        film_was_fullscreen.append(app.video_win.fullscreen)
+        raise_browser(name)
+    mac.activate_app = activate_app
+    return film_was_fullscreen
+
+
+def entering_fullscreen(transition=0.4):
+    """A film paused and resumed, at the moment fullscreen is handed back:
+    for `transition` seconds the window drops any request to leave."""
+    app, mac = make()
+    app._toggle_fullscreen()
+    app._stream_swap(True)
+    assert pump(app, lambda: app._swapped) and fullscreen(app) == (False, False)
+    app.video_win.transition = transition
+    app._stream_swap(False)
+    assert pump(app, lambda: fullscreen(app) == (True, True))
+    return app, mac
+
+
+def parked(app):
+    """An Event that is set once the swap worker is waiting for the film
+    to leave fullscreen - until then a swap queued behind the pause would
+    simply replace it, and nothing about the wait would be tested."""
+    waiting = threading.Event()
+    wait = app._left_fullscreen.wait
+
+    def waited(timeout=None):
+        waiting.set()
+        return wait(timeout)
+    app._left_fullscreen.wait = waited
+    return waiting
+
+
+def test_pause_waits_for_a_film_still_entering_fullscreen():
+    # The worker's own patience is put far beyond every timeout here: a
+    # worker that is never told the film has left would otherwise give up
+    # and raise the browser just as these waits run out, and pass by luck.
+    settle, mac_app.FULLSCREEN_SETTLE = mac_app.FULLSCREEN_SETTLE, 30.0
+    try:
+        app, mac = entering_fullscreen()
+        film_was_fullscreen = watch_raises(app, mac)
+        app._stream_swap(True)                          # paused at once
+        assert fullscreen(app) == (False, True) and app.video_win.dropped, \
+            "the film left at once, so this proves nothing"
+        assert pump(app, lambda: film_was_fullscreen), \
+            f"the pause was never told the film had left: {mac.names()}"
+        assert film_was_fullscreen == [False], \
+            "the browser was raised while the film was still fullscreen; " \
+            "leaving fullscreen afterwards puts the film back in front of it"
+        assert pump(app, lambda: app._swapped)
+        assert fullscreen(app) == (False, False) and app._was_fullscreen
+
+        # the same when the request macOS dropped was the user's own:
+        # Cmd-Shift-F on and off inside one animation, then a pause
+        app, mac = make()
+        app.video_win.transition = 0.4
+        film_was_fullscreen = watch_raises(app, mac)
+        app._toggle_fullscreen()
+        app._toggle_fullscreen()
+        assert fullscreen(app) == (False, True) and app.video_win.dropped
+        app._stream_swap(True)
+        assert pump(app, lambda: film_was_fullscreen), mac.names()
+        assert film_was_fullscreen == [False], \
+            "the browser was raised under a film still leaving fullscreen"
+        assert pump(app, lambda: app._swapped)
+        assert fullscreen(app) == (False, False) and not app._was_fullscreen, \
+            "the user had left fullscreen: there is none to give back"
+
+        # the usual pause - the film leaves at once - does not wait on the
+        # Tk side at all
+        app, mac = make()
+        app._toggle_fullscreen()
+        app._stream_swap(True)
+        assert wait_for(lambda: "activate_app" in mac.names()), \
+            "a pause waited for the Tk side before raising the browser"
+        assert pump(app, lambda: app._swapped)
+
+        # ...nor for a fullscreen the app never asked for and is not
+        # settling (the green button): nothing would ever end that wait
+        app, mac = make()
+        app.video_win.fullscreen = True
+        app._stream_swap(True)
+        assert wait_for(lambda: "activate_app" in mac.names()), \
+            "a pause waited on a fullscreen that nothing is settling"
+    finally:
+        mac_app.FULLSCREEN_SETTLE = settle
+    print("fullscreen: a pause waits for a film that is still entering it")
+
+
+def test_overtaken_pause_is_called_off():
+    # pause, resume, and both again within a second: the second pause is
+    # still waiting for the film to leave fullscreen when its resume comes
+    app, mac = entering_fullscreen()
+    mac.delay = 0.3                     # System Events takes its time
+    waiting = parked(app)
+    raised, changes = activated(mac), app.video_win.changes
+    app._stream_swap(True)
+    assert fullscreen(app) == (False, True) and waiting.wait(2.0), \
+        "the pause is not waiting"
+    app._stream_swap(False)
+    # long enough for the dropped leave to have been asked for again and
+    # taken, and the browser raised after it, had neither been called off
+    idle(app, 1.5)
+    assert activated(mac) == raised, \
+        f"the browser was raised for a pause already over: {mac.names()}"
+    assert app.video_win.changes == changes, \
+        "the film dropped out of fullscreen for a pause already over"
+    assert fullscreen(app) == (True, True) and not app._was_fullscreen
+    assert not app._swapped and app._left_fullscreen.is_set()
+    # ...and nothing is left hanging: the next pause runs as usual
+    mac.delay = 0.0
+    app.video_win.transition = 0.0
+    app._stream_swap(True)
+    assert pump(app, lambda: app._swapped), mac.names()
+    assert fullscreen(app) == (False, False) and app._was_fullscreen
+
+    # closing calls a waiting pause off too, and does not wait for it
+    app, mac = entering_fullscreen()
+    waiting = parked(app)
+    raised = activated(mac)
+    app._stream_swap(True)
+    assert waiting.wait(2.0), "the pause is not waiting"
+    app.ctl.worker = app._swap_thread
+    app._on_close()
+    assert app.ctl.worker_alive_at_close is False, \
+        "the swap worker was still waiting when the controller closed"
+    assert activated(mac) == raised, \
+        f"the browser was raised as the app closed: {mac.names()}"
+    print("swap: a pause overtaken while it waits is called off")
+
+
 def test_worker_stops_before_the_controller_closes():
     app, mac = make()
     worker = getattr(app, "_swap_thread", None)
@@ -795,6 +1016,9 @@ def main():
     test_browser_is_looked_up_again()
     test_rapid_toggles_collapse()
     test_fullscreen_debt_survives_overlapping_swaps()
+    test_dropped_fullscreen_request_is_made_again()
+    test_pause_waits_for_a_film_still_entering_fullscreen()
+    test_overtaken_pause_is_called_off()
     test_worker_stops_before_the_controller_closes()
     test_video_sync_hides_the_film_window()
     test_switch_to_embedded_shows_the_film_window()

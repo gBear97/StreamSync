@@ -59,15 +59,25 @@ def make_helper_app(tmp):
                          capture_output=True, text=True).stdout.strip()
     if not os.path.isabs(exe):
         exe = os.path.realpath(sys.executable)
-    macos_dir = os.path.join(tmp, APP + ".app", "Contents", "MacOS")
+    bundle = os.path.join(tmp, APP + ".app")
+    macos_dir = os.path.join(bundle, "Contents", "MacOS")
     os.makedirs(macos_dir)
     helper = os.path.join(macos_dir, APP)
     shutil.copy2(exe, helper)
-    plist = os.path.join(tmp, APP + ".app", "Contents", "Info.plist")
+    plist = os.path.join(bundle, "Contents", "Info.plist")
     with open(plist, "wb") as f:
         plistlib.dump({"CFBundleName": APP, "CFBundleExecutable": APP,
                        "CFBundleIdentifier": "com.streamsync.test.macwinctl",
                        "CFBundlePackageType": "APPL"}, f)
+    # python.org's interpreter is signed, and that signature is sealed to
+    # the Info.plist and resources of the bundle it shipped in. Away from
+    # them the copy no longer validates and macOS kills it as it launches
+    # (exit -9, nothing on stderr). An ad-hoc signature over the throwaway
+    # bundle replaces it. Not checked: an interpreter that was never
+    # signed that way runs as it is, and one that still cannot run is
+    # reported by name in main().
+    subprocess.run(["codesign", "--force", "--sign", "-", bundle],
+                   capture_output=True)
     return helper
 
 
@@ -93,6 +103,13 @@ def main():
             f"(first application process whose unix id is {pid})")
 
     def registered(pid):
+        # A helper that died is not one that is slow to appear: say so,
+        # with the exit code, instead of waiting out the timeout for it.
+        code = proc.poll()
+        if code is not None:
+            raise AssertionError(
+                f"helper exited with code {code} before it registered "
+                "(-9 is macOS refusing to run the copied interpreter)")
         try:
             return prop(pid, "name") == APP
         except RuntimeError:
@@ -114,8 +131,18 @@ def main():
             "helper missing from list_gui_apps()"
         # A hide sent while the app is still activating gets cancelled by
         # the launch activation, so wait until the window has taken focus.
-        wait_for("helper window never took focus after launch",
-                 lambda: prop(proc.pid, "frontmost") == "true", timeout=15)
+        # It does not always take it: on macOS 27 a helper spawned from
+        # behind another app stayed behind it (frontmost still false 4 s
+        # after launch). Then there is no launch activation left to wait
+        # for, so bring the helper forward instead.
+        try:
+            wait_for("helper window did not take focus by itself",
+                     lambda: prop(proc.pid, "frontmost") == "true", timeout=4)
+        except AssertionError:
+            macwindowctl.activate_app(APP)
+            wait_for("helper window never took focus after launch",
+                     lambda: prop(proc.pid, "frontmost") == "true",
+                     timeout=15)
 
         macwindowctl.hide_app(APP)
         wait_for("helper did not hide",
