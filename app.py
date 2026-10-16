@@ -105,10 +105,9 @@ class App:
         # attached to ours, so resizing the window (fullscreen) from inside
         # a mouse handler has deadlocked against it - every mouse handler
         # defers its work to the next event-loop pass.
-        self.video_win.bind("<Double-Button-1>",
-                            lambda e: self.video_win.after(
-                                1, self._fullscreen_clicked))
+        self.video_win.bind("<Double-Button-1>", self._on_video_double)
         self.video_win.bind("<MouseWheel>", self._on_video_wheel)
+        self._wheel_acc = 0          # wheel delta not yet turned into a step
         self.video_win.bind("<Button-3>", self._show_video_menu)
         self.video_win.bind("<Motion>", self._on_video_motion)
         self.video_win.protocol("WM_DELETE_WINDOW", self.video_win.withdraw)
@@ -415,11 +414,13 @@ class App:
         return True
 
     def _sync(self, resync=False, whole=False):
+        """Start a sync; True if one started (False: one was already
+        running, or the setup is not ready)."""
         if self.ctl.busy:
-            return
+            return False
         method = self.method_var.get()
         if not self._ready(need_region=(method == "video")):
-            return
+            return False
         video = {"mute": self.mute_var.get()}
         if method == "video":
             self._set_status("Capturing stream frames...")
@@ -436,16 +437,20 @@ class App:
                 for win in video["hidden"]:
                     win.deiconify()
             messagebox.showerror("StreamSync", str(e))
-            return
+            return False
         if not started:
             for win in video.get("hidden") or ():
                 win.deiconify()      # a sync was already running
         if started:
             self.sync_btn.state(["disabled"])
             self.resync_btn.state(["disabled"])
+            # the fullscreen bar's too, whichever button started it
+            for b in (self._fs_resync, self._fs_full):
+                b.config(state="disabled")
+        return bool(started)
 
     def _resync(self):
-        self._sync(resync=True)
+        return self._sync(resync=True)
 
     def _hide_overlapping_windows(self):
         left, top, w, h = self.ctl.region
@@ -690,6 +695,12 @@ class App:
         if flag:
             self._fs_saved = windowctl.borderless_fullscreen(hwnd)
             self.video_win.lift()
+            # A mouse resting over the film brings no motion with it
+            # (Windows only repeats the last position, which
+            # _on_video_motion ignores), so the controls start their rest
+            # here: they show, then go with the pointer as usual.
+            self._fs_moved = time.monotonic()
+            self.video_win.after(1, self._show_fs_bar)
         else:
             if self._fs_saved is not None:
                 windowctl.unfullscreen(hwnd, self._fs_saved)
@@ -719,6 +730,11 @@ class App:
         m.add_command(label="Hide video window",
                       command=self.video_win.withdraw)
         self.video_menu = m
+
+    def _on_video_double(self, _event):
+        if self.player is not self.embedded:
+            return          # external VLC has its own window to double-click
+        self.video_win.after(1, self._fullscreen_clicked)
 
     def _show_video_menu(self, event):
         if self.player is not self.embedded:
@@ -775,6 +791,8 @@ class App:
                                      font=("Segoe UI", 13, "bold"))
             self._osd_lbl.pack()
             self._osd_win.withdraw()
+            self._osd_hook = None    # its no-activate hook, kept alive
+            self._osd_hwnd = None    # the OS frame that hook is on
         self._osd_lbl.config(text=text)
         self._osd_win.update_idletasks()
         x = (self.video_win.winfo_rootx() + self.video_win.winfo_width()
@@ -782,15 +800,30 @@ class App:
         y = self.video_win.winfo_rooty() + 18
         self._osd_win.geometry(f"+{x}+{y}")
         self._osd_win.deiconify()
+        # a click on it must leave the film the active window, as for the
+        # fullscreen bar (see windowctl.no_activate_on_click)
+        self._osd_win.update_idletasks()
+        hwnd = int(self._osd_win.frame(), 16)
+        if hwnd != self._osd_hwnd:     # first showing, or Tk rebuilt it
+            self._osd_hook = windowctl.no_activate_on_click(hwnd)
+            self._osd_hwnd = hwnd
         if self._osd_after is not None:
             self.video_win.after_cancel(self._osd_after)
         self._osd_after = self.video_win.after(ms, self._osd_win.withdraw)
 
     def _on_video_wheel(self, event):
-        if self.player is not self.embedded:
+        if self.player is not self.embedded or not event.delta:
             return
-        self.video_win.after(1, self._step_volume,
-                             5 if event.delta > 0 else -5)
+        # A mouse notch is 120; a precision touchpad sends many small
+        # deltas instead. Step 5 per 120 they add up to, so a short swipe
+        # is not a dozen steps.
+        if self._wheel_acc * event.delta < 0:
+            self._wheel_acc = 0      # turned back: count afresh
+        self._wheel_acc += event.delta
+        steps = int(self._wheel_acc / 120)     # toward zero, either sign
+        if steps:
+            self._wheel_acc -= steps * 120
+            self.video_win.after(1, self._step_volume, 5 * steps)
 
     # ------------------------------------------------ fullscreen control bar
 
@@ -814,8 +847,10 @@ class App:
         self._fs_time = tk.Label(row, width=8, anchor="e", bg=bg, fg=fg,
                                  font=("Segoe UI", 10))
         self._fs_time.pack(side="left")
-        self._fs_track = tk.Canvas(row, bg=bg, height=22, cursor="hand2",
-                                   highlightthickness=0)
+        # a small width of its own: the track takes what pack hands it,
+        # rather than asking for 10cm and squeezing the film length out
+        self._fs_track = tk.Canvas(row, bg=bg, width=40, height=22,
+                                   cursor="hand2", highlightthickness=0)
         self._fs_track.pack(side="left", fill="x", expand=True, padx=10)
         self._fs_len = tk.Label(row, width=8, anchor="w", bg=bg, fg=fg,
                                 font=("Segoe UI", 10))
@@ -830,8 +865,9 @@ class App:
         self._fs_full = self._fs_button(
             row, lambda: self._fs_resync_clicked(whole=True),
             "⟲ Resync (full)")
-        self._fs_status = tk.Label(row, anchor="w", bg=bg, fg="#9a9a9a",
-                                   font=("Segoe UI", 9))
+        # width=1: a long status is cut off, not a reason to widen the bar
+        self._fs_status = tk.Label(row, width=1, anchor="w", bg=bg,
+                                   fg="#9a9a9a", font=("Segoe UI", 9))
         self._fs_status.pack(side="left", fill="x", expand=True, padx=(8, 0))
         self._fs_track.bind("<ButtonPress-1>", self._fs_track_press)
         self._fs_track.bind("<B1-Motion>", self._fs_track_drag)
@@ -875,12 +911,18 @@ class App:
             self.video_win.after(1, self._show_fs_bar)
 
     def _show_fs_bar(self):
-        if self._closing or self._fs_up or not self.fullscreen:
+        if (self._closing or self._fs_up or not self.fullscreen
+                or self.player is not self.embedded):
             return
         win, bar = self.video_win, self.fs_bar
         self._set_film_cursor("")
         bar.update_idletasks()
-        w = max(480, min(1100, win.winfo_width() - 80))
+        # 1100 px at 100% scaling and more as the DPI grows, never narrower
+        # than the controls ask for, nor wider than the (fullscreen) film
+        scale = win.winfo_fpixels("1i") / 96
+        w = max(bar.winfo_reqwidth(),
+                min(round(1100 * scale), win.winfo_width() - 80))
+        w = min(w, win.winfo_width())
         h = bar.winfo_reqheight()
         x = win.winfo_rootx() + (win.winfo_width() - w) // 2
         y = win.winfo_rooty() + win.winfo_height() - h - 40
@@ -903,8 +945,24 @@ class App:
                 or not self.video_win.winfo_viewable()):
             self._hide_fs_bar()
             return
+        # A resync from the bar holds it up until the result is in - unless
+        # another application has the keyboard on the film's monitor: after
+        # an Alt+Tab to the browser there, the topmost bar would sit over
+        # it for the whole sync, so it rests as usual (hiding it outright
+        # would flicker it under a mouse crossing the film). A window on
+        # another monitor having the keyboard is the usual case, not that:
+        # a click on the bar leaves the foreground where it was (see
+        # windowctl.no_activate_on_click).
+        held = self._fs_hold
+        if held:
+            fg = windowctl.foreground()
+            film = int(self.video_win.frame(), 16)
+            held = (not fg
+                    or fg in (film, self._fs_hwnd, int(self.root.frame(), 16))
+                    or windowctl.monitor_rect(fg)
+                    != windowctl.monitor_rect(film))
         if (time.monotonic() - self._fs_moved >= self.FS_BAR_IDLE
-                and not (self._fs_drag or self._fs_hold
+                and not (self._fs_drag or held
                          or self._pointer_on_fs_bar())):
             self._hide_fs_bar(hide_pointer=True)
             return
@@ -994,15 +1052,12 @@ class App:
         film's audio - even with a position hint set."""
         if self.method_var.get() == "video":
             self._hide_fs_bar()     # keep it out of the screen capture
-        if whole:
-            self._sync(whole=True)
-        else:
-            self._resync()
-        if self.ctl.busy:
-            # stay up until the result is in: the bar shows the status
+        started = self._sync(whole=True) if whole else self._resync()
+        if started:
+            # stay up until the result is in: the bar shows the status.
+            # (Not when another sync was already running: this click
+            # started nothing, and that one is not the bar's to report.)
             self._fs_hold = True
-            for b in (self._fs_resync, self._fs_full):
-                b.config(state="disabled")
             (self._fs_full if whole else self._fs_resync).config(
                 text="⟲ Resyncing...")
 

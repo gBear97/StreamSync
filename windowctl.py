@@ -51,6 +51,7 @@ _SetWindowLongW = _proto("SetWindowLongW", wintypes.DWORD,
                          wintypes.HWND, ctypes.c_int, wintypes.DWORD)
 _SetWindowLongPtrW = _proto("SetWindowLongPtrW", ctypes.c_void_p,
                             wintypes.HWND, ctypes.c_int, ctypes.c_void_p)
+_GetForegroundWindow = _proto("GetForegroundWindow", wintypes.HWND)
 _CallWindowProcW = _proto("CallWindowProcW", LRESULT, ctypes.c_void_p,
                           wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
                           wintypes.LPARAM)
@@ -120,6 +121,11 @@ def no_activate_on_click(hwnd):
     prev = _SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
                               ctypes.cast(hook, ctypes.c_void_p))
     return hook
+
+
+def foreground():
+    """The top-level window that has the keyboard now (0 if none)."""
+    return _GetForegroundWindow() or 0
 
 
 def list_windows():

@@ -39,6 +39,11 @@ def main():
         time.sleep(0.4)
         assert not windowctl.is_minimized(hwnd), "window did not restore"
         print("hwnd found by title and pid; minimize + restore both verified")
+        # restore() asks for the foreground, which Windows may refuse;
+        # whatever has it, foreground() names a live window (or 0: none)
+        fg = windowctl.foreground()
+        assert isinstance(fg, int) and (fg == 0 or windowctl.is_valid(fg)), fg
+        print(f"foreground window read: {hex(fg)}")
         print("WINDOWCTL TEST PASSED")
     finally:
         proc.terminate()

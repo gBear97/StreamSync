@@ -2,9 +2,9 @@
 
 Real Tk events on a real (small) video window: double-click toggles
 fullscreen, right-click opens the player menu, the wheel steps the volume
-without ever unmuting, and in fullscreen a moving mouse brings up the
-control bar (timeline, play/pause, stop, resync here / full) that hides
-again, with the pointer, once the mouse rests. Fullscreen itself is
+a notch at a time without ever unmuting, and in fullscreen a moving mouse
+brings up the control bar (timeline, play/pause, stop, resync here / full)
+that hides again, with the pointer, once the mouse rests. Fullscreen itself is
 checked on every monitor attached: it must cover the monitor the window
 is on. Then, where VLC is installed, real libvlc plays a still image into
 the window, and a click over the picture must land on our frame - where
@@ -70,6 +70,7 @@ class FakeEmbedded:
 
 def make_app(root):
     import tkinter as tk
+    from tkinter import ttk
 
     import app
     import windowctl
@@ -77,11 +78,18 @@ def make_app(root):
     # The frame-style swap is recorded, not done: the bar's checks must
     # not take the screen over for seconds at a time (monitors() checks
     # the real swap, a moment per monitor).
-    fs_calls = []
+    # The foreground window is stubbed too: the film has the keyboard
+    # unless a check hands it to another window (fg["hwnd"]), on the
+    # film's monitor unless the check puts it on another (fg["monitor"]).
+    fs_calls, fg = [], {}
+    film_monitor = (0, 0, 1920, 1080)
     app.windowctl = types.SimpleNamespace(
         borderless_fullscreen=lambda h: fs_calls.append(("on", h)) or "kept",
         unfullscreen=lambda h, saved: fs_calls.append(("off", h, saved)),
-        no_activate_on_click=windowctl.no_activate_on_click)
+        no_activate_on_click=windowctl.no_activate_on_click,
+        foreground=lambda: fg.get("hwnd") or int(a.video_win.frame(), 16),
+        monitor_rect=lambda h: (fg.get("monitor", film_monitor)
+                                if h == fg.get("hwnd") else film_monitor))
 
     class FakeApp(app.App):
         """App with only the video window built - see the module note."""
@@ -95,12 +103,26 @@ def make_app(root):
             self._fs_saved = None
             self.mute_var = tk.BooleanVar(value=True)
             self.method_var = tk.StringVar(value="audio")
+            self.hint_var = tk.StringVar(value="1:05:00")
+            self.window_var = tk.StringVar(value="2:00")
             self.status_lbl = tk.Label(root)
+            self.sync_btn, self.resync_btn = ttk.Button(root), ttk.Button(root)
             self.embedded = FakeEmbedded()
-            self.ctl = types.SimpleNamespace(player=self.embedded,
-                                             external=None, busy=False)
-            self.fs_calls, self.pauses, self.popups = fs_calls, 0, []
+            # the real _sync runs; the controller's side is recorded
             self.syncs = []
+
+            def run(kind):
+                def start(hint, window, method, **video):
+                    self.syncs.append((kind, hint))
+                    self.ctl.busy = True
+                    return True
+                return start
+
+            self.ctl = types.SimpleNamespace(
+                player=self.embedded, external=None, busy=False,
+                sync=run("sync"), resync=run("resync"))
+            self.fs_calls, self.pauses, self.popups = fs_calls, 0, []
+            self.fg = fg
             self._build_video_window()
             self._build_video_menu()
             self._build_fs_bar()
@@ -113,12 +135,11 @@ def make_app(root):
         def _on_mute_toggle(self):
             pass
 
-        def _sync(self, resync=False, whole=False):
-            # recorded; what the real one sends is sync_args()'s check
-            self.syncs.append((resync, whole))
-            self.ctl.busy = True
+        def _ready(self, need_region):
+            return True         # no film to choose: nothing is loaded
 
-    return FakeApp(root)
+    a = FakeApp(root)
+    return a
 
 
 def pump(root, seconds=0.15):
@@ -200,13 +221,27 @@ def mouse_controls(root, a):
     a._closing = False
     assert len(a.popups) == 1, a.popups
 
-    # wheel: +/-5 from 100 when libvlc has no volume yet, clamped to
-    # 0-125, and never unmutes; the OSD says so
+    # wheel: +/-5 a notch (120) from 100 when libvlc has no volume yet,
+    # clamped to 0-125, and never unmutes; the OSD says so
     click(frame, "<MouseWheel>", delta=120)
     pump(root)
     assert a.embedded.vol == 105, a.embedded.vol
     assert a._osd_lbl.cget("text") == "Volume 105% (muted)"
     assert a.mute_var.get() is True and a.embedded.mute_calls == 0
+    # a precision touchpad: small deltas step only once they add up to a
+    # notch, and less than a notch (or a zero delta) does nothing
+    for _ in range(4):
+        click(frame, "<MouseWheel>", delta=30)
+    pump(root)
+    assert a.embedded.vol == 110, a.embedded.vol
+    for d in (0, 40, 40):
+        click(frame, "<MouseWheel>", delta=d)
+    pump(root)
+    assert a.embedded.vol == 110, a.embedded.vol
+    # ...turned back, the count starts afresh: one notch down, one step
+    click(frame, "<MouseWheel>", delta=-120)
+    pump(root)
+    assert a.embedded.vol == 105, a.embedded.vol
     a.embedded.vol = 123
     click(frame, "<MouseWheel>", delta=120)
     pump(root)
@@ -218,17 +253,30 @@ def mouse_controls(root, a):
     a._flash_osd("bye", ms=50)
     pump(root, 0.3)
     assert a._osd_win.state() == "withdrawn", a._osd_win.state()
-    print("wheel: volume steps by 5, clamped to 0-125, stays muted; the "
-          "OSD shows it and hides itself")
+    print("wheel: volume steps by 5 a notch, small deltas adding up to "
+          "one, clamped to 0-125, stays muted; the OSD shows it and hides "
+          "itself")
 
-    # external VLC: the video window is not its player - no menu, no wheel
+    # external VLC: the video window is not its player - no menu, no
+    # wheel, and a double-click neither fullscreens the embed nor reaches
+    # out to VLC's own window (a blocking call from here)
+    toggles = []
     a.ctl.player = object()
+    a.ctl.external = types.SimpleNamespace(
+        fullscreen_toggle=lambda: toggles.append(1))
     click(frame, "<ButtonPress-3>", button=3, rootx=1, rooty=1)
     click(frame, "<MouseWheel>", delta=120)
+    for _ in range(2):
+        t += 100
+        click(frame, "<ButtonPress-1>", button=1, time=t)
+        click(frame, "<ButtonRelease-1>", button=1, time=t + 20)
+    t += 2000
     pump(root)
     assert len(a.popups) == 1 and a.embedded.vol == 0
-    a.ctl.player = a.embedded
-    print("external player: right-click and wheel leave the embed alone")
+    assert toggles == [] and a.fullscreen is False, (toggles, a.fs_calls)
+    a.ctl.player, a.ctl.external = a.embedded, None
+    print("external player: right-click, wheel and double-click leave the "
+          "embed (and VLC) alone")
 
 
 LRESULT = ctypes.c_ssize_t
@@ -237,7 +285,7 @@ MA_ACTIVATE, MA_NOACTIVATE = 1, 3
 
 
 def fs_bar(root, a):
-    """The fullscreen control bar, over the small window standing in for a
+    """The fullscreen control bar, over a window standing in for a
     fullscreen one (the frame-style swap is stubbed - see make_app)."""
     send = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
                               wintypes.WPARAM, wintypes.LPARAM)(
@@ -245,6 +293,8 @@ def fs_bar(root, a):
     win, frame, bar, e = a.video_win, a.video_frame, a.fs_bar, a.embedded
     a.FS_BAR_IDLE = 0.4
     a._pointer_on_fs_bar = lambda: False   # wherever the real pointer is
+    win.geometry("960x540+40+40")          # room for the whole bar
+    pump(root, 0.3)
     e.t, e.n, e.playing = 754.4, 6750.0, True
 
     def move(x, y):
@@ -268,8 +318,16 @@ def fs_bar(root, a):
     assert abs(mid - want) <= 1, (mid, want)
     assert (bar.winfo_rooty() + bar.winfo_height()
             < win.winfo_rooty() + win.winfo_height())
+    # as wide as its controls ask for at least, so the film length is not
+    # squeezed out by the track (which takes what is left)
+    pump(root)
+    assert bar.winfo_width() >= bar.winfo_reqwidth(), \
+        (bar.winfo_width(), bar.winfo_reqwidth())
+    assert a._fs_len.winfo_width() >= a._fs_len.winfo_reqwidth(), \
+        (a._fs_len.winfo_width(), a._fs_len.winfo_reqwidth())
+    assert a._fs_track.winfo_width() > 200, a._fs_track.winfo_width()
     print("fullscreen: a moving mouse brings up the bar, centred at the "
-          "bottom, reading 12:34 of 1:52:30")
+          "bottom, reading 12:34 of 1:52:30, with room for all of it")
 
     # a click must not make the bar the active window - the film keeps
     # the keyboard (Space, Esc) and the taskbar stays under it. The video
@@ -278,7 +336,13 @@ def fs_bar(root, a):
     bh, vh = int(bar.frame(), 16), int(win.frame(), 16)
     assert send(bh, WM_MOUSEACTIVATE, bh, msg) == MA_NOACTIVATE
     assert send(vh, WM_MOUSEACTIVATE, vh, msg) == MA_ACTIVATE
-    print("a click on the bar leaves the film the active window")
+    # the volume OSD floats over the film the same way
+    a._flash_osd("Volume 50%", ms=300)
+    pump(root)
+    oh = int(a._osd_win.frame(), 16)
+    assert send(oh, WM_MOUSEACTIVATE, oh, msg) == MA_NOACTIVATE
+    print("a click on the bar or the volume OSD leaves the film the active "
+          "window")
 
     pump(root, 0.8)
     assert not shown() and bar.state() == "withdrawn"
@@ -329,7 +393,7 @@ def fs_bar(root, a):
     # resync: the bar stays up, with its status, until the result is in;
     # either button locks both, and the one pressed says it is running
     resync, full = a._fs_resync, a._fs_full
-    for btn, want in ((resync, (True, False)), (full, (False, True))):
+    for btn, want in ((resync, ("resync", "1:05:00")), (full, ("sync", ""))):
         label = btn.cget("text")
         move(50 + len(a.syncs), 30)
         assert shown()
@@ -337,6 +401,7 @@ def fs_bar(root, a):
         pump(root)
         assert a.syncs[-1] == want, a.syncs
         assert resync.cget("state") == full.cget("state") == "disabled"
+        assert a.sync_btn.instate(["disabled"])
         assert btn.cget("text").endswith("Resyncing...")
         a._set_status("Listening to the stream (12 s)...")
         assert a._fs_status.cget("text") == \
@@ -351,9 +416,58 @@ def fs_bar(root, a):
         assert shown()
         pump(root, 0.6)
         assert not shown()
-    assert a.syncs == [(True, False), (False, True)], a.syncs
+    assert a.syncs == [("resync", "1:05:00"), ("sync", "")], a.syncs
     print("resync here / resync (full): the bar holds while one runs, "
           "shows its status, then rests as usual")
+
+    # Another monitor's window keeping the keyboard is the usual case (a
+    # click on the bar leaves it there): the bar holds. Alt+Tab to a
+    # window on the film's monitor mid-resync, though: the topmost bar
+    # must not sit over it until the result is in - it rests as usual.
+    # Back on the film, a move brings it up held again.
+    move(52, 30)
+    resync.invoke()
+    pump(root)
+    assert a._fs_hold and shown()
+    a.fg["hwnd"] = 1                  # some other application's window...
+    a.fg["monitor"] = (1920, 0, 1920, 1080)      # ...on the other monitor
+    pump(root, 0.8)
+    assert shown()
+    del a.fg["monitor"]               # now on the film's
+    pump(root, 0.8)
+    assert not shown()
+    a.fg.clear()
+    move(53, 30)
+    pump(root, 0.8)
+    assert shown()
+    a.ctl.busy = False
+    a._fs_sync_done()
+    pump(root, 0.8)
+    assert not shown()
+    print("a held bar holds while another monitor's window is active, and "
+          "rests as usual once one on the film's monitor is")
+
+    # a sync started elsewhere (the main window, a hotkey) locks the bar's
+    # buttons too, and a click that gets to them anyway starts nothing,
+    # relabels nothing and holds nothing
+    syncs = len(a.syncs)
+    move(54, 30)
+    a._sync()
+    assert len(a.syncs) == syncs + 1 and a.ctl.busy
+    assert resync.cget("state") == full.cget("state") == "disabled"
+    for whole in (False, True):
+        a._fs_resync_clicked(whole=whole)
+    pump(root)
+    assert len(a.syncs) == syncs + 1 and not a._fs_hold, a.syncs
+    assert resync.cget("text") == "⟲ Resync here"
+    assert full.cget("text") == "⟲ Resync (full)"
+    pump(root, 0.8)
+    assert not shown()
+    a.ctl.busy = False
+    a._fs_sync_done()
+    assert resync.cget("state") == full.cget("state") == "normal"
+    print("a sync started elsewhere locks the bar's resync buttons; one "
+          "pressed then starts and holds nothing")
 
     # gone with whatever takes the film away
     move(41, 30)
@@ -380,6 +494,20 @@ def fs_bar(root, a):
     print("the bar goes when the film does, leaves with fullscreen, and "
           "never shows windowed, for external VLC or while closing")
 
+    # back into fullscreen with the mouse resting (F11, a double-click,
+    # the film resuming after a stream pause): Windows repeats the last
+    # position at most, yet the bar shows and then goes, pointer and all
+    a._set_fullscreen(True)
+    move(44, 30)                                 # the same place again
+    assert shown()
+    pump(root, 0.8)
+    assert not shown() and frame.cget("cursor") == "none"
+    a._set_fullscreen(False)
+    win.geometry("320x180+40+40")
+    pump(root, 0.3)
+    print("fullscreen entered under a resting mouse: the bar shows, then "
+          "goes with the pointer")
+
 
 def sync_args():
     """What the real _sync hands the controller: Resync (full) searches
@@ -404,14 +532,24 @@ def sync_args():
         hint_var=tk.StringVar(value="1:05:00"),
         window_var=tk.StringVar(value="2:00"),
         sync_btn=ttk.Button(), resync_btn=ttk.Button(),
+        _fs_resync=tk.Button(), _fs_full=tk.Button(),
         _ready=lambda need_region: True)
     for kw in ({}, {"resync": True}, {"whole": True}):
-        app.App._sync(s, **kw)
+        assert app.App._sync(s, **kw) is True
     assert calls == [("sync", "1:05:00", "2:00", "audio"),
                      ("resync", "1:05:00", "2:00", "audio"),
                      ("sync", "", "2:00", "audio")], calls
+    # a started sync locks every button that starts one, the fullscreen
+    # bar's included; while one runs, another starts nothing
+    for b in (s.sync_btn, s.resync_btn):
+        assert b.instate(["disabled"])
+    assert s._fs_resync.cget("state") == s._fs_full.cget("state") == \
+        "disabled"
+    s.ctl.busy = True
+    assert app.App._sync(s) is False and len(calls) == 3, calls
     print("resync (full) searches the whole film even with a hint set; "
-          "sync and resync here keep the hint")
+          "sync and resync here keep the hint; a started sync locks the "
+          "bar's buttons too, and none starts while one runs")
 
 
 def monitors(root):
@@ -531,7 +669,17 @@ def main():
     try:
         a = make_app(root)
         mouse_controls(root, a)
-        fs_bar(root, a)
+        # The bar's checks need a window big enough for the whole bar, over
+        # much of the screen - and the real pointer must not rest on it:
+        # Windows sends a move at the pointer whenever a window appears or
+        # vanishes under it, which would mix with the checks' own moves.
+        pt = wintypes.POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        ctypes.windll.user32.SetCursorPos(0, 0)     # the window is at +40+40
+        try:
+            fs_bar(root, a)
+        finally:
+            ctypes.windll.user32.SetCursorPos(pt.x, pt.y)
         sync_args()
         monitors(root)
         vout_hits(root, a)
