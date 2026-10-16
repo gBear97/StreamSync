@@ -102,9 +102,7 @@ def make_app(root):
             self._osd_after = None
             self._fs_saved = None
             self.mute_var = tk.BooleanVar(value=True)
-            self.method_var = tk.StringVar(value="audio")
             self.hint_var = tk.StringVar(value="1:05:00")
-            self.window_var = tk.StringVar(value="2:00")
             self.status_lbl = tk.Label(root)
             self.sync_btn, self.resync_btn = ttk.Button(root), ttk.Button(root)
             self.embedded = FakeEmbedded()
@@ -112,7 +110,7 @@ def make_app(root):
             self.syncs = []
 
             def run(kind):
-                def start(hint, window, method, **video):
+                def start(hint, mute=True):
                     self.syncs.append((kind, hint))
                     self.ctl.busy = True
                     return True
@@ -521,24 +519,22 @@ def sync_args():
     calls = []
 
     def rec(kind):
-        return lambda hint, window, method, **video: calls.append(
-            (kind, hint, window, method)) or True
+        return lambda hint, mute=True: calls.append((kind, hint, mute)) or True
 
     s = types.SimpleNamespace(
         ctl=types.SimpleNamespace(busy=False, sync=rec("sync"),
                                   resync=rec("resync")),
-        method_var=tk.StringVar(value="audio"),
-        mute_var=tk.BooleanVar(value=True),
+        mute_var=tk.BooleanVar(value=False),
         hint_var=tk.StringVar(value="1:05:00"),
-        window_var=tk.StringVar(value="2:00"),
         sync_btn=ttk.Button(), resync_btn=ttk.Button(),
         _fs_resync=tk.Button(), _fs_full=tk.Button(),
-        _ready=lambda need_region: True)
+        _ready=lambda: True)
     for kw in ({}, {"resync": True}, {"whole": True}):
         assert app.App._sync(s, **kw) is True
-    assert calls == [("sync", "1:05:00", "2:00", "audio"),
-                     ("resync", "1:05:00", "2:00", "audio"),
-                     ("sync", "", "2:00", "audio")], calls
+    # mute_var is off here, so a call that dropped it would show True
+    assert calls == [("sync", "1:05:00", False),
+                     ("resync", "1:05:00", False),
+                     ("sync", "", False)], calls
     # a started sync locks every button that starts one, the fullscreen
     # bar's included; while one runs, another starts nothing
     for b in (s.sync_btn, s.resync_btn):
@@ -601,9 +597,10 @@ def vout_hits(root, a):
     picture lands on our frame. (WS_EX_TRANSPARENT, which an earlier shell
     swept onto the vout for this, does not change hit-testing at all.)"""
     import ctypes
+    import subprocess
     from ctypes import wintypes
 
-    from PIL import Image
+    import imageio_ffmpeg
 
     import players
 
@@ -634,7 +631,11 @@ def vout_hits(root, a):
 
     with tempfile.TemporaryDirectory() as tmp:
         still = os.path.join(tmp, "still.png")
-        Image.new("RGB", (640, 360), (40, 90, 160)).save(still)
+        # one flat blue frame, made by the ffmpeg the app already ships
+        subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner",
+                        "-loglevel", "error", "-f", "lavfi",
+                        "-i", "color=c=0x285aa0:s=640x360", "-frames:v", "1",
+                        still], check=True, capture_output=True)
         try:
             p.load(still)
             p.mp.play()

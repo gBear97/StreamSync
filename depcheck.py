@@ -21,14 +21,11 @@ import netcerts
 # (import name, pip name)
 REQUIRED_PKGS = [
     ("numpy", "numpy"),
-    ("PIL", "Pillow"),
-    ("mss", "mss"),
     ("imageio_ffmpeg", "imageio-ffmpeg"),
     ("vlc", "python-vlc"),
     ("soundcard", "soundcard"),
     ("websockets", "websockets"),   # watch parties
 ]
-OPTIONAL_PKGS = [("keyboard", "keyboard")] if sys.platform == "win32" else []
 
 IS_MAC = sys.platform == "darwin"
 VLC64_DLL = r"C:\Program Files\VideoLAN\VLC\libvlc.dll"
@@ -65,10 +62,10 @@ def frozen():
     return bool(getattr(sys, "frozen", False))
 
 
-def missing_packages(pkgs=REQUIRED_PKGS):
+def missing_packages():
     if frozen():
         return []
-    return [pip for mod, pip in pkgs
+    return [pip for mod, pip in REQUIRED_PKGS
             if importlib.util.find_spec(mod) is None]
 
 
@@ -149,7 +146,6 @@ def collect():
     pkgs = missing_packages()
     return {
         "packages": pkgs,
-        "optional": missing_packages(OPTIONAL_PKGS),
         "vlc": vlc_dll_path(),
         "vlc32_only": (not IS_MAC and vlc_dll_path() is None
                        and os.path.isfile(VLC32_DLL)),
@@ -226,8 +222,8 @@ class _Dialog:
                   ).grid(row=0, column=0, columnspan=2, sticky="w")
 
         self.row_lbls = {}
-        for i, key in enumerate(("packages", "vlc", "ffmpeg", "blackhole",
-                                 "optional"), start=1):
+        for i, key in enumerate(("packages", "vlc", "ffmpeg", "blackhole"),
+                                start=1):
             lbl = ttk.Label(frm, text="")
             lbl.grid(row=i, column=0, columnspan=2, sticky="w", pady=(6, 0))
             self.row_lbls[key] = lbl
@@ -315,13 +311,6 @@ class _Dialog:
             self.row_lbls["ffmpeg"].config(
                 text="[  ] ffmpeg (bundled): checked after packages install")
 
-        if c["optional"] and not frozen():
-            self.row_lbls["optional"].config(
-                text="[optional] " + ", ".join(c["optional"]) +
-                     " - global hotkeys only; app works without it")
-        else:
-            self.row_lbls["optional"].config(text="")
-
         state_pip = "!disabled" if (c["packages"] and not frozen()) else "disabled"
         self.pip_btn.state([state_pip])
         if c["vlc"]:
@@ -345,7 +334,7 @@ class _Dialog:
     # ----------------------------------------------------------------- fixes
 
     def _fix_pip(self):
-        pkgs = self.checks["packages"] + self.checks["optional"]
+        pkgs = self.checks["packages"]
         self._run([sys.executable, "-m", "pip", "install",
                    "--disable-pip-version-check"] + pkgs,
                   "Python packages installed.")
@@ -548,7 +537,6 @@ if __name__ == "__main__":
     else:
         c = collect()
         print("packages missing:", c["packages"] or "none")
-        print("optional missing:", c["optional"] or "none")
         print("vlc:", c["vlc"] or "NOT FOUND")
         print("ffmpeg ok:", c["ffmpeg"])
         print("package manager:", c["pkgmgr"] or "NOT FOUND")
