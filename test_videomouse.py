@@ -2,19 +2,25 @@
 
 Real Tk events on a real (small) video window: double-click toggles
 fullscreen, right-click opens the player menu, the wheel steps the volume
-without ever unmuting. Then, where VLC is installed, real libvlc plays a
-still image into the window, and a click over the picture must land on
-our frame - where those bindings are - not on libvlc's vout.
+without ever unmuting, and in fullscreen a moving mouse brings up the
+control bar (timeline, play/pause, stop, resync) that hides again, with
+the pointer, once the mouse rests. Fullscreen itself is checked on every
+monitor attached: it must cover the monitor the window is on. Then, where
+VLC is installed, real libvlc plays a still image into the window, and a
+click over the picture must land on our frame - where those bindings
+are - not on libvlc's vout.
 
 No config: the app object is built from its video-window parts only, so
 nothing here can load a film or save ~/.streamsync.json.
 """
 
+import ctypes
 import os
 import sys
 import tempfile
 import time
 import types
+from ctypes import wintypes
 
 
 class FakeEmbedded:
@@ -24,6 +30,24 @@ class FakeEmbedded:
         self.tracks = [(-1, "Disable"), (2, "English"), (3, "Francais")]
         self.current = 2
         self.picked = []
+        self.t, self.n, self.playing = None, None, False
+        self.seeks, self.stops = [], 0
+
+    def time(self):
+        return self.t
+
+    def length(self):
+        return self.n
+
+    def is_playing(self):
+        return self.playing
+
+    def seek(self, seconds):
+        self.seeks.append(seconds)
+
+    def stop(self):
+        self.stops += 1
+        self.t, self.playing = None, False
 
     def volume(self):
         return self.vol
@@ -48,6 +72,16 @@ def make_app(root):
     import tkinter as tk
 
     import app
+    import windowctl
+
+    # The frame-style swap is recorded, not done: the bar's checks must
+    # not take the screen over for seconds at a time (monitors() checks
+    # the real swap, a moment per monitor).
+    fs_calls = []
+    app.windowctl = types.SimpleNamespace(
+        borderless_fullscreen=lambda h: fs_calls.append(("on", h)) or "kept",
+        unfullscreen=lambda h, saved: fs_calls.append(("off", h, saved)),
+        no_activate_on_click=windowctl.no_activate_on_click)
 
     class FakeApp(app.App):
         """App with only the video window built - see the module note."""
@@ -58,26 +92,30 @@ def make_app(root):
             self._closing = False
             self._osd_win = None
             self._osd_after = None
+            self._fs_saved = None
             self.mute_var = tk.BooleanVar(value=True)
+            self.method_var = tk.StringVar(value="audio")
+            self.status_lbl = tk.Label(root)
             self.embedded = FakeEmbedded()
             self.ctl = types.SimpleNamespace(player=self.embedded,
-                                             external=None)
-            self.fs_calls, self.pauses, self.popups = [], 0, []
+                                             external=None, busy=False)
+            self.fs_calls, self.pauses, self.popups = fs_calls, 0, []
+            self.resyncs = 0
             self._build_video_window()
             self._build_video_menu()
+            self._build_fs_bar()
             # tk_popup runs a modal menu loop that would wait for a human
             self.video_menu.tk_popup = lambda x, y: self.popups.append((x, y))
-
-        def _set_fullscreen(self, flag):
-            # recorded, not done: a test must not take over the screen
-            self.fs_calls.append(flag)
-            self.fullscreen = flag
 
         def _toggle_pause(self):
             self.pauses += 1
 
         def _on_mute_toggle(self):
             pass
+
+        def _resync(self):
+            self.resyncs += 1
+            self.ctl.busy = True
 
     return FakeApp(root)
 
@@ -106,10 +144,12 @@ def mouse_controls(root, a):
     # window whenever the pointer crossed the video (Space = pause)
     assert not win.bind("<Enter>")
 
-    # double-click on the picture (the frame: clicks land there once the
-    # vout is shielded) toggles fullscreen, and again toggles it back.
-    # Tk pairs presses by their event time, not the wall clock, so each
-    # press is stamped: 100 ms apart within a double-click, 2 s between.
+    # double-click on the picture (the frame: clicks land there - see
+    # vout_hits) toggles fullscreen, and again toggles it back, through
+    # the video window's own OS frame. Tk pairs presses by their event
+    # time, not the wall clock, so each press is stamped: 100 ms apart
+    # within a double-click, 2 s between.
+    hwnd = int(win.frame(), 16)
     t = 1000
     for want in (True, False):
         for _ in range(2):
@@ -118,8 +158,8 @@ def mouse_controls(root, a):
             click(frame, "<ButtonRelease-1>", button=1, time=t + 20)
         t += 2000
         pump(root)
-        assert a.fs_calls and a.fs_calls[-1] is want, a.fs_calls
-    assert a.fs_calls == [True, False], a.fs_calls
+        assert a.fullscreen is want, a.fs_calls
+    assert a.fs_calls == [("on", hwnd), ("off", hwnd, "kept")], a.fs_calls
     print("double-click on the video: fullscreen on, then off again")
 
     # right-click: the menu pops at the pointer, its subtitle list rebuilt
@@ -188,6 +228,189 @@ def mouse_controls(root, a):
     assert len(a.popups) == 1 and a.embedded.vol == 0
     a.ctl.player = a.embedded
     print("external player: right-click and wheel leave the embed alone")
+
+
+LRESULT = ctypes.c_ssize_t
+WM_MOUSEACTIVATE, WM_LBUTTONDOWN, HTCLIENT = 0x0021, 0x0201, 1
+MA_ACTIVATE, MA_NOACTIVATE = 1, 3
+
+
+def fs_bar(root, a):
+    """The fullscreen control bar, over the small window standing in for a
+    fullscreen one (the frame-style swap is stubbed - see make_app)."""
+    send = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
+                              wintypes.WPARAM, wintypes.LPARAM)(
+        ("SendMessageW", ctypes.windll.user32))
+    win, frame, bar, e = a.video_win, a.video_frame, a.fs_bar, a.embedded
+    a.FS_BAR_IDLE = 0.4
+    a._pointer_on_fs_bar = lambda: False   # wherever the real pointer is
+    e.t, e.n, e.playing = 754.4, 6750.0, True
+
+    def move(x, y):
+        frame.event_generate("<Motion>", x=x, y=y, rootx=500 + x,
+                             rooty=300 + y)
+        pump(root, 0.1)
+
+    def shown():
+        return a._fs_up and bar.winfo_viewable()
+
+    move(10, 10)
+    assert not a._fs_up and bar.state() == "withdrawn"
+    a._set_fullscreen(True)
+    move(12, 10)
+    assert shown()
+    assert a._fs_play.cget("text").endswith("Pause")
+    assert a._fs_time.cget("text") == "12:34", a._fs_time.cget("text")
+    assert a._fs_len.cget("text") == "1:52:30", a._fs_len.cget("text")
+    mid = bar.winfo_rootx() + bar.winfo_width() // 2
+    want = win.winfo_rootx() + win.winfo_width() // 2
+    assert abs(mid - want) <= 1, (mid, want)
+    assert (bar.winfo_rooty() + bar.winfo_height()
+            < win.winfo_rooty() + win.winfo_height())
+    print("fullscreen: a moving mouse brings up the bar, centred at the "
+          "bottom, reading 12:34 of 1:52:30")
+
+    # a click must not make the bar the active window - the film keeps
+    # the keyboard (Space, Esc) and the taskbar stays under it. The video
+    # window, plain Tk, is the control: Tk says yes to activation.
+    msg = (WM_LBUTTONDOWN << 16) | HTCLIENT
+    bh, vh = int(bar.frame(), 16), int(win.frame(), 16)
+    assert send(bh, WM_MOUSEACTIVATE, bh, msg) == MA_NOACTIVATE
+    assert send(vh, WM_MOUSEACTIVATE, vh, msg) == MA_ACTIVATE
+    print("a click on the bar leaves the film the active window")
+
+    pump(root, 0.8)
+    assert not shown() and bar.state() == "withdrawn"
+    assert frame.cget("cursor") == "none" and win.cget("cursor") == "none"
+    move(12, 10)              # what Windows sends as the bar vanishes
+    assert not shown() and frame.cget("cursor") == "none"
+    move(40, 30)
+    assert shown() and frame.cget("cursor") == ""
+    print("a resting mouse hides the bar and the pointer; a repeated "
+          "position does not bring them back, a real move does")
+
+    # the timeline: a click seeks there, a drag seeks once, on release
+    a._fs_refresh()
+    pump(root)
+    tr = a._fs_track
+    x0, span = 8, tr.winfo_width() - 16
+    tr.event_generate("<ButtonPress-1>", x=x0 + span // 2, y=10)
+    tr.event_generate("<ButtonRelease-1>", x=x0 + span // 2, y=10)
+    pump(root)
+    assert len(e.seeks) == 1 and abs(e.seeks[0] - 3375.0) < 20, e.seeks
+    tr.event_generate("<ButtonPress-1>", x=x0 + span // 4, y=10)
+    tr.event_generate("<Motion>", x=x0 + span * 3 // 4, y=10, state=0x100)
+    pump(root)
+    assert len(e.seeks) == 1, e.seeks            # not while dragging
+    assert a._fs_time.cget("text").startswith("1:24:"), \
+        a._fs_time.cget("text")                  # the knob's time, ~3/4
+    tr.event_generate("<ButtonRelease-1>", x=x0 + span * 3 // 4, y=10)
+    pump(root)
+    assert len(e.seeks) == 2 and abs(e.seeks[1] - 5062.5) < 20, e.seeks
+    print("timeline: a click seeks there; a drag shows its time and seeks "
+          "once, on release")
+
+    pauses = a.pauses
+    a._fs_play.invoke()
+    pump(root)
+    assert a.pauses == pauses + 1
+    a._fs_stop.invoke()
+    pump(root)
+    assert e.stops == 1
+    assert a._fs_play.cget("text").endswith("Play")
+    assert a._fs_time.cget("text") == "-:--"
+    tr.event_generate("<ButtonPress-1>", x=x0 + 10, y=10)
+    tr.event_generate("<ButtonRelease-1>", x=x0 + 10, y=10)
+    pump(root)
+    assert len(e.seeks) == 2, e.seeks            # stopped: nothing to seek
+    print("play/pause and stop work; a stopped film has no timeline")
+
+    # resync: the bar stays up, with its status, until the result is in
+    move(50, 30)
+    assert shown()
+    a._fs_resync.invoke()
+    pump(root)
+    assert a.resyncs == 1 and a._fs_resync.cget("state") == "disabled"
+    a._set_status("Listening to the stream (12 s)...")
+    assert a._fs_status.cget("text") == "Listening to the stream (12 s)..."
+    pump(root, 0.8)
+    assert shown()
+    a.ctl.busy = False
+    a._fs_sync_done()
+    assert a._fs_resync.cget("state") == "normal"
+    pump(root, 0.2)
+    assert shown()
+    pump(root, 0.6)
+    assert not shown()
+    print("resync: the bar holds while it runs, shows its status, then "
+          "rests as usual")
+
+    # gone with whatever takes the film away
+    move(41, 30)
+    win.withdraw()
+    pump(root, 0.4)
+    assert not shown()
+    win.deiconify()
+    move(42, 30)
+    assert shown()
+    a._set_fullscreen(False)
+    assert not shown() and frame.cget("cursor") == ""
+    move(43, 30)
+    assert not shown()                           # windowed: no bar
+    a._set_fullscreen(True)
+    a.ctl.player = object()                      # external VLC
+    move(44, 30)
+    assert not shown()
+    a.ctl.player = e
+    a._closing = True
+    a._show_fs_bar()
+    assert not shown()
+    a._closing = False
+    a._set_fullscreen(False)
+    print("the bar goes when the film does, leaves with fullscreen, and "
+          "never shows windowed, for external VLC or while closing")
+
+
+def monitors(root):
+    """Fullscreen covers the monitor the window is on - every monitor here,
+    not only the primary one Tk's -fullscreen always picks - keeps the
+    window's hwnd (libvlc draws into it) and puts it back exactly. Each
+    monitor is covered for a moment."""
+    import tkinter as tk
+
+    import windowctl
+
+    rects = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
+                        ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+    def each(_hmon, _hdc, r, _lp):
+        r = r.contents
+        rects.append((r.left, r.top, r.right - r.left, r.bottom - r.top))
+        return True
+
+    ctypes.windll.user32.EnumDisplayMonitors(None, None, each, 0)
+    w = tk.Toplevel(root)
+    try:
+        for mx, my, mw, mh in rects:
+            w.geometry(f"320x180+{mx + 60}+{my + 60}")
+            pump(root, 0.2)
+            hwnd = int(w.frame(), 16)
+            before = windowctl.window_rect(hwnd)
+            assert windowctl.monitor_rect(hwnd) == (mx, my, mw, mh)
+            saved = windowctl.borderless_fullscreen(hwnd)
+            pump(root, 0.1)
+            assert windowctl.window_rect(hwnd) == (mx, my, mw, mh), \
+                (windowctl.window_rect(hwnd), (mx, my, mw, mh))
+            assert int(w.frame(), 16) == hwnd
+            windowctl.unfullscreen(hwnd, saved)
+            pump(root, 0.1)
+            assert windowctl.window_rect(hwnd) == before, \
+                (windowctl.window_rect(hwnd), before)
+    finally:
+        w.destroy()
+    print(f"fullscreen covers the window's own monitor, on each of "
+          f"{len(rects)} here, and restores it, same hwnd")
 
 
 def vout_hits(root, a):
@@ -265,6 +488,8 @@ def main():
     try:
         a = make_app(root)
         mouse_controls(root, a)
+        fs_bar(root, a)
+        monitors(root)
         vout_hits(root, a)
     finally:
         root.destroy()

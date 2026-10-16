@@ -15,6 +15,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from pathlib import Path
 
 import tkinter as tk
@@ -32,6 +33,11 @@ from players import EmbeddedPlayer, VLCError
 from version import __version__
 
 
+def fmt_clock(s):
+    """m:ss or h:mm:ss in whole seconds - a timeline's reading."""
+    return fmt_time(int(s)).rsplit(".", 1)[0]
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -47,6 +53,7 @@ class App:
         self._closing = False
         self._osd_win = None         # Tk-drawn volume OSD over the video
         self._osd_after = None
+        self._fs_saved = None        # frame style + rect fullscreen replaced
 
         root.title(f"StreamSync {__version__}")
         root.resizable(False, False)
@@ -54,6 +61,7 @@ class App:
         self._build_video_window()
         self._build_controls()
         self._build_video_menu()  # after controls: shares their variables
+        self._build_fs_bar()
 
         try:
             embedded = EmbeddedPlayer(self.video_frame.winfo_id())
@@ -102,6 +110,7 @@ class App:
                                 1, self._fullscreen_clicked))
         self.video_win.bind("<MouseWheel>", self._on_video_wheel)
         self.video_win.bind("<Button-3>", self._show_video_menu)
+        self.video_win.bind("<Motion>", self._on_video_motion)
         self.video_win.protocol("WM_DELETE_WINDOW", self.video_win.withdraw)
         self.video_win.withdraw()
         self.video_win.update_idletasks()
@@ -636,9 +645,8 @@ class App:
                 self.stream_hwnd = hwnd
                 if self.player is self.embedded:
                     self._was_fullscreen = self.fullscreen
-                    if self.fullscreen:
-                        self.video_win.attributes("-fullscreen", False)
-                        self.fullscreen = False
+                    # resuming puts it back fullscreen, on the same monitor
+                    self._set_fullscreen(False, show=False)
                     self.video_win.withdraw()
                 elif self.external is not None and self.external.proc:
                     self._ext_hwnd = windowctl.find_by_pid(self.external.proc.pid)
@@ -669,10 +677,25 @@ class App:
         else:
             self.external.fullscreen_toggle()
 
-    def _set_fullscreen(self, flag):
+    def _set_fullscreen(self, flag, show=True):
+        if show:
+            self.video_win.deiconify()
+        if flag == self.fullscreen:
+            return
+        # Tk's -fullscreen always picks the primary monitor; cover the one
+        # the window is on, as VLC does (see windowctl). A window shown
+        # just now gets its OS frame at idle time, so let that happen.
+        self.video_win.update_idletasks()
+        hwnd = int(self.video_win.frame(), 16)
+        if flag:
+            self._fs_saved = windowctl.borderless_fullscreen(hwnd)
+            self.video_win.lift()
+        else:
+            if self._fs_saved is not None:
+                windowctl.unfullscreen(hwnd, self._fs_saved)
+            self._fs_saved = None
+            self._hide_fs_bar()
         self.fullscreen = flag
-        self.video_win.deiconify()
-        self.video_win.attributes("-fullscreen", flag)
 
     # ------------------------------------------- video window mouse controls
 
@@ -769,6 +792,216 @@ class App:
         self.video_win.after(1, self._step_volume,
                              5 if event.delta > 0 else -5)
 
+    # ------------------------------------------------ fullscreen control bar
+
+    FS_BAR_IDLE = 2.5        # seconds of a resting mouse before it hides
+
+    def _build_fs_bar(self):
+        """VLC-style controls over the bottom of a fullscreen film: they
+        appear when the mouse moves and hide, with the pointer, once it
+        rests. A top-level window of their own, like VLC's (and like the
+        volume OSD): a widget inside the video window would have to sit
+        over libvlc's Direct3D child window."""
+        bg, fg = "#1b1b1b", "#e6e6e6"
+        bar = tk.Toplevel(self.video_win, bg=bg, highlightthickness=1,
+                          highlightbackground="#3a3a3a")
+        bar.overrideredirect(True)
+        bar.attributes("-topmost", True)
+        bar.attributes("-alpha", 0.92)
+        bar.withdraw()
+        row = tk.Frame(bar, bg=bg)
+        row.pack(fill="x", padx=14, pady=(10, 2))
+        self._fs_time = tk.Label(row, width=8, anchor="e", bg=bg, fg=fg,
+                                 font=("Segoe UI", 10))
+        self._fs_time.pack(side="left")
+        self._fs_track = tk.Canvas(row, bg=bg, height=22, cursor="hand2",
+                                   highlightthickness=0)
+        self._fs_track.pack(side="left", fill="x", expand=True, padx=10)
+        self._fs_len = tk.Label(row, width=8, anchor="w", bg=bg, fg=fg,
+                                font=("Segoe UI", 10))
+        self._fs_len.pack(side="left")
+        row = tk.Frame(bar, bg=bg)
+        row.pack(fill="x", padx=14, pady=(2, 10))
+        self._fs_play = self._fs_button(row, self._toggle_pause)
+        self._fs_stop = self._fs_button(row, self._fs_stop_clicked,
+                                        "⏹ Stop")
+        self._fs_resync = self._fs_button(row, self._fs_resync_clicked,
+                                          "⟲ Resync here")
+        self._fs_status = tk.Label(row, anchor="w", bg=bg, fg="#9a9a9a",
+                                   font=("Segoe UI", 9))
+        self._fs_status.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self._fs_track.bind("<ButtonPress-1>", self._fs_track_press)
+        self._fs_track.bind("<B1-Motion>", self._fs_track_drag)
+        self._fs_track.bind("<ButtonRelease-1>", self._fs_track_release)
+        self._fs_track.bind("<Configure>", lambda e: self._fs_draw_track())
+        self.fs_bar = bar
+        self._fs_hook = None         # its no-activate hook, kept alive
+        self._fs_hwnd = None         # the OS frame that hook is on
+        self._fs_up = False
+        self._fs_after = None
+        self._fs_xy = None           # last pointer position over the film
+        self._fs_moved = 0.0         # ...and when it got there
+        self._fs_drag = False
+        self._fs_hold = False        # a resync from the bar is running
+        self._fs_pos = (None, None)  # (time, length) last read
+        self._fs_frac = None         # where the knob is drawn
+
+    def _fs_button(self, parent, action, text=""):
+        # deferred like every mouse handler over the film (see
+        # _build_video_window): Play/Pause can resize the video window
+        b = tk.Button(parent, text=text,
+                      command=lambda: self.video_win.after(1, action),
+                      bg="#2c2c2c", fg="#e6e6e6", activebackground="#444444",
+                      activeforeground="#ffffff", relief="flat", bd=0,
+                      padx=12, pady=3, font=("Segoe UI", 11), takefocus=0,
+                      cursor="hand2")
+        b.pack(side="left", padx=(0, 6))
+        return b
+
+    def _on_video_motion(self, event):
+        xy = (event.x_root, event.y_root)
+        if xy == self._fs_xy:
+            # Windows repeats the last position when a window appears or
+            # vanishes under a resting pointer - the bar hiding, for one
+            return
+        self._fs_xy = xy
+        if not self.fullscreen or self.player is not self.embedded:
+            return
+        self._fs_moved = time.monotonic()
+        if not self._fs_up:
+            self.video_win.after(1, self._show_fs_bar)
+
+    def _show_fs_bar(self):
+        if self._closing or self._fs_up or not self.fullscreen:
+            return
+        win, bar = self.video_win, self.fs_bar
+        self._set_film_cursor("")
+        bar.update_idletasks()
+        w = max(480, min(1100, win.winfo_width() - 80))
+        h = bar.winfo_reqheight()
+        x = win.winfo_rootx() + (win.winfo_width() - w) // 2
+        y = win.winfo_rooty() + win.winfo_height() - h - 40
+        bar.geometry(f"{w}x{h}+{x}+{y}")
+        self._fs_up = True
+        self._fs_refresh()
+        bar.deiconify()
+        bar.update_idletasks()
+        hwnd = int(bar.frame(), 16)
+        if hwnd != self._fs_hwnd:      # first showing, or Tk rebuilt it
+            self._fs_hook = windowctl.no_activate_on_click(hwnd)
+            self._fs_hwnd = hwnd
+        self._fs_after = win.after(250, self._fs_tick)
+
+    def _fs_tick(self):
+        self._fs_after = None
+        if not self._fs_up:
+            return
+        if (not self.fullscreen or self.player is not self.embedded
+                or not self.video_win.winfo_viewable()):
+            self._hide_fs_bar()
+            return
+        if (time.monotonic() - self._fs_moved >= self.FS_BAR_IDLE
+                and not (self._fs_drag or self._fs_hold
+                         or self._pointer_on_fs_bar())):
+            self._hide_fs_bar(hide_pointer=True)
+            return
+        self._fs_refresh()
+        self._fs_after = self.video_win.after(250, self._fs_tick)
+
+    def _hide_fs_bar(self, hide_pointer=False):
+        if self._fs_after is not None:
+            self.video_win.after_cancel(self._fs_after)
+            self._fs_after = None
+        self._fs_up = self._fs_drag = False
+        self.fs_bar.withdraw()
+        # as in VLC, a resting pointer goes with the controls
+        self._set_film_cursor("none" if hide_pointer else "")
+
+    def _set_film_cursor(self, cursor):
+        for w in (self.video_win, self.video_frame):
+            w.config(cursor=cursor)
+
+    def _pointer_on_fs_bar(self):
+        bar = self.fs_bar
+        x, y = bar.winfo_pointerxy()
+        bx, by = bar.winfo_rootx(), bar.winfo_rooty()
+        return (bx <= x < bx + bar.winfo_width()
+                and by <= y < by + bar.winfo_height())
+
+    def _fs_refresh(self):
+        p = self.player
+        try:
+            t, n, playing = p.time(), p.length(), p.is_playing()
+        except Exception:
+            return
+        self._fs_pos = (t, n)
+        self._fs_play.config(text="⏸ Pause" if playing else "▶ Play")
+        self._fs_len.config(text=fmt_clock(n) if n else "-:--")
+        if not self._fs_drag:
+            self._fs_time.config(text="-:--" if t is None else fmt_clock(t))
+            self._fs_frac = (min(1.0, max(0.0, t / n))
+                             if t is not None and n else None)
+            self._fs_draw_track()
+
+    def _fs_draw_track(self):
+        c = self._fs_track
+        c.delete("all")
+        y = c.winfo_height() // 2
+        x0, x1 = 8, max(8, c.winfo_width() - 8)
+        c.create_line(x0, y, x1, y, fill="#4a4a4a", width=4, capstyle="round")
+        if self._fs_frac is not None:
+            x = x0 + (x1 - x0) * self._fs_frac
+            c.create_line(x0, y, x, y, fill="#ff8800", width=4,
+                          capstyle="round")
+            c.create_oval(x - 7, y - 7, x + 7, y + 7, fill="#f2f2f2",
+                          outline="")
+
+    def _fs_frac_at(self, x):
+        w = self._fs_track.winfo_width()
+        return min(1.0, max(0.0, (x - 8) / max(1, w - 16)))
+
+    def _fs_track_press(self, event):
+        t, n = self._fs_pos
+        if t is None or not n:
+            return          # stopped or never started: nothing to seek in
+        self._fs_drag = True
+        self._fs_track_drag(event)
+
+    def _fs_track_drag(self, event):
+        if self._fs_drag:
+            self._fs_frac = self._fs_frac_at(event.x)
+            self._fs_time.config(text=fmt_clock(self._fs_frac
+                                                * self._fs_pos[1]))
+            self._fs_draw_track()
+
+    def _fs_track_release(self, event):
+        # the knob follows the drag; the film moves once, on release
+        if not self._fs_drag:
+            return
+        self._fs_drag = False
+        target = self._fs_frac_at(event.x) * self._fs_pos[1]
+        self.video_win.after(1, self.player.seek, target)
+
+    def _fs_stop_clicked(self):
+        self.player.stop()
+        self._fs_refresh()
+
+    def _fs_resync_clicked(self):
+        if self.method_var.get() == "video":
+            self._hide_fs_bar()     # keep it out of the screen capture
+        self._resync()
+        if self.ctl.busy:
+            # stay up until the result is in: the bar shows the status
+            self._fs_hold = True
+            self._fs_resync.config(state="disabled",
+                                   text="⟲ Resyncing...")
+
+    def _fs_sync_done(self):
+        self._fs_resync.config(state="normal", text="⟲ Resync here")
+        if self._fs_hold:
+            self._fs_hold = False
+            self._fs_moved = time.monotonic()   # then the usual time to read it
+
     # ------------------------------------------------------------- subtitles
 
     def _refresh_subs(self):
@@ -828,6 +1061,7 @@ class App:
                 elif kind == "busy_off":
                     self.sync_btn.state(["!disabled"])
                     self.resync_btn.state(["!disabled"])
+                    self._fs_sync_done()
                 elif kind == "auto_off":
                     # auto mode gave up (details in the log): untick it
                     # exactly as a manual uncheck would, then say why
@@ -902,6 +1136,7 @@ class App:
 
     def _set_status(self, text):
         self.status_lbl.config(text=text)
+        self._fs_status.config(text=text)    # readable in fullscreen too
 
     def _tick_time(self):
         try:
