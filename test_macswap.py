@@ -10,7 +10,7 @@ thread each System Events round trip ran on. What is tested:
 - fullscreen is left and given back through the film window itself;
   libvlc's own fullscreen does nothing once the film renders into our
   window, so the swap used to leave the film fullscreen over the
-  browser and the next Cmd-Shift-F took two presses;
+  browser and the next Toggle Fullscreen took two goes;
 - a swap that fails hands back the fullscreen it took away and settles
   on what it left on screen: a pause after it raises the browser when
   the film is in front - a pause after a failed resume used to be
@@ -31,13 +31,11 @@ thread each System Events round trip ran on. What is tested:
 - a pause straight after a resume raises the browser only once the film
   has really left the fullscreen it was still entering - raised before,
   the browser ends up behind the film - and the same after the user's own
-  Cmd-Shift-F;
+  Toggle Fullscreen;
 - a resume that overtakes a pause still waiting for that calls it off:
   no browser over a film that is playing again, no film dropping out of
   fullscreen for a pause that is over; and closing calls it off too;
 - closing stops the swap worker before the controller shuts down;
-- a video-capture sync takes the film window off screen too, so the
-  matcher cannot find our own picture inside the capture region;
 - switching back to the built-in player shows its film window and hands
   libvlc the view, as opening a film does.
 """
@@ -46,7 +44,6 @@ import threading
 import time
 import types
 
-import controller
 import mac_app
 
 FILM = "/films/film.mkv"
@@ -92,9 +89,6 @@ class Window(Widget):
 
     def deiconify(self):
         self.shown = True
-
-    def state(self):
-        return "normal" if self.shown else "withdrawn"
 
     def attributes(self, *args):
         if args == ("-fullscreen",):
@@ -205,8 +199,6 @@ class Ctl:
         self.external = None
         self.video_path = None
         self.busy = False
-        self.region = None
-        self.facecam_rect = None
         self.audio_device = ""
         self.auto_interval = 30
         self.auto_follow = True
@@ -294,9 +286,9 @@ class Osascript:
 
 
 def make(film=True, **osa):
-    """A MacApp over the fakes, with the film loaded the way Cmd-O does."""
+    """A MacApp over the fakes, with the film loaded the way Open Film... does."""
     fake_tk = types.SimpleNamespace(
-        Toplevel=Window, Frame=Window, Menu=Widget, Text=Widget,
+        Toplevel=Window, Frame=Window, Menu=Widget,
         StringVar=StringVar, BooleanVar=Var, IntVar=Var)
     mac = Osascript(**osa)
     mac_app.tk = fake_tk
@@ -304,14 +296,11 @@ def make(film=True, **osa):
     mac_app.filedialog = Dialogs()
     mac_app.messagebox = Dialogs()
     mac_app.EmbeddedPlayer = Player
-    mac_app.controller = types.SimpleNamespace(
-        SyncController=Ctl, build_mask=controller.build_mask,
-        zone_in_region=controller.zone_in_region)
+    mac_app.controller = types.SimpleNamespace(SyncController=Ctl)
     mac_app.macwindowctl = mac
     mac_app.audio_capture = types.SimpleNamespace(
         list_speakers=lambda: [], list_microphones=lambda: [])
-    mac_app.diagnostics = types.SimpleNamespace(
-        log=lambda *a, **kw: None, LOG_FILE="")
+    mac_app.diagnostics = types.SimpleNamespace(log=lambda *a, **kw: None)
     app = mac_app.MacApp(Root())
     settle = app._swap_done
     app.results = []                    # each swap result the Tk side settled
@@ -450,7 +439,7 @@ def test_failed_swap_gives_fullscreen_back():
     app, mac = make()
     app._stream_swap(True)
     assert pump(app, lambda: app._swapped)
-    app._toggle_fullscreen()            # Shift-Cmd-F while paused
+    app._toggle_fullscreen()            # Toggle Fullscreen while paused
     mac.fail = {"hide_app"}
     app._stream_swap(False)
     assert settled(app, 2) and "App swap failed" in status(app), status(app)
@@ -751,7 +740,7 @@ def test_dropped_fullscreen_request_is_made_again():
     idle(app, 0.6)
     assert app.video_win.dropped == asked and app._fs_until is None
 
-    # the same on the way out: Cmd-Shift-F twice inside the animation
+    # the same on the way out: Toggle Fullscreen twice inside the animation
     app, mac = make()
     app.video_win.transition = 0.4
     app._toggle_fullscreen()
@@ -761,7 +750,7 @@ def test_dropped_fullscreen_request_is_made_again():
         f"the film stayed fullscreen behind the app's back: {fullscreen(app)}"
 
     # a window that never takes it is believed, so that the next
-    # Cmd-Shift-F is one press and not two
+    # Toggle Fullscreen is one go and not two
     app, mac = make()
     settle, mac_app.FULLSCREEN_SETTLE = mac_app.FULLSCREEN_SETTLE, 0.5
     try:
@@ -837,7 +826,7 @@ def test_pause_waits_for_a_film_still_entering_fullscreen():
         assert fullscreen(app) == (False, False) and app._was_fullscreen
 
         # the same when the request macOS dropped was the user's own:
-        # Cmd-Shift-F on and off inside one animation, then a pause
+        # Toggle Fullscreen on and off inside one animation, then a pause
         app, mac = make()
         app.video_win.transition = 0.4
         film_was_fullscreen = watch_raises(app, mac)
@@ -940,41 +929,6 @@ def test_worker_stops_before_the_controller_closes():
     print("close: the swap worker stops before the controller does")
 
 
-def test_video_sync_hides_the_film_window():
-    app, mac = make()
-    app.method_var.set("video")
-    app.ctl.region = (0, 0, 1280, 720)
-    sent = []
-    app.ctl.sync = lambda hint, window, method, **video: \
-        sent.append(video) or True
-    app._sync()
-    hidden = sent[0]["hidden"]
-    assert app.video_win in hidden and not app.video_win.shown, \
-        "the film window stayed on screen for the capture"
-    assert app.root in hidden and not app.root.shown
-    app.q.put(("show", hidden))         # the controller, frames grabbed
-    assert pump(app, lambda: app.video_win.shown and app.root.shown)
-
-    # a film window the user closed is not brought back by a sync
-    app.video_win.withdraw()
-    sent.clear()
-    app._sync()
-    assert app.video_win not in sent[0]["hidden"]
-    app.q.put(("show", sent[0]["hidden"]))
-    assert pump(app, lambda: app.root.shown)
-    assert not app.video_win.shown
-
-    # a time it cannot read puts every hidden window straight back
-    app._show_video_window()
-
-    def unreadable(*a, **kw):
-        raise ValueError("Can't read that time.")
-    app.ctl.sync = unreadable
-    app._sync()
-    assert app.root.shown and app.video_win.shown
-    print("video sync: the film window is off screen for the capture")
-
-
 def switch(app, kind):
     app.player_var.set(kind)
     app._apply_player_choice()
@@ -1020,7 +974,6 @@ def main():
     test_pause_waits_for_a_film_still_entering_fullscreen()
     test_overtaken_pause_is_called_off()
     test_worker_stops_before_the_controller_closes()
-    test_video_sync_hides_the_film_window()
     test_switch_to_embedded_shows_the_film_window()
     print("MAC SWAP TEST PASSED")
 

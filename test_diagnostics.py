@@ -459,7 +459,7 @@ try:
     ctl.auto_enabled, ctl.auto_follow = True, False
 
     controller.CONFIG_PATH = Path(tmp) / "streamsync.json"
-    ctl.save_config({"method": "audio"})
+    ctl.save_config({"hint": ""})
     ok("the settings were written",
        controller.CONFIG_PATH.read_text().startswith("{"))
     ok("a config save is logged, with the auto arming flags",
@@ -467,7 +467,7 @@ try:
 
     controller.CONFIG_PATH = Path(tmp) / "no-such-folder" / "streamsync.json"
     try:
-        ctl.save_config({"method": "audio"})
+        ctl.save_config({"hint": ""})
     except Exception as e:
         fails.append(f"a failed config save raised: {e!r}")
     failed = read_log().partition("config save FAILED:")[2]

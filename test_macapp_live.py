@@ -1,5 +1,5 @@
 """Live check of the Mac shell: the real MacApp over real Tk, real libvlc
-and real System Events, driven through the methods its menus and keys call.
+and real System Events, driven through the methods its menus call.
 
 test_macswap.py covers the same ground over a fake Tk, and it passed on
 v1.0.8 - whose first run on a Mac, with Automation refused, lost
@@ -18,8 +18,9 @@ Events, and a film: the one StreamSync last had open, or the path given.
 Settings and the log go to a temporary folder; ~/.streamsync.json is read
 for the film's path and never written.
 
-  A  pause and resume with the film fullscreen - by key, by the stream's
-     own pause events, and with one landing inside the other's animation
+  A  pause and resume with the film fullscreen - from the Play / Pause
+     menu item, by the stream's own pause events, and with one landing
+     inside the other's animation
   B  the same with Automation refused. The refusal is injected where the
      shell calls System Events, with the error macOS gives for one
      (-1743): revoking the real permission is not a test's to do
@@ -360,7 +361,7 @@ def script():
     check("A6 resume after that: fullscreen back", dict(
         playing=True, owes_fullscreen=False, **FULL, **FILM_FRONT))
 
-    # the stream's own pauses arrive as queue events, not key presses
+    # the stream's own pauses arrive as queue events, not menu clicks
     app.q.put(("swap", True))
     yield 4.0
     check("A7 stream pause event: stream app forward, film windowed", dict(

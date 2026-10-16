@@ -1,9 +1,8 @@
 """StreamSync - sync a local copy of a film in VLC to a live stream.
 
-Primary method: record a few seconds of system audio (the stream's sound,
-commentary included) via WASAPI loopback and find the matching moment in
-the local file's audio track - works with the stream minimized. Fallback
-method: screen-capture frame matching with facecam ignore-zones.
+It records a few seconds of system audio (the stream's sound, commentary
+included) via WASAPI loopback and finds the matching moment in the local
+file's audio track - works with the stream minimized.
 
 Playback goes to an embedded VLC surface (millisecond seeks) or to the
 real VLC app driven over its HTTP interface. An optional auto mode
@@ -21,10 +20,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from PIL import Image, ImageTk
-
 import audio_capture
-import capture
 import controller
 import diagnostics
 import windowctl
@@ -43,7 +39,6 @@ class App:
         self.root = root
         self.q = queue.Queue()
         self.fullscreen = False
-        self._preview_photo = None
         self.stream_hwnd = None      # pinned stream browser window
         self.stream_title = ""
         self._win_map = {}
@@ -76,10 +71,8 @@ class App:
         self.embedded = embedded
 
         self._load_config()
-        self._apply_method_visibility()
         self._populate_audio_devices()
         self._refresh_windows()
-        self._install_hotkeys()
 
         self.ctl.start()
 
@@ -139,54 +132,30 @@ class App:
                         variable=self.player_var,
                         command=self._apply_player_choice).pack(side="left", padx=(10, 0))
 
-        row = ttk.Frame(setup)
-        row.pack(fill="x", pady=(6, 0))
-        ttk.Label(row, text="Sync by:").pack(side="left")
-        self.method_var = tk.StringVar(value="audio")
-        ttk.Radiobutton(row, text="Audio (works minimized)", value="audio",
-                        variable=self.method_var,
-                        command=self._apply_method_visibility).pack(side="left", padx=(6, 0))
-        ttk.Radiobutton(row, text="Video screen-capture (experimental)", value="video",
-                        variable=self.method_var,
-                        command=self._apply_method_visibility).pack(side="left", padx=(10, 0))
-
-        # audio-method row
-        self.audio_row = ttk.Frame(setup)
-        self.audio_row.pack(fill="x", pady=(6, 0))
-        ttk.Label(self.audio_row, text="Listen on:").pack(side="left")
+        # the stream's audio device
+        audio_row = ttk.Frame(setup)
+        audio_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(audio_row, text="Listen on:").pack(side="left")
         self.device_var = tk.StringVar()
-        self.device_combo = ttk.Combobox(self.audio_row, textvariable=self.device_var,
+        self.device_combo = ttk.Combobox(audio_row, textvariable=self.device_var,
                                          width=42, state="readonly")
         self.device_combo.pack(side="left", padx=(6, 0))
         self.device_combo.bind("<<ComboboxSelected>>", self._on_device_pick)
-        ttk.Button(self.audio_row, text="Refresh", width=8,
+        ttk.Button(audio_row, text="Refresh", width=8,
                    command=self._populate_audio_devices).pack(side="left", padx=(6, 0))
 
-        # video-method row
-        self.video_row = ttk.Frame(setup)
-        self.video_row.pack(fill="x", pady=(6, 0))
-        ttk.Button(self.video_row, text="Capture region...", width=16,
-                   command=self._select_region).pack(side="left")
-        self.region_lbl = ttk.Label(self.video_row, text="not set")
-        self.region_lbl.pack(side="left", padx=(8, 0))
-        self.adv_btn = ttk.Menubutton(self.video_row, text="Edge cases")
-        self.adv_btn.pack(side="left", padx=(10, 0))
-        self.preview_lbl = ttk.Label(self.video_row)
-        self.preview_lbl.pack(side="right")
-        self._build_advanced_menu()
-
         # subtitles (embedded player only)
-        self.subs_row = ttk.Frame(setup)
-        self.subs_row.pack(fill="x", pady=(6, 0))
-        ttk.Label(self.subs_row, text="Subtitles:").pack(side="left")
+        subs_row = ttk.Frame(setup)
+        subs_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(subs_row, text="Subtitles:").pack(side="left")
         self.sub_var = tk.StringVar()
-        self.sub_combo = ttk.Combobox(self.subs_row, textvariable=self.sub_var,
+        self.sub_combo = ttk.Combobox(subs_row, textvariable=self.sub_var,
                                       width=32, state="readonly")
         self.sub_combo.pack(side="left", padx=(6, 0))
         self.sub_combo.bind("<<ComboboxSelected>>", self._on_sub_pick)
-        ttk.Button(self.subs_row, text="Refresh", width=8,
+        ttk.Button(subs_row, text="Refresh", width=8,
                    command=self._refresh_subs).pack(side="left", padx=(6, 0))
-        ttk.Button(self.subs_row, text="Load file...", width=10,
+        ttk.Button(subs_row, text="Load file...", width=10,
                    command=self._load_sub_file).pack(side="left", padx=(6, 0))
 
         # ---------------- Sync
@@ -197,10 +166,8 @@ class App:
         ttk.Label(row, text="Position hint").pack(side="left")
         self.hint_var = tk.StringVar()
         ttk.Entry(row, textvariable=self.hint_var, width=10).pack(side="left", padx=(6, 0))
-        ttk.Label(row, text="(h:mm:ss, blank = whole file)   Search +/-").pack(
+        ttk.Label(row, text="(h:mm:ss, blank = whole file)").pack(
             side="left", padx=(6, 0))
-        self.window_var = tk.StringVar(value="2:00")
-        ttk.Entry(row, textvariable=self.window_var, width=8).pack(side="left", padx=(6, 0))
 
         row = ttk.Frame(sync)
         row.pack(fill="x", pady=(8, 0))
@@ -294,36 +261,6 @@ class App:
         self.status_lbl = ttk.Label(outer, text="Pick a video file to begin.",
                                     wraplength=620, foreground="#245")
         self.status_lbl.grid(row=5, column=0, sticky="w", pady=(4, 0))
-        self.hotkey_lbl = ttk.Label(outer, text="", foreground="#666")
-        self.hotkey_lbl.grid(row=6, column=0, sticky="w", pady=(4, 0))
-
-    def _build_advanced_menu(self):
-        menu = tk.Menu(self.adv_btn, tearoff=0)
-        self.facecam_var = tk.StringVar(value="none")
-        menu.add_radiobutton(label="No facecam ignore zone",
-                             variable=self.facecam_var, value="none")
-        for val, label in (("tl", "Ignore top-left corner (facecam)"),
-                           ("tr", "Ignore top-right corner (facecam)"),
-                           ("bl", "Ignore bottom-left corner (facecam)"),
-                           ("br", "Ignore bottom-right corner (facecam)")):
-            menu.add_radiobutton(label=label, variable=self.facecam_var, value=val)
-        menu.add_radiobutton(label="Custom ignore zone (drag it)...",
-                             variable=self.facecam_var, value="custom",
-                             command=self._select_facecam_rect)
-        menu.add_separator()
-        self.mirror_var = tk.BooleanVar(value=False)
-        menu.add_checkbutton(label="Stream is mirror-flipped",
-                             variable=self.mirror_var)
-        self.adv_btn.config(menu=menu)
-
-    def _apply_method_visibility(self):
-        # subs_row is always packed, so it works as a stable anchor
-        if self.method_var.get() == "audio":
-            self.video_row.pack_forget()
-            self.audio_row.pack(fill="x", pady=(6, 0), before=self.subs_row)
-        else:
-            self.audio_row.pack_forget()
-            self.video_row.pack(fill="x", pady=(6, 0), before=self.subs_row)
 
     # ------------------------------------------------------------- players
 
@@ -372,44 +309,9 @@ class App:
             self._set_status("Opening in external VLC...")
         self._save_config()
 
-    def _select_region(self):
-        region = capture.RegionSelector(self.root).select()
-        if region:
-            self.ctl.region = region
-            self.region_lbl.config(
-                text=f"{region[2]}x{region[3]} at ({region[0]}, {region[1]})")
-            self._set_status("Region set.")
-            self._save_config()
-
-    def _select_facecam_rect(self):
-        if not self.ctl.region:
-            messagebox.showinfo("StreamSync",
-                                "Set the capture region first, then drag the "
-                                "facecam zone inside it.")
-            self.facecam_var.set("none")
-            return
-        rect = capture.RegionSelector(self.root).select()
-        if not rect:
-            self.facecam_var.set("none")
-            return
-        zone = controller.zone_in_region(self.ctl.region, rect)
-        if zone is None:
-            messagebox.showinfo("StreamSync", "That zone is outside the capture "
-                                              "region - try again.")
-            self.facecam_var.set("none")
-            return
-        self.ctl.facecam_rect = zone
-        x0, y0, x1, y1 = zone
-        self._set_status(f"Ignoring zone x {x0:.2f}-{x1:.2f}, y {y0:.2f}-{y1:.2f} "
-                         "of the frame during video matching.")
-        self._save_config()
-
-    def _ready(self, need_region):
+    def _ready(self):
         if not self.ctl.video_path:
             messagebox.showinfo("StreamSync", "Choose a video file first.")
-            return False
-        if need_region and not self.ctl.region:
-            messagebox.showinfo("StreamSync", "Select the stream's capture region first.")
             return False
         return True
 
@@ -418,29 +320,15 @@ class App:
         running, or the setup is not ready)."""
         if self.ctl.busy:
             return False
-        method = self.method_var.get()
-        if not self._ready(need_region=(method == "video")):
+        if not self._ready():
             return False
-        video = {"mute": self.mute_var.get()}
-        if method == "video":
-            self._set_status("Capturing stream frames...")
-            video.update(mask=controller.build_mask(self.facecam_var.get(),
-                                                    self.ctl.facecam_rect),
-                         mirror=self.mirror_var.get(),
-                         hidden=self._hide_overlapping_windows())
         run = self.ctl.resync if resync else self.ctl.sync
         hint = "" if whole else self.hint_var.get()   # blank: the whole film
         try:
-            started = run(hint, self.window_var.get(), method, **video)
+            started = run(hint, mute=self.mute_var.get())
         except ValueError as e:
-            if video.get("hidden"):
-                for win in video["hidden"]:
-                    win.deiconify()
             messagebox.showerror("StreamSync", str(e))
             return False
-        if not started:
-            for win in video.get("hidden") or ():
-                win.deiconify()      # a sync was already running
         if started:
             self.sync_btn.state(["disabled"])
             self.resync_btn.state(["disabled"])
@@ -451,21 +339,6 @@ class App:
 
     def _resync(self):
         return self._sync(resync=True)
-
-    def _hide_overlapping_windows(self):
-        left, top, w, h = self.ctl.region
-        hidden = []
-        for win in (self.root, self.video_win):
-            if win.state() == "withdrawn":
-                continue
-            wx, wy = win.winfo_rootx(), win.winfo_rooty()
-            ww, wh = win.winfo_width(), win.winfo_height()
-            if wx < left + w and wx + ww > left and wy < top + h and wy + wh > top:
-                win.withdraw()
-                hidden.append(win)
-        if hidden:
-            self.root.update()
-        return hidden
 
     # ------------------------------------------------------------- auto mode
 
@@ -1050,8 +923,6 @@ class App:
     def _fs_resync_clicked(self, whole=False):
         """Resync around the film's position, or (whole) search the whole
         film's audio - even with a position hint set."""
-        if self.method_var.get() == "video":
-            self._hide_fs_bar()     # keep it out of the screen capture
         started = self._sync(whole=True) if whole else self._resync()
         if started:
             # stay up until the result is in: the bar shows the status.
@@ -1119,11 +990,6 @@ class App:
                     self._stream_swap(payload[0])
                 elif kind == "devices":
                     self._apply_devices(payload[0])
-                elif kind == "preview":
-                    self._show_preview(payload[0])
-                elif kind == "show":
-                    for win in payload[0] or ():
-                        win.deiconify()
                 elif kind == "busy_off":
                     self.sync_btn.state(["!disabled"])
                     self.resync_btn.state(["!disabled"])
@@ -1134,38 +1000,9 @@ class App:
                     self.auto_var.set(False)
                     self._on_auto_toggle()
                     self._set_status(payload[0])
-                elif kind == "hotkey":
-                    self._hotkey(payload[0])
         except queue.Empty:
             pass
         self.root.after(80, self._poll_queue)
-
-    def _hotkey(self, name):
-        if name == "sync":
-            self._sync()
-        elif name == "resync":
-            self._resync()
-        elif name == "pause":
-            self._toggle_pause()
-        elif name == "back":
-            self._nudge(-0.1)
-        elif name == "fwd":
-            self._nudge(0.1)
-
-    def _install_hotkeys(self):
-        try:
-            import keyboard
-            keyboard.add_hotkey("ctrl+alt+s", lambda: self.q.put(("hotkey", "sync")))
-            keyboard.add_hotkey("ctrl+alt+r", lambda: self.q.put(("hotkey", "resync")))
-            keyboard.add_hotkey("ctrl+alt+p", lambda: self.q.put(("hotkey", "pause")))
-            keyboard.add_hotkey("ctrl+alt+left", lambda: self.q.put(("hotkey", "back")))
-            keyboard.add_hotkey("ctrl+alt+right", lambda: self.q.put(("hotkey", "fwd")))
-            self.hotkey_lbl.config(
-                text="Global hotkeys: Ctrl+Alt+S sync | Ctrl+Alt+R resync | "
-                     "Ctrl+Alt+P pause | Ctrl+Alt+Left/Right nudge 0.1s")
-        except Exception:
-            self.hotkey_lbl.config(text="Global hotkeys unavailable "
-                                        "(optional 'keyboard' package not working).")
 
     def _populate_audio_devices(self):
         def work():
@@ -1194,12 +1031,6 @@ class App:
         self.ctl.audio_device = "" if val.startswith("(default)") else val
         self._save_config()
 
-    def _show_preview(self, gray_img):
-        img = Image.fromarray((gray_img * 255).clip(0, 255).astype("uint8"))
-        img.thumbnail((160, 90))
-        self._preview_photo = ImageTk.PhotoImage(img)
-        self.preview_lbl.config(image=self._preview_photo, text="")
-
     def _set_status(self, text):
         self.status_lbl.config(text=text)
         self._fs_status.config(text=text)    # readable in fullscreen too
@@ -1217,12 +1048,8 @@ class App:
 
     def _save_config(self):
         self.ctl.save_config({
-            "window": self.window_var.get(),
             "hint": self.hint_var.get(),
-            "method": self.method_var.get(),
             "player": self.player_var.get(),
-            "facecam": self.facecam_var.get(),
-            "mirror": self.mirror_var.get(),
             "swap": self.swap_var.get(),
             "stream_title": self.stream_title,
         })
@@ -1233,19 +1060,8 @@ class App:
         if path:
             self.ctl.load_file(path)
             self.file_lbl.config(text=Path(path).name)
-        if self.ctl.region:
-            r = self.ctl.region
-            self.region_lbl.config(
-                text=f"{r[2]}x{r[3]} at ({r[0]}, {r[1]}) (from last session)")
-        if cfg.get("window"):
-            self.window_var.set(cfg["window"])
         if cfg.get("hint"):
             self.hint_var.set(cfg["hint"])
-        if cfg.get("method") in ("audio", "video"):
-            self.method_var.set(cfg["method"])
-        if cfg.get("facecam"):
-            self.facecam_var.set(cfg["facecam"])
-        self.mirror_var.set(bool(cfg.get("mirror", False)))
         self.interval_var.set(self.ctl.auto_interval)
         self.follow_var.set(self.ctl.auto_follow)
         self.swap_var.set(bool(cfg.get("swap", True)))
@@ -1259,16 +1075,12 @@ class App:
         self._closing = True
         self._save_config()
         self.ctl.close()
-        try:
-            import keyboard
-            keyboard.unhook_all()
-        except Exception:
-            pass
         self.root.destroy()
 
 
 def main():
-    # make Tk report physical pixels so regions line up with mss captures
+    # make Tk report physical pixels, so window and monitor rectangles
+    # agree with the ones windowctl gets from Win32
     try:
         import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(2)

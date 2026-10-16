@@ -306,7 +306,7 @@ def statuses(q):
 
 def test_nudged_film_left_alone():
     ctl, stream, player, clock, q = make(offset=0.5)
-    run_sync(ctl, ctl.sync, "", "", "audio")
+    run_sync(ctl, ctl.sync, "")
     assert abs(player.pos() - (stream.pos() + 0.5)) < 1e-6, "first sync missed"
     n = len(player.seeks)
     state = new_state()
@@ -319,7 +319,7 @@ def test_nudged_film_left_alone():
 
 def test_drift_corrected():
     ctl, stream, player, clock, q = make(offset=0.2)
-    run_sync(ctl, ctl.sync, "", "", "audio")
+    run_sync(ctl, ctl.sync, "")
     player.anchor = (player.pos() - 1.3, clock())     # the film slipped
     state = new_state()
     clock.now += ctl.auto_step(state)
@@ -331,15 +331,15 @@ def test_drift_corrected():
 
 def test_weak_resync_not_applied():
     ctl, stream, player, clock, q = make()
-    run_sync(ctl, ctl.sync, "", "", "audio")
+    run_sync(ctl, ctl.sync, "")
     stream.audible = False                       # every look comes back weak
-    run_sync(ctl, ctl.resync, "", "2:00", "audio")
+    run_sync(ctl, ctl.resync, "")
     assert len(player.seeks) == 1, "a weak Resync moved the film"
     assert any("NOT applied" in s for s in statuses(q))
 
     ctl, stream, player, clock, q = make()
     stream.audible = False
-    run_sync(ctl, ctl.sync, "", "", "audio")
+    run_sync(ctl, ctl.sync, "")
     assert len(player.seeks) == 1, "first sync should still use its best guess"
     print("weak match: Resync leaves the film alone; first sync still guesses")
 
@@ -347,7 +347,7 @@ def test_weak_resync_not_applied():
 def test_weak_first_look_listens_longer():
     ctl, stream, player, clock, q = make()
     stream.weak_until = 10.0                     # 6 s is not enough, 12 s is
-    run_sync(ctl, ctl.sync, "", "", "audio")
+    run_sync(ctl, ctl.sync, "")
     msgs = statuses(q)
     assert any("listening longer (12 s)" in s for s in msgs), msgs
     assert abs(player.pos() - stream.pos()) < 1e-6
@@ -357,7 +357,7 @@ def test_weak_first_look_listens_longer():
 def test_false_pause_recovers():
     ctl, stream, player, clock, q = make()
     ctl.auto_enabled = True
-    run_sync(ctl, ctl.sync, "", "", "audio")
+    run_sync(ctl, ctl.sync, "")
     state = new_state()
     stream.audible = False            # a long stretch the matcher can't hear...
     for _ in range(3):
@@ -380,7 +380,7 @@ def test_false_pause_recovers():
 
 def test_long_pause_window_bounded():
     ctl, stream, player, clock, q = make()
-    run_sync(ctl, ctl.sync, "", "", "audio")
+    run_sync(ctl, ctl.sync, "")
     windows = []
     hear = controller.audio_matcher.find_match_audio
 
@@ -413,7 +413,7 @@ def test_long_pause_window_bounded():
 def test_auto_pause_survives_weak_resync():
     ctl, stream, player, clock, q = make()
     ctl.auto_enabled = True
-    run_sync(ctl, ctl.sync, "", "", "audio")
+    run_sync(ctl, ctl.sync, "")
     seen = {}
     sync = []
 
@@ -441,7 +441,7 @@ def test_auto_pause_survives_weak_resync():
     run_loop(ctl, clock, 330, [
         (0, stream.pause),
         (60, paused),
-        (60, lambda: sync.append(press(ctl, ctl.resync, "", "2:00", "audio"))),
+        (60, lambda: sync.append(press(ctl, ctl.resync, ""))),
         (70, lambda: sync.pop()()),
         (75, still_paused),
         (100, stream.play),
@@ -450,7 +450,7 @@ def test_auto_pause_survives_weak_resync():
         # comes back, so it is the manual sync that resumes the film
         (150, stream.pause),
         (230, paused),
-        (240, lambda: sync.append(press(ctl, ctl.resync, "", "2:00", "audio"))),
+        (240, lambda: sync.append(press(ctl, ctl.resync, ""))),
         (240, stream.play),
         (255, resynced_by_hand),
         (330, handed_back)])
@@ -471,7 +471,7 @@ def test_held_pause_is_only_that_films():
         if on_external:
             ctl.external = Player(clock)
             run_sync(ctl, ctl.use_external, True)
-        run_sync(ctl, ctl.sync, "", "", "audio")
+        run_sync(ctl, ctl.sync, "")
         was = ctl.player
         looks = []
         hear = controller.audio_matcher.find_match_audio
@@ -516,7 +516,7 @@ def test_auto_passes_timed_from_their_start():
     # 8 s after every 8 s of listening
     ctl, stream, player, clock, q = make()
     ctl.auto_enabled = True
-    run_sync(ctl, ctl.sync, "", "", "audio")
+    run_sync(ctl, ctl.sync, "")
     passes = []
     hear = controller.audio_matcher.find_match_audio
 
@@ -549,7 +549,7 @@ def test_auto_passes_timed_from_their_start():
 
 def test_real_pause_and_resume():
     ctl, stream, player, clock, q = make()
-    run_sync(ctl, ctl.sync, "", "", "audio")
+    run_sync(ctl, ctl.sync, "")
     state = new_state()
     stream.pause()
     for _ in range(3):
@@ -565,7 +565,7 @@ def test_real_pause_and_resume():
 def test_vanished_film_gives_up():
     ctl, stream, player, clock, q = make()
     ctl.auto_enabled = True
-    run_sync(ctl, ctl.sync, "", "", "audio")
+    run_sync(ctl, ctl.sync, "")
     drain(q)
     gone = controller.matcher.MatchError(
         "ffmpeg could not read this file as a video.")  # drive unplugged
@@ -592,7 +592,7 @@ def test_vanished_paused_film_gives_up():
     # vanished mid-play tends to stop, and a stopped film is left alone)
     ctl, stream, player, clock, q = make()
     ctl.auto_enabled = True
-    run_sync(ctl, ctl.sync, "", "", "audio")
+    run_sync(ctl, ctl.sync, "")
     drain(q)
     hear = controller.audio_matcher.find_match_audio
     gone = []
@@ -650,7 +650,7 @@ def test_give_up_needs_a_run():
         """`arm`: (after, on) pairs ticking Auto on or off meanwhile."""
         ctl, stream, player, clock, q = make()
         ctl.auto_enabled = True
-        run_sync(ctl, ctl.sync, "", "", "audio")
+        run_sync(ctl, ctl.sync, "")
         drain(q)
         left = failing_matcher(errors)
         run_loop(ctl, clock, 400, [
@@ -684,7 +684,7 @@ def test_give_up_needs_a_run():
 def test_silent_capture_is_a_miss():
     ctl, stream, player, clock, q = make()
     ctl.auto_enabled = True
-    run_sync(ctl, ctl.sync, "", "", "audio")
+    run_sync(ctl, ctl.sync, "")
     drain(q)
 
     def silence():
@@ -711,7 +711,7 @@ def test_viewer_nudge_goes_to_session():
 
 def test_session_start_mid_listen_wins():
     ctl, stream, player, clock, q = make()
-    run_sync(ctl, ctl.sync, "", "", "audio")
+    run_sync(ctl, ctl.sync, "")
     mon = ctl._loopback()
     viewer = session.ViewerSession("ws://x", "CODE", "film.mkv", player, q)
 
@@ -887,7 +887,7 @@ def test_switch_back_loads_the_film():
     # paused, is neither reloaded nor restarted by a trip to VLC and back
     ctl, stream, embedded, external, q = switchable()
     ctl.load_file("film.mkv")
-    run_sync(ctl, ctl.sync, "", "", "audio")
+    run_sync(ctl, ctl.sync, "")
     assert embedded.seeks, statuses(q)
     embedded.pause()
     here = embedded.pos()
@@ -909,7 +909,7 @@ def test_switch_back_loads_the_film():
     assert embedded.films == ["film.mkv"], \
         "switching back left the built-in player without the film"
     statuses(q)
-    run_sync(ctl, ctl.sync, "", "", "audio")
+    run_sync(ctl, ctl.sync, "")
     msgs = statuses(q)
     assert embedded.seeks and abs(embedded.pos() - stream.pos()) < 1e-6, msgs
 
