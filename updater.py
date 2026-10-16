@@ -6,15 +6,18 @@ with, so each step is checked rather than trusted:
 - the release feed and the download are HTTPS to github.com, verified
   against real CA roots (see netcerts - a frozen build ships none of its
   own, so this was silently failing closed until it was fixed);
-- the disk image must match the SHA256 published beside it in the same
-  release, which catches a truncated or corrupted download;
-- the unpacked bundle must carry an intact Developer ID signature from
-  our own team, which is what actually establishes the update came from
-  us rather than merely arriving intact;
-- the new bundle is copied out of the image and verified *before*
-  anything touches the installed copy, and the swap itself happens after
-  the app has quit, from a helper that restores the old bundle if the
-  move fails.
+- the release's SHA256SUMS must carry a valid signature by the release
+  key built into this app (SHA256SUMS.sig, see sigcheck), so the
+  checksums themselves came from us - on Windows, which has no
+  Authenticode signature, that is the whole proof of origin;
+- the download must match its SHA256 in those checksums, which catches
+  a truncated, corrupted or substituted file;
+- on the Mac, the unpacked bundle must also carry an intact Developer ID
+  signature from our own team;
+- the new build is verified *before* anything touches the installed
+  copy. On the Mac the bundle is swapped after the app has quit, by a
+  helper that restores the old one if the move fails; on Windows the
+  installer replaces the app's folder once the app has closed.
 
 Stdlib only, so it stays importable from the dependency gate's context.
 """
@@ -31,6 +34,7 @@ import urllib.error
 import urllib.request
 
 import netcerts
+import sigcheck
 from version import __version__
 
 REPO = "gBear97/StreamSync"
@@ -38,9 +42,16 @@ REPO = "gBear97/StreamSync"
 # is not signed by it is refused, so a tampered download cannot install
 # itself even if it somehow matched the published checksum.
 TEAM_ID = "52T7L6ZVY8"
+# The public half of the release key that signs every release's
+# SHA256SUMS (the private half is the repository secret
+# RELEASE_SIGNING_KEY). Changing it means every installed app refuses
+# every later release, so it changes only with a new key's rollout.
+RELEASE_KEY = bytes.fromhex(
+    "b696a60118d83a318b8754588ff19ff345a1b16caeaadefbc649ea43f576adb2")
 LATEST_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
 RELEASES_PAGE = f"https://github.com/{REPO}/releases/latest"
 SUMS_ASSET = "SHA256SUMS"
+SIG_ASSET = "SHA256SUMS.sig"
 _UA = {"User-Agent": "StreamSync-updater", "Accept": "application/vnd.github+json"}
 
 
@@ -68,8 +79,22 @@ def current_arch():
     return "arm64" if platform.machine() == "arm64" else "x86_64"
 
 
-def pick_asset(assets, arch=None):
-    """The release's .dmg for this architecture."""
+def current_platform():
+    """Which build of a release this process wants: "windows" or "mac"."""
+    return "windows" if sys.platform == "win32" else "mac"
+
+
+def pick_asset(assets, arch=None, plat=None):
+    """This platform's build in a release: the Windows installer, or the
+    .dmg for this Mac's architecture. Each test names its own suffix, so
+    one platform can never pick up the other's build - the Windows name
+    contains no -arm64- or -x86_64-, and only a Mac looks for .dmg."""
+    if (plat or current_platform()) == "windows":
+        for a in assets:
+            name = a.get("name", "")
+            if name.endswith("-setup.exe") and "-windows-x64-" in name:
+                return a
+        raise UpdateError("That release has no Windows installer.")
     arch = arch or current_arch()
     for a in assets:
         name = a.get("name", "")
@@ -97,6 +122,32 @@ def installed_app_path():
     marker = ".app/Contents/MacOS/"
     i = exe.find(marker)
     return exe[:i + len(".app")] if i != -1 else None
+
+
+def install_dir(localappdata=None):
+    """Where the Windows installer puts StreamSync (per user, no admin)."""
+    local = localappdata or os.environ.get("LOCALAPPDATA") or ""
+    return os.path.join(local, "Programs", "StreamSync") if local else None
+
+
+def installed_exe_path(exe=None, frozen=None, localappdata=None):
+    """Path of the installed StreamSync.exe we are running from, or None.
+
+    Only a frozen build running from the installer's own folder updates
+    itself. A source checkout is a developer's tree, and a copy unzipped
+    from an older release lives wherever its owner put it, where a new
+    installer would not land - both are sent to the Releases page instead.
+    """
+    if frozen is None:
+        frozen = getattr(sys, "frozen", False)
+    if not frozen:
+        return None
+    exe = os.path.abspath(exe or sys.executable)
+    home = install_dir(localappdata)
+    if not home or (os.path.normcase(os.path.dirname(exe))
+                    != os.path.normcase(os.path.abspath(home))):
+        return None
+    return exe
 
 
 # ------------------------------------------------------------------ network
@@ -141,15 +192,36 @@ def available_update():
     return (tag, rel) if is_newer(tag) else (None, None)
 
 
-def download_verified(asset, sums_url, dest_dir, progress=None):
-    """Download the asset and check it against the release's SHA256SUMS."""
+def verified_sums(release, key=None):
+    """The release's SHA256SUMS as text, once its signature checks out.
+
+    The signature covers the exact bytes published, so the text is only
+    decoded after it has been verified - never re-encoded and checked.
+    """
+    urls = {a.get("name"): a.get("browser_download_url")
+            for a in release.get("assets", [])}
+    if not urls.get(SUMS_ASSET) or not urls.get(SIG_ASSET):
+        raise UpdateError(
+            f"That release publishes no signed {SUMS_ASSET}, so it cannot "
+            "be verified. Refusing to install it.")
+    try:
+        sums = _get(urls[SUMS_ASSET])
+        sig = _get(urls[SIG_ASSET])
+    except Exception as e:
+        raise UpdateError(_why(e)) from e
+    if not sigcheck.verify(key or RELEASE_KEY, sums, sig):
+        raise UpdateError(
+            f"That release's {SUMS_ASSET} is not signed by StreamSync's "
+            "release key, so nothing in it can be trusted. Refusing to "
+            "install it.")
+    return sums.decode("utf-8", "replace")
+
+
+def download_verified(asset, release, dest_dir, progress=None):
+    """Download the asset and check it against the release's signed
+    SHA256SUMS."""
     name = asset["name"]
-    want = None
-    if sums_url:
-        try:
-            want = expected_sha256(_get(sums_url).decode("utf-8", "replace"), name)
-        except Exception:
-            want = None
+    want = expected_sha256(verified_sums(release), name)
     if want is None:
         raise UpdateError(
             f"That release publishes no {SUMS_ASSET} entry for {name}, so the "
@@ -297,3 +369,25 @@ def swap_and_relaunch(app_path, staged):
     subprocess.Popen(["/bin/sh", script, str(os.getpid()), app_path, staged],
                      start_new_session=True,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# The installer's own switches: no wizard and no prompts, no reboot, and
+# /relaunch=1 tells installer/StreamSync.iss to start the new version.
+SETUP_ARGS = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/relaunch=1"]
+
+
+def install_and_relaunch_windows(setup_path):
+    """Start the verified installer, detached, and tell the caller to quit.
+
+    The installer writes into the same per-user folder, closing this app
+    first if it is still open (CloseApplications=force), and starts the
+    new version when it is done. The caller quits through its normal
+    close straight after, so its settings are saved before the files are
+    replaced. A file the app downloaded itself carries no mark of the web,
+    so SmartScreen does not stop the installer the way it may stop a
+    first install from the browser.
+    """
+    detached = 0x00000008 | 0x00000200   # DETACHED_PROCESS | NEW_PROCESS_GROUP
+    subprocess.Popen([setup_path] + SETUP_ARGS, creationflags=detached,
+                     close_fds=True, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
