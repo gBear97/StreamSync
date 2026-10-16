@@ -133,7 +133,7 @@ def make_app(root):
         def _on_mute_toggle(self):
             pass
 
-        def _ready(self, need_region):
+        def _ready(self):
             return True         # no film to choose: nothing is loaded
 
     a = FakeApp(root)
