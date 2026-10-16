@@ -3,12 +3,12 @@
 Real Tk events on a real (small) video window: double-click toggles
 fullscreen, right-click opens the player menu, the wheel steps the volume
 without ever unmuting, and in fullscreen a moving mouse brings up the
-control bar (timeline, play/pause, stop, resync) that hides again, with
-the pointer, once the mouse rests. Fullscreen itself is checked on every
-monitor attached: it must cover the monitor the window is on. Then, where
-VLC is installed, real libvlc plays a still image into the window, and a
-click over the picture must land on our frame - where those bindings
-are - not on libvlc's vout.
+control bar (timeline, play/pause, stop, resync here / full) that hides
+again, with the pointer, once the mouse rests. Fullscreen itself is
+checked on every monitor attached: it must cover the monitor the window
+is on. Then, where VLC is installed, real libvlc plays a still image into
+the window, and a click over the picture must land on our frame - where
+those bindings are - not on libvlc's vout.
 
 No config: the app object is built from its video-window parts only, so
 nothing here can load a film or save ~/.streamsync.json.
@@ -100,7 +100,7 @@ def make_app(root):
             self.ctl = types.SimpleNamespace(player=self.embedded,
                                              external=None, busy=False)
             self.fs_calls, self.pauses, self.popups = fs_calls, 0, []
-            self.resyncs = 0
+            self.syncs = []
             self._build_video_window()
             self._build_video_menu()
             self._build_fs_bar()
@@ -113,8 +113,9 @@ def make_app(root):
         def _on_mute_toggle(self):
             pass
 
-        def _resync(self):
-            self.resyncs += 1
+        def _sync(self, resync=False, whole=False):
+            # recorded; what the real one sends is sync_args()'s check
+            self.syncs.append((resync, whole))
             self.ctl.busy = True
 
     return FakeApp(root)
@@ -325,25 +326,34 @@ def fs_bar(root, a):
     assert len(e.seeks) == 2, e.seeks            # stopped: nothing to seek
     print("play/pause and stop work; a stopped film has no timeline")
 
-    # resync: the bar stays up, with its status, until the result is in
-    move(50, 30)
-    assert shown()
-    a._fs_resync.invoke()
-    pump(root)
-    assert a.resyncs == 1 and a._fs_resync.cget("state") == "disabled"
-    a._set_status("Listening to the stream (12 s)...")
-    assert a._fs_status.cget("text") == "Listening to the stream (12 s)..."
-    pump(root, 0.8)
-    assert shown()
-    a.ctl.busy = False
-    a._fs_sync_done()
-    assert a._fs_resync.cget("state") == "normal"
-    pump(root, 0.2)
-    assert shown()
-    pump(root, 0.6)
-    assert not shown()
-    print("resync: the bar holds while it runs, shows its status, then "
-          "rests as usual")
+    # resync: the bar stays up, with its status, until the result is in;
+    # either button locks both, and the one pressed says it is running
+    resync, full = a._fs_resync, a._fs_full
+    for btn, want in ((resync, (True, False)), (full, (False, True))):
+        label = btn.cget("text")
+        move(50 + len(a.syncs), 30)
+        assert shown()
+        btn.invoke()
+        pump(root)
+        assert a.syncs[-1] == want, a.syncs
+        assert resync.cget("state") == full.cget("state") == "disabled"
+        assert btn.cget("text").endswith("Resyncing...")
+        a._set_status("Listening to the stream (12 s)...")
+        assert a._fs_status.cget("text") == \
+            "Listening to the stream (12 s)..."
+        pump(root, 0.8)
+        assert shown()
+        a.ctl.busy = False
+        a._fs_sync_done()
+        assert resync.cget("state") == full.cget("state") == "normal"
+        assert btn.cget("text") == label
+        pump(root, 0.2)
+        assert shown()
+        pump(root, 0.6)
+        assert not shown()
+    assert a.syncs == [(True, False), (False, True)], a.syncs
+    print("resync here / resync (full): the bar holds while one runs, "
+          "shows its status, then rests as usual")
 
     # gone with whatever takes the film away
     move(41, 30)
@@ -369,6 +379,39 @@ def fs_bar(root, a):
     a._set_fullscreen(False)
     print("the bar goes when the film does, leaves with fullscreen, and "
           "never shows windowed, for external VLC or while closing")
+
+
+def sync_args():
+    """What the real _sync hands the controller: Resync (full) searches
+    the whole film - a blank hint - even with a position hint set, while
+    Sync and Resync here go on using it."""
+    import tkinter as tk
+    from tkinter import ttk
+
+    import app
+
+    calls = []
+
+    def rec(kind):
+        return lambda hint, window, method, **video: calls.append(
+            (kind, hint, window, method)) or True
+
+    s = types.SimpleNamespace(
+        ctl=types.SimpleNamespace(busy=False, sync=rec("sync"),
+                                  resync=rec("resync")),
+        method_var=tk.StringVar(value="audio"),
+        mute_var=tk.BooleanVar(value=True),
+        hint_var=tk.StringVar(value="1:05:00"),
+        window_var=tk.StringVar(value="2:00"),
+        sync_btn=ttk.Button(), resync_btn=ttk.Button(),
+        _ready=lambda need_region: True)
+    for kw in ({}, {"resync": True}, {"whole": True}):
+        app.App._sync(s, **kw)
+    assert calls == [("sync", "1:05:00", "2:00", "audio"),
+                     ("resync", "1:05:00", "2:00", "audio"),
+                     ("sync", "", "2:00", "audio")], calls
+    print("resync (full) searches the whole film even with a hint set; "
+          "sync and resync here keep the hint")
 
 
 def monitors(root):
@@ -489,6 +532,7 @@ def main():
         a = make_app(root)
         mouse_controls(root, a)
         fs_bar(root, a)
+        sync_args()
         monitors(root)
         vout_hits(root, a)
     finally:

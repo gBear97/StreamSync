@@ -414,7 +414,7 @@ class App:
             return False
         return True
 
-    def _sync(self, resync=False):
+    def _sync(self, resync=False, whole=False):
         if self.ctl.busy:
             return
         method = self.method_var.get()
@@ -428,9 +428,9 @@ class App:
                          mirror=self.mirror_var.get(),
                          hidden=self._hide_overlapping_windows())
         run = self.ctl.resync if resync else self.ctl.sync
+        hint = "" if whole else self.hint_var.get()   # blank: the whole film
         try:
-            started = run(self.hint_var.get(), self.window_var.get(), method,
-                          **video)
+            started = run(hint, self.window_var.get(), method, **video)
         except ValueError as e:
             if video.get("hidden"):
                 for win in video["hidden"]:
@@ -827,6 +827,9 @@ class App:
                                         "⏹ Stop")
         self._fs_resync = self._fs_button(row, self._fs_resync_clicked,
                                           "⟲ Resync here")
+        self._fs_full = self._fs_button(
+            row, lambda: self._fs_resync_clicked(whole=True),
+            "⟲ Resync (full)")
         self._fs_status = tk.Label(row, anchor="w", bg=bg, fg="#9a9a9a",
                                    font=("Segoe UI", 9))
         self._fs_status.pack(side="left", fill="x", expand=True, padx=(8, 0))
@@ -986,18 +989,26 @@ class App:
         self.player.stop()
         self._fs_refresh()
 
-    def _fs_resync_clicked(self):
+    def _fs_resync_clicked(self, whole=False):
+        """Resync around the film's position, or (whole) search the whole
+        film's audio - even with a position hint set."""
         if self.method_var.get() == "video":
             self._hide_fs_bar()     # keep it out of the screen capture
-        self._resync()
+        if whole:
+            self._sync(whole=True)
+        else:
+            self._resync()
         if self.ctl.busy:
             # stay up until the result is in: the bar shows the status
             self._fs_hold = True
-            self._fs_resync.config(state="disabled",
-                                   text="⟲ Resyncing...")
+            for b in (self._fs_resync, self._fs_full):
+                b.config(state="disabled")
+            (self._fs_full if whole else self._fs_resync).config(
+                text="⟲ Resyncing...")
 
     def _fs_sync_done(self):
         self._fs_resync.config(state="normal", text="⟲ Resync here")
+        self._fs_full.config(state="normal", text="⟲ Resync (full)")
         if self._fs_hold:
             self._fs_hold = False
             self._fs_moved = time.monotonic()   # then the usual time to read it
