@@ -66,6 +66,11 @@ def main():
         raise
     if not ready:
         return
+    # A one-off field probe for the Mac film window (see macprobe.py),
+    # run from Terminal against a built app; not part of the product.
+    if "--probe-overlay" in sys.argv:
+        import macprobe
+        raise SystemExit(macprobe.main(sys.argv))
     if sys.platform == "darwin":
         import mac_app as app
     else:
