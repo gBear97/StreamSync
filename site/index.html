@@ -234,12 +234,13 @@
     <a href="#how">how it works</a>
     <a href="#party">watch parties</a>
     <a href="#features">features</a>
+    <a href="#new">new in 2.0</a>
     <a href="#download">download</a>
   </div>
 </nav>
 
 <header class="hero">
-  <div class="eyebrow">for watch-along nights <span class="amber">&#xB7; twitch / kick</span></div>
+  <div class="eyebrow">for watch-along nights <span class="amber">&#xB7; twitch / kick &#xB7; version 2.0</span></div>
   <h1>Their commentary.<br>Your picture.</h1>
   <p class="lede">StreamSync listens to the watch-along stream you're in, finds that exact
     moment in <strong>your own copy of the film</strong>, and plays it in VLC &#x2014; matched to the
@@ -297,7 +298,7 @@
       <div class="tmark">T+8&thinsp;s</div>
       <h3>Play</h3>
       <p>VLC seeks to the matched moment <em>plus</em> exactly the time the search took, so it
-        lands in sync &#x2014; not eight seconds behind. Nudge buttons trim to taste.</p>
+        lands in sync &#x2014; not eight seconds behind. Fine-tune trims to taste.</p>
     </div>
   </div>
 </section>
@@ -350,7 +351,7 @@
   <div class="grid">
     <div class="feat">
       <h3>Works minimized</h3>
-      <p>Audio-first sync never needs to see the stream's window &#x2014; keep it in the background
+      <p>Audio sync never needs to see the stream's window &#x2014; keep it in the background
         with the sound on.</p>
     </div>
     <div class="feat">
@@ -373,9 +374,9 @@
         your settings, your shortcuts.</p>
     </div>
     <div class="feat">
-      <h3>Millisecond nudges</h3>
-      <p>&#xB1;0.1&thinsp;s taps for final lip-sync, with an offset that's remembered on every
-        future sync.</p>
+      <h3>Fine-tune</h3>
+      <p>0.1&thinsp;s and 0.5&thinsp;s steps for final lip-sync, or one frame at a time from the
+        fullscreen bar &#x2014; an offset that's kept on every later sync.</p>
     </div>
     <div class="feat">
       <h3>Heavy files welcome</h3>
@@ -383,9 +384,9 @@
         sync just as fast.</p>
     </div>
     <div class="feat">
-      <h3>Video fallback</h3>
-      <p>Experimental screen matching with facecam ignore zones, for streams that bury the
-        film's audio entirely.</p>
+      <h3>Player controls you expect</h3>
+      <p>Double-click for fullscreen, right-click for a menu, scroll for volume, and a control
+        bar in fullscreen &#x2014; on Windows and Mac alike.</p>
     </div>
     <div class="feat">
       <h3>Sessions at scale</h3>
@@ -400,25 +401,80 @@
   </div>
 </section>
 
+<section id="new" class="rule">
+  <div class="eyebrow">new in 2.0</div>
+  <h2>One app, both systems, signed updates.</h2>
+  <div class="grid">
+    <div class="feat">
+      <h3>A new look, shared</h3>
+      <p>Windows and Mac now run the same app in a new dark design: a first-run screen that walks
+        you through opening the film, then one window with the sync state, the player and
+        fine-tune.</p>
+    </div>
+    <div class="feat">
+      <h3>Updates you can trust</h3>
+      <p>Every release's checksums are signed. StreamSync checks the signature and the download
+        before it installs anything, and refuses an update that doesn't match.</p>
+    </div>
+    <div class="feat">
+      <h3>A real Windows installer</h3>
+      <p>No admin prompt, no folder to keep track of &#x2014; and the app updates itself from
+        then on, with progress and a Cancel button.</p>
+    </div>
+    <div class="feat">
+      <h3>The Mac catches up</h3>
+      <p>The film window on the Mac gets Windows' mouse controls and fullscreen bar: timeline,
+        pause, stop, frame steps and resync, right over the film.</p>
+    </div>
+  </div>
+  <p class="prose"><strong>Gone in 2.0:</strong> the experimental video sync (syncing is
+    audio-only now, and the Mac no longer asks for Screen Recording), the &#xB1;2&thinsp;s nudge
+    buttons, F11 (press F for fullscreen), and the global Ctrl+Alt hotkeys &#x2014; the app's keys
+    work while one of its windows is in front.</p>
+</section>
+
 <section id="download" class="rule">
   <div class="eyebrow">get it</div>
   <h2>Two platforms, one engine.</h2>
   <div class="plats">
     <div class="plat">
       <div class="head"><h3>Windows</h3><span class="tag ready">READY</span></div>
-      <p>A portable folder &#x2014; no installer. First-run setup checks for VLC and installs anything
-        missing through winget, Microsoft's own package manager.</p>
-      <a class="btn" href="#download" title="Preview page &#x2014; downloads not hosted yet">Get the Windows build</a>
+      <p>A setup program that installs just for you &#x2014; no admin prompt. First-run setup checks
+        for VLC and installs anything missing through winget, Microsoft's own package manager.
+        From then on, StreamSync updates itself.</p>
+      <a class="btn" href="https://github.com/gBear97/StreamSync/releases/latest">Download for Windows</a>
     </div>
     <div class="plat">
       <div class="head"><h3>macOS</h3><span class="tag beta">BETA</span></div>
-      <p>Native menu-bar build. Setup installs the BlackHole audio driver in one click &#x2014;
-        checksum-verified, signed and notarized &#x2014; then walks you through routing.</p>
-      <a class="btn ghost" href="#download" title="Preview page &#x2014; downloads not hosted yet">Read the build guide</a>
+      <p>A signed, notarized disk image for Apple Silicon and Intel &#x2014; drag it to Applications.
+        Install the free BlackHole audio driver so StreamSync can hear the stream; first-run setup
+        offers VLC, and BlackHole with it, when VLC is missing &#x2014; checksum-verified, signed and
+        notarized &#x2014; and the guide walks you through routing.</p>
+      <div class="ctas" style="margin-top:0">
+        <a class="btn" href="https://github.com/gBear97/StreamSync/releases/latest">Download for macOS</a>
+        <a class="btn ghost" href="https://github.com/gBear97/StreamSync/blob/main/MAC_FIRST_RUN.md">First-run guide</a>
+      </div>
     </div>
   </div>
-  <p class="fineprint">This page is a preview &#x2014; downloads aren't hosted yet. Builds are currently
-    unsigned personal builds; code signing is on the roadmap.</p>
+  <p class="prose"><strong>Which file?</strong> On the releases page, Windows is the file ending in
+    <strong>-setup.exe</strong>. For a Mac, take the <strong>.dmg</strong> marked
+    <strong>arm64</strong> for Apple Silicon or <strong>x86_64</strong> for Intel (Apple menu &#x203A;
+    About This Mac says which). Both need VLC; first-run setup offers to install it.</p>
+  <p class="prose"><strong>Updating.</strong> StreamSync checks for a new version when it starts and
+    offers it in its own window. It downloads the update, checks it against the release's signed
+    checksums, installs it and restarts &#x2014; or, if anything doesn't check out, installs nothing
+    and leaves your copy as it was.</p>
+  <p class="prose"><strong>Coming from 1.x on Windows?</strong> The old zip can't update itself. Run
+    the 2.0 setup program once, then delete the old StreamSync folder &#x2014; your settings are kept.
+    On a Mac, accept the update in the app, or drag the new app over the old one.</p>
+  <p class="prose"><strong>A note on antivirus.</strong> To update itself on Windows, StreamSync
+    downloads its own installer and runs it &#x2014; only an installer whose checksum matches the
+    release's signed checksum list, but some antivirus tools flag any program that does that. If
+    yours blocks an update, download the setup program from the releases page and run it
+    yourself.</p>
+  <p class="fineprint">Mac builds are signed and notarized by Apple. The Windows installer is not
+    code-signed, so the first install may show SmartScreen's "unknown publisher" warning (More
+    info &#x203A; Run anyway). Known gap: fullscreen on a second screen is untested on the Mac.</p>
 </section>
 
 <footer>
