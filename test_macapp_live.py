@@ -1,5 +1,6 @@
-"""Live check of the Mac shell: the real MacApp over real Tk, real libvlc
-and real System Events, driven through the methods its menus call.
+"""Live check of the Mac shell: the real app (ui.shell with the Mac's
+adapter) over real Tk, real libvlc and real System Events, driven through
+the methods its buttons and keys call.
 
 test_macswap.py covers the same ground over a fake Tk, and it passed on
 v1.0.8 - whose first run on a Mac, with Automation refused, lost
@@ -18,8 +19,8 @@ Events, and a film: the one StreamSync last had open, or the path given.
 Settings and the log go to a temporary folder; ~/.streamsync.json is read
 for the film's path and never written.
 
-  A  pause and resume with the film fullscreen - from the Play / Pause
-     menu item, by the stream's own pause events, and with one landing
+  A  pause and resume with the film fullscreen - as the play button and
+     Space do, by the stream's own pause events, and with one landing
      inside the other's animation
   B  the same with Automation refused. The refusal is injected where the
      shell calls System Events, with the error macOS gives for one
@@ -53,8 +54,8 @@ import tkinter as tk                      # noqa: E402
 import controller                         # noqa: E402
 import diagnostics                        # noqa: E402
 import macwindowctl                       # noqa: E402
-import mac_app                            # noqa: E402
 import test_macwindowctl as helper_mod    # noqa: E402
+import ui.shell as shell                  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP = helper_mod.APP                      # the stand-in stream app's name
@@ -136,8 +137,9 @@ def _box(kind):
     return show
 
 
+# tkinter's own messagebox module: the patch holds for every ui module
 for _kind in ("showerror", "showinfo", "showwarning"):
-    setattr(mac_app.messagebox, _kind, _box(_kind))
+    setattr(shell.messagebox, _kind, _box(_kind))
 
 
 def _thread_hook(args):
@@ -191,7 +193,7 @@ def _tk_error(exc, val, tb):
 
 
 root.report_callback_exception = _tk_error
-app = mac_app.MacApp(root)
+app = shell.create_app(root)
 app._check_updates = lambda quiet=True: None     # no network, no dialogs
 SW, SH = root.winfo_screenwidth(), root.winfo_screenheight()
 
@@ -199,7 +201,7 @@ SW, SH = root.winfo_screenwidth(), root.winfo_screenheight()
 def state():
     vw = app.video_win
     vw.update_idletasks()
-    mp = app.player_backend.mp
+    mp = app.embedded.mp
     w, h = vw.winfo_width(), vw.winfo_height()
     return {
         "t": now(),
@@ -298,8 +300,8 @@ def script():
         stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
     threading.Thread(target=_sampler, daemon=True).start()
     yield from until(lambda: seen["helper_visible"] is not None, 15)
-    app.stream_app = APP
-    app.streamapp_var.set(APP)
+    app.stream_window = APP
+    app.stream_var.set(APP)
     app._swap_app = ""
 
     # --- playback, the way a first sync starts it ---------------------
@@ -472,9 +474,9 @@ def script():
     yield 1.5
     check("C3 back to built-in: film window shown", dict(
         win_state="normal", playing=False))
-    if not (app.ctl.player is app.player_backend
+    if not (app.ctl.player is app.embedded
             and app.ctl._embedded_path == film2
-            and app.player_backend.has_media):
+            and app.embedded.has_media):
         results[-1]["ok"] = False
         results[-1]["wrong"]["film"] = "the built-in player was not given " \
                                        "the film opened meanwhile"
@@ -533,7 +535,7 @@ def finish():
     try:
         if app.fullscreen:
             app._set_fullscreen(False)
-        app.player_backend.pause()
+        app.embedded.pause()
     except Exception:
         errors.append((now(), "cleanup", traceback.format_exc()[-800:]))
     ext = app.ctl.external

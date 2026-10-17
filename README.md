@@ -56,7 +56,7 @@ missing, a fix-it dialog appears with one-click installs:
 
 Each fix shows its progress in the dialog and confirms with a green
 check when done; the Start button unlocks once everything passes.
-(`python app.py` still works and skips the gate - handy for development.)
+(`python -m ui.shell` skips the gate - handy for development.)
 
 ## Quick start
 

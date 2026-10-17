@@ -37,23 +37,62 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
+      # test_videomouse checks that a click over the picture reaches our
+      # window and not libvlc's own (vout_hits). That takes a real 64-bit
+      # libvlc playing into the window; without VLC it skips, and the
+      # check had only ever run on the PC.
+      - name: Install VLC
+        if: runner.os == 'Windows'
+        run: choco install vlc --no-progress -y
+
+      # test_ui builds every screen under real Tk. The Linux runner has no
+      # display, so it gets a virtual one - at 24-bit colour: xvfb-run's
+      # default is 8-bit, which Tk would draw (and the screenshots show)
+      # in a dithered palette.
+      - name: Install a virtual display
+        if: runner.os == 'Linux'
+        run: command -v xvfb-run || (sudo apt-get update && sudo apt-get install -y xvfb)
+
       # Engine, capture timing, controller decisions, fingerprints, the
-      # relay, a whole watch party and the Mac shell's swap (over a fake
-      # Tk) - none needs a sound card, a display or VLC. (test_windowctl /
-      # test_macwindowctl / test_videomouse drive real windows and skip
-      # themselves off their platform; test_videomouse's libvlc hit-test
-      # also skips where VLC is not installed.)
-      - name: Engine and session tests
+      # relay, a whole watch party, the shell over a fake Tk (test_macswap)
+      # and the update flow over a fake updater - none needs a sound card,
+      # a display or VLC. test_widgets and test_ui draw the real controls
+      # and screens: they skip where there is no display, and test_ui runs
+      # under a virtual one on Linux. (test_windowctl / test_macwindowctl /
+      # test_videomouse drive real windows and skip themselves off their
+      # platform; test_videomouse's libvlc hit-test also skips where VLC
+      # is not installed.)
+      - name: Engine, session and UI tests
         shell: bash
+        env:
+          # each screen as a PNG, to hold up against the approved boards
+          # (test_widgets reads the older name of the same setting)
+          STREAMSYNC_SHOTS: ${{ runner.temp }}/ui-shots
+          STREAMSYNC_SCREENSHOTS: ${{ runner.temp }}/ui-shots
         run: |
           set -e
           for t in test_audio_capture test_players test_controller \
                    test_audio_matcher test_fingerprint test_relay \
                    test_session test_updater test_netcerts test_diagnostics \
-                   test_macswap test_windowctl test_videomouse; do
+                   test_macswap test_windowctl test_videomouse \
+                   test_widgets test_updateflow test_ui; do
             echo "=== $t"
-            python "$t.py"
+            if [ "$t" = test_ui ] && [ "$RUNNER_OS" = Linux ] && [ -z "$DISPLAY" ]; then
+              xvfb-run -a -s "-screen 0 1280x1024x24" python "$t.py"
+            else
+              python "$t.py"
+            fi
           done
+
+      # Small PNGs kept for a week, failed runs included: a broken screen
+      # is when they are wanted most.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-shots-${{ matrix.os }}
+          path: ${{ runner.temp }}/ui-shots
+          if-no-files-found: ignore
+          retention-days: 7
 
   windows-app:
     name: Windows app
@@ -74,12 +113,14 @@ jobs:
       - name: Install VLC
         run: choco install vlc --no-progress -y
 
-      # Builds the real main window, lets it run for 3 s and closes it:
-      # catches anything that throws while the UI and the controller are
-      # wired together, on the platform no one had been testing.
+      # The way a user starts it: through the dependency gate (which, under
+      # --selftest, fails the run instead of waiting on its dialog), then
+      # the real main window, every dialog opened and closed once, and the
+      # real close path after 3 s, with a throwaway config. Catches anything
+      # that throws while the UI and the controller are wired together.
       - name: Smoke-test the main window
         timeout-minutes: 3
-        run: python app.py --selftest
+        run: python streamsync.py --selftest
 
       - name: Build StreamSync.exe
         shell: pwsh

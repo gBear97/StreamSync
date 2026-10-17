@@ -1,11 +1,13 @@
-"""The macOS shell's facecam swap and film window, driven with fakes.
+"""The macOS adapter's facecam swap and film window, driven with fakes.
 
-No Mac, no window, no osascript: mac_app's window helpers are only
-touched at call time, so the real MacApp is built here over a fake Tk
-(windows that remember whether they are shown or fullscreen, an after()
-that never fires - the test pumps the event queue itself), a fake
-player, a fake controller and a fake macwindowctl that records which
-thread each System Events round trip ran on. What is tested:
+No Mac, no window, no osascript: ui/platform_mac.py imports on every OS
+and touches its helpers only at call time, so the real shared shell is
+built here with the Mac adapter (ui.shell.create_app(root,
+platform=platform_mac)) over a fake Tk (windows that remember whether they
+are shown or fullscreen and what is bound on them, an after() that never
+fires - the test pumps the event queue itself), a fake player, a fake
+controller and a fake macwindowctl that records which thread each System
+Events round trip ran on. It runs on Windows and Linux too. What is tested:
 
 - fullscreen is left and given back through the film window itself;
   libvlc's own fullscreen does nothing once the film renders into our
@@ -20,7 +22,7 @@ thread each System Events round trip ran on. What is tested:
   for seconds - the first waits on the Automation prompt - and pausing
   used to freeze the UI for that long), and the browser is looked up
   once, not on every swap - again only once a swap with it has failed
-  (it may have quit) or another Stream App is picked;
+  (it may have quit) or another Stream app is picked;
 - a rapid pause/resume/pause only plays out the state it settled on;
 - the fullscreen debt survives swaps that overlap, however their
   results interleave with new pauses;
@@ -37,23 +39,58 @@ thread each System Events round trip ran on. What is tested:
   fullscreen for a pause that is over; and closing calls it off too;
 - closing stops the swap worker before the controller shuts down;
 - switching back to the built-in player shows its film window and hands
-  libvlc the view, as opening a film does.
+  libvlc the view, as opening a film does;
+- once fullscreen has settled the film window asks for the keyboard -
+  entering does not make it key on a Mac, so Space, F and Esc went
+  nowhere - on a toggle and when a swap hands fullscreen back;
+- leaving fullscreen hides the fullscreen bar first, before the window
+  leaves and before the worker can raise the browser (the bar joins
+  every Space);
+- with the film window's mouse controls off (until Step 5 turns them on)
+  nothing but keys is bound on it, and the bar never shows;
+- Space, Left, Right, F and Esc are bound on the main window, the film
+  window and the bar;
+- a fullscreen the green button made is left by one Esc or one F;
+- switching to the VLC app leaves fullscreen and keeps the film window up;
+- with no film, F does nothing at all;
+- a stream lookup that System Events refuses says so, and why, instead
+  of asking for a pick;
+- once closed, the queue loop dispatches and settles nothing;
+- Command-Q and Settings... reach the app's own close and Settings;
+- a failed attach says so at once, and the diagnostics report it writes
+  (Spotlight and codesign, seconds) runs off the Tk thread.
 """
 
 import threading
 import time
 import types
 
-import mac_app
+import ui.dialogs
+import ui.mainwin
+import ui.platform_mac as platform_mac
+import ui.shell as shell
+import ui.update
+import ui.video
 
 FILM = "/films/film.mkv"
 TK = threading.get_ident()     # the test thread plays the Tk thread
+
+# every ui module the app is made of that could reach a faked name
+MODULES = (shell, platform_mac, ui.video, ui.mainwin, ui.dialogs, ui.update)
+
+
+def patch(name, value):
+    """Swap a collaborator in every module that uses it (each module
+    looks its collaborators up as globals at call time)."""
+    for module in MODULES:
+        if hasattr(module, name):
+            setattr(module, name, value)
 
 
 # ------------------------------------------------------------------ fake Tk
 
 class Widget:
-    """Any ttk widget or menu: remembers its options, accepts every call."""
+    """Any widget or menu: remembers its options, accepts every call."""
     def __init__(self, *a, **kw):
         self.opts = dict(kw)
 
@@ -73,7 +110,10 @@ class Window(Widget):
     does, and a change asked for inside that time is dropped without a
     word, as macOS drops it. Asked straight after a dropped request to
     enter, the window says it is fullscreen - for an instant, as Tk 8.6.16
-    was measured to on macOS 27."""
+    was measured to on macOS 27.
+
+    after() records (ms, fn, args) in `later` without running anything,
+    and bind() records (sequence, fn) in `bindings`."""
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.shown = True          # Tk maps a new Toplevel at once
@@ -83,6 +123,9 @@ class Window(Widget):
         self.changes = 0           # ...and requests taken
         self._moving_until = 0.0
         self._lies_until = 0.0
+        self.later = []
+        self.bindings = []
+        self.focused = 0
 
     def withdraw(self):
         self.shown = False
@@ -107,6 +150,19 @@ class Window(Widget):
             self.changes += 1
             self._moving_until = time.monotonic() + self.transition
 
+    def after(self, ms, fn=None, *args):
+        self.later.append((ms, fn, args))
+        return f"after#{len(self.later)}"
+
+    def after_idle(self, fn, *args):
+        return self.after("idle", fn, *args)
+
+    def bind(self, sequence=None, fn=None, add=None):
+        self.bindings.append((sequence, fn))
+
+    def focus_force(self):
+        self.focused += 1
+
     def winfo_id(self):
         return 0x5EED
 
@@ -115,9 +171,13 @@ class Root(Window):
     def __init__(self):
         super().__init__()
         self.destroyed = False
+        self.commands = {}
 
     def after(self, ms, fn=None, *args):
         pass                       # the test pumps _poll_queue itself
+
+    def createcommand(self, name, fn):
+        self.commands[name] = fn
 
     def destroy(self):
         self.destroyed = True
@@ -133,13 +193,31 @@ class Var:
     def set(self, value):
         self.value = value
 
+    def trace_add(self, *a):       # shell code does not trace; this is a guard
+        return "trace"
+
+    def trace_remove(self, *a):
+        pass
+
 
 class StringVar(Var):
     def __init__(self, master=None, value=""):
         super().__init__(master, value)
 
 
+class FakeTk(types.SimpleNamespace):
+    """tkinter as the shell sees it. Any other class is a Widget, and a
+    constant reads as tkinter's own (tk.END is "end")."""
+    def __getattr__(self, name):
+        if name.isupper():
+            return name.lower()
+        if name[:1].isupper():
+            return Widget
+        raise AttributeError(name)
+
+
 class Widgets:
+    """ui.widgets, ttk: every class is a Widget."""
     def __getattr__(self, name):
         return Widget
 
@@ -156,6 +234,16 @@ class Dialogs:
         return lambda *a, **kw: self.shown.append((name, a))
 
 
+class Quiet:
+    """A module whose every function does nothing, apart from the ones
+    given: diagnostics must not write the real log."""
+    def __init__(self, **given):
+        self.__dict__.update(given)
+
+    def __getattr__(self, name):
+        return lambda *a, **kw: None
+
+
 # ------------------------------------------------------ fake engine and Mac
 
 class Player:
@@ -163,13 +251,14 @@ class Player:
     def __init__(self, hwnd=None):
         self.embedded = False
         self.attached = []
+        self.attach_ok = True
         self.vlc_fullscreen = []   # libvlc's own: a no-op once attached
         self.playing = False
 
     def attach_tk(self, win_id):
         self.attached.append(win_id)
-        self.embedded = True
-        return True
+        self.embedded = self.attach_ok
+        return self.attach_ok
 
     def set_fullscreen(self, flag):
         self.vlc_fullscreen.append(flag)
@@ -285,23 +374,35 @@ class Osascript:
         return [c[0] for c in self.calls]
 
 
-def make(film=True, **osa):
-    """A MacApp over the fakes, with the film loaded the way Open Film... does."""
-    fake_tk = types.SimpleNamespace(
-        Toplevel=Window, Frame=Window, Menu=Widget,
-        StringVar=StringVar, BooleanVar=Var, IntVar=Var)
+reports = []                   # the thread each diagnostics report ran on
+
+
+def make(film=True, attach=True, **osa):
+    """The shared shell with the Mac adapter over the fakes, with the film
+    loaded the way Open film... does."""
     mac = Osascript(**osa)
-    mac_app.tk = fake_tk
-    mac_app.ttk = Widgets()
-    mac_app.filedialog = Dialogs()
-    mac_app.messagebox = Dialogs()
-    mac_app.EmbeddedPlayer = Player
-    mac_app.controller = types.SimpleNamespace(SyncController=Ctl)
-    mac_app.macwindowctl = mac
-    mac_app.audio_capture = types.SimpleNamespace(
-        list_speakers=lambda: [], list_microphones=lambda: [])
-    mac_app.diagnostics = types.SimpleNamespace(log=lambda *a, **kw: None)
-    app = mac_app.MacApp(Root())
+    patch("tk", FakeTk(Toplevel=Window, Frame=Window, Menu=Widget, Label=Widget,
+                       Canvas=Widget, Button=Widget, Entry=Widget, Text=Widget,
+                       StringVar=StringVar, BooleanVar=Var, IntVar=Var, DoubleVar=Var,
+                       TclError=Exception))
+    patch("ttk", Widgets())
+    patch("widgets", Widgets())
+    patch("filedialog", Dialogs())
+    patch("messagebox", Dialogs())
+    patch("EmbeddedPlayer", Player)
+    patch("controller", Quiet(SyncController=Ctl))
+    patch("macwindowctl", mac)
+    patch("depcheck", Quiet(present_window=lambda w: None))
+    patch("audio_capture", Quiet(list_speakers=lambda: [], list_microphones=lambda: [],
+                                 default_speaker_name=lambda: ""))
+    patch("matcher", Quiet(probe=lambda p: (6750.0, 0.0)))
+
+    def log_report(*a, **kw):
+        reports.append(threading.get_ident())
+        return "the log"
+    patch("diagnostics", Quiet(log_report=log_report))
+    app = shell.create_app(Root(), platform=platform_mac)
+    app.embedded.attach_ok = attach
     settle = app._swap_done
     app.results = []                    # each swap result the Tk side settled
 
@@ -341,11 +442,21 @@ def fullscreen(app):
     return app.fullscreen, app.video_win.fullscreen
 
 
+def quiet_fullscreen(app):
+    """Pump until no fullscreen request is still being checked."""
+    return pump(app, lambda: app._fs_until is None)
+
+
+def press(app, action, widget=None):
+    """A key, as its binding hands it to the shell."""
+    return app._on_key(action, types.SimpleNamespace(widget=widget or app.video_win))
+
+
 # -------------------------------------------------------------------- tests
 
 def test_fullscreen_goes_through_the_film_window():
     app, mac = make()
-    assert app.video_win.shown and app.player_backend.embedded
+    assert app.video_win.shown and app.embedded.embedded
     app._toggle_fullscreen()
     assert fullscreen(app) == (True, True)
 
@@ -358,7 +469,7 @@ def test_fullscreen_goes_through_the_film_window():
     assert pump(app, lambda: not app._swapped), mac.names()
     assert fullscreen(app) == (True, True), fullscreen(app)
     assert not app._was_fullscreen
-    assert app.player_backend.vlc_fullscreen == [], \
+    assert app.embedded.vlc_fullscreen == [], \
         "libvlc's fullscreen does nothing to a film in our own window"
 
     app._toggle_fullscreen()                            # one press, not two
@@ -517,7 +628,7 @@ def test_failed_swap_is_not_rerun_by_every_sync():
     # browser was picked or looked up, the film fullscreen or windowed
     for pick, full in (("Safari", False), ("", True)):
         app, mac = make()
-        app.stream_app = pick
+        app.stream_window = pick
         if full:
             app._toggle_fullscreen()
         mac.fail = set(REFUSED)
@@ -562,7 +673,7 @@ def test_refused_swap_leaves_things_as_they_were():
     # Nothing was raised, so the resume's refused hide left nothing up
     # either, and the syncs after it have nothing to hide
     app, mac = make()
-    app.stream_app = "Safari"
+    app.stream_window = "Safari"
     mac.fail = set(REFUSED)
     mac.hold = threading.Event()        # the prompt is up
     app._stream_swap(True)
@@ -644,14 +755,14 @@ def test_browser_is_looked_up_again():
     assert activated(mac) == ["Safari", "Safari", "Google Chrome"]
     assert mac.names().count("list_gui_apps") == 2, mac.names()
 
-    # a Stream App picked by hand replaces the browser found automatically
+    # a Stream app picked by hand replaces the browser found automatically
     app, mac = make(apps=("Finder", "Safari", "Google Chrome"))
     app._stream_swap(True)
     assert pump(app, lambda: app._swapped)
     app._stream_swap(False)
     assert pump(app, lambda: not app._swapped)
-    app.streamapp_var.set("Google Chrome")
-    app._on_streamapp_pick()
+    app.stream_var.set("Google Chrome")
+    app._on_stream_pick()
     # (the pick wins over the remembered browser anyway; this is that
     # nothing found under the old choice outlives it)
     assert app._swap_app == "", \
@@ -752,7 +863,7 @@ def test_dropped_fullscreen_request_is_made_again():
     # a window that never takes it is believed, so that the next
     # Toggle Fullscreen is one go and not two
     app, mac = make()
-    settle, mac_app.FULLSCREEN_SETTLE = mac_app.FULLSCREEN_SETTLE, 0.5
+    settle, platform_mac.FULLSCREEN_SETTLE = platform_mac.FULLSCREEN_SETTLE, 0.5
     try:
         app.video_win.transition = 60.0
         app._toggle_fullscreen()
@@ -762,7 +873,7 @@ def test_dropped_fullscreen_request_is_made_again():
             "the app went on believing a fullscreen change that never came"
         assert fullscreen(app) == (True, True) and app._fs_until is None
     finally:
-        mac_app.FULLSCREEN_SETTLE = settle
+        platform_mac.FULLSCREEN_SETTLE = settle
     print("fullscreen: a request dropped mid-animation is made again")
 
 
@@ -810,7 +921,7 @@ def test_pause_waits_for_a_film_still_entering_fullscreen():
     # The worker's own patience is put far beyond every timeout here: a
     # worker that is never told the film has left would otherwise give up
     # and raise the browser just as these waits run out, and pass by luck.
-    settle, mac_app.FULLSCREEN_SETTLE = mac_app.FULLSCREEN_SETTLE, 30.0
+    settle, platform_mac.FULLSCREEN_SETTLE = platform_mac.FULLSCREEN_SETTLE, 30.0
     try:
         app, mac = entering_fullscreen()
         film_was_fullscreen = watch_raises(app, mac)
@@ -858,7 +969,7 @@ def test_pause_waits_for_a_film_still_entering_fullscreen():
         assert wait_for(lambda: "activate_app" in mac.names()), \
             "a pause waited on a fullscreen that nothing is settling"
     finally:
-        mac_app.FULLSCREEN_SETTLE = settle
+        platform_mac.FULLSCREEN_SETTLE = settle
     print("fullscreen: a pause waits for a film that is still entering it")
 
 
@@ -939,11 +1050,11 @@ def test_switch_to_embedded_shows_the_film_window():
     app, mac = make(film=False)
     switch(app, "external")
     app._choose_file()
-    assert not app.video_win.shown and not app.player_backend.attached
+    assert not app.video_win.shown and not app.embedded.attached
     switch(app, "embedded")
     assert app.video_win.shown, \
         "switching to the built-in player left its film window hidden"
-    assert app.player_backend.attached == [app.video_frame.winfo_id()], \
+    assert app.embedded.attached == [app.video_frame.winfo_id()], \
         "the built-in player was never given the film window's view"
 
     # a film window closed during External playback comes back, attached once
@@ -951,7 +1062,7 @@ def test_switch_to_embedded_shows_the_film_window():
     app.video_win.withdraw()
     switch(app, "external")
     switch(app, "embedded")
-    assert app.video_win.shown and len(app.player_backend.attached) == 1
+    assert app.video_win.shown and len(app.embedded.attached) == 1
 
     # no film yet: no empty window
     app, mac = make(film=False)
@@ -959,6 +1070,196 @@ def test_switch_to_embedded_shows_the_film_window():
     switch(app, "embedded")
     assert not app.video_win.shown
     print("player switch: the built-in player gets its film window back")
+
+
+# --------------------------------------------------- the shared shell's film
+
+def focus_asked(app):
+    """Whether the film window has asked, for later, for the keyboard."""
+    return any(fn == app.video_win.focus_force for _, fn, _ in app.video_win.later)
+
+
+def test_settled_fullscreen_gives_the_film_the_keyboard():
+    # entering fullscreen does not make the film's window key on a Mac:
+    # Space, F and Esc over the film went nowhere
+    app, mac = make()
+    app.video_win.later.clear()
+    app._toggle_fullscreen()
+    assert quiet_fullscreen(app) and fullscreen(app) == (True, True)
+    assert focus_asked(app), "a settled fullscreen left the film without the keyboard"
+
+    # ...and when a swap hands fullscreen back
+    app._stream_swap(True)
+    assert pump(app, lambda: app._swapped) and quiet_fullscreen(app)
+    app.video_win.later.clear()
+    app._stream_swap(False)
+    assert pump(app, lambda: not app._swapped and app.fullscreen and app._fs_until is None)
+    assert focus_asked(app), "fullscreen handed back left the film without the keyboard"
+
+    # ...but not on the way out
+    app.video_win.later.clear()
+    app._toggle_fullscreen()
+    assert quiet_fullscreen(app) and fullscreen(app) == (False, False)
+    assert not focus_asked(app)
+    print("fullscreen: once settled, the film takes the keyboard")
+
+
+def test_leaving_hides_the_bar_first():
+    # the bar joins every Space: left up, it would sit over the browser
+    app, mac = make()
+    app._toggle_fullscreen()
+    assert quiet_fullscreen(app)
+    order = []
+    withdraw, attributes, put = app.fs_bar.withdraw, app.video_win.attributes, app._swap_q.put
+
+    def bar_withdraw():
+        order.append("bar hidden")
+        withdraw()
+
+    def film_attributes(*args):
+        if len(args) == 2 and args[0] == "-fullscreen" and not args[1]:
+            order.append("film leaves")
+        return attributes(*args)
+
+    def queued(item):
+        order.append("worker told")
+        put(item)
+    app.fs_bar.withdraw = bar_withdraw
+    app.video_win.attributes = film_attributes
+    app._swap_q.put = queued
+    app._stream_swap(True)
+    assert {"bar hidden", "film leaves", "worker told"} <= set(order), order
+    assert order.index("bar hidden") < order.index("film leaves") \
+        < order.index("worker told"), order
+    assert not app.fs_bar.shown
+    assert pump(app, lambda: app._swapped), mac.names()
+    print("fullscreen: leaving hides the bar first")
+
+
+MOUSE = ("Button", "Double", "MouseWheel", "Motion", "Enter", "Leave")
+
+
+def test_film_mouse_controls_wait_for_step_5():
+    # Step 5 turns these on after they have been checked by hand; until
+    # then the film window takes keys only, and the bar never shows
+    assert platform_mac.Adapter.FILM_CONTROLS is False
+    app, mac = make()
+    mouse = [s for s, _ in app.video_win.bindings if any(m in s for m in MOUSE)]
+    assert not mouse, f"mouse bound on the film window: {mouse}"
+    app._toggle_fullscreen()
+    assert quiet_fullscreen(app) and fullscreen(app) == (True, True)
+    app._show_fs_bar()
+    assert not app._fs_up and not app.fs_bar.shown
+    print("film window: keys only, no bar, until Step 5")
+
+
+KEYS = ("<space>", "<Left>", "<Right>", "<KeyPress-f>", "<KeyPress-F>", "<Escape>")
+
+
+def test_keys_are_bound_everywhere():
+    app, mac = make()
+    for name in ("root", "video_win", "fs_bar"):
+        bound = {s for s, _ in getattr(app, name).bindings}
+        missing = [k for k in KEYS if k not in bound]
+        assert not missing, f"{name} lacks {missing}"
+    # ...and a key's binding reaches the shell: Space over the film plays
+    space = dict(app.video_win.bindings)["<space>"]
+    assert space(types.SimpleNamespace(widget=app.video_win)) == "break"
+    assert app.embedded.playing
+    print("keys: bound on the main window, the film and the bar")
+
+
+def test_green_button_fullscreen_is_left_in_one_press():
+    # the green button (or Ctrl-Cmd-F) makes the window fullscreen behind
+    # the app's back: one Esc, or one F, must leave it
+    for key in ("leave", "fullscreen"):
+        app, mac = make()
+        app.video_win.fullscreen = True
+        assert fullscreen(app) == (False, True)
+        assert press(app, key) == "break"
+        assert quiet_fullscreen(app)
+        assert fullscreen(app) == (False, False), \
+            f"{key} after the green button took two presses: {fullscreen(app)}"
+    print("fullscreen: one press leaves a green-button fullscreen")
+
+
+def test_switch_to_external_leaves_fullscreen():
+    app, mac = make()
+    app._toggle_fullscreen()
+    assert quiet_fullscreen(app)
+    switch(app, "external")
+    assert quiet_fullscreen(app)
+    assert fullscreen(app) == (False, False), fullscreen(app)
+    assert app.video_win.shown, "the Mac keeps the film window up for the VLC app"
+    assert not app._was_fullscreen
+    print("player switch: the VLC app gets the screen, the film window stays")
+
+
+def test_no_film_no_fullscreen():
+    app, mac = make(film=False)
+    assert press(app, "fullscreen") == "break"
+    press(app, "leave")
+    app._toggle_fullscreen()
+    quiet_fullscreen(app)
+    assert fullscreen(app) == (False, False)
+    assert app.embedded.vlc_fullscreen == [] and not app.video_win.shown, \
+        "fullscreen with no film covered the screen with an empty window"
+    print("fullscreen: nothing to do with no film")
+
+
+def test_refused_lookup_says_why():
+    # no pick, and System Events refuses the lookup: asking for a pick
+    # would send the user the wrong way
+    app, mac = make()
+    mac.fail = {"list_gui_apps"}
+    app.stream_window = ""
+    app._stream_swap(True)
+    assert settled(app, 1)
+    assert "App swap failed" in status(app) and "Automation" in status(app), status(app)
+    assert not app._swapped
+    print("swap: a refused lookup says why")
+
+
+def test_nothing_runs_once_closed():
+    app, mac = make()
+    settles = []
+    settle = app._settle_fullscreen
+
+    def counted():
+        settles.append(1)
+        settle()
+    app._settle_fullscreen = counted
+    app._poll_queue()
+    assert settles == [1]
+    app._on_close()
+    app.q.put(("status", "after the close"))
+    app._poll_queue()                   # raises nothing
+    assert status(app) != "after the close", "dispatched after the close"
+    assert settles == [1], "settled fullscreen after the close"
+    print("close: nothing is dispatched or settled afterwards")
+
+
+def test_app_menu_reaches_the_app():
+    # Tk's own Command-Q skips _on_close: the settings and the watch
+    # party's goodbye were lost
+    app, mac = make()
+    commands = app.root.commands
+    assert commands.get("tk::mac::Quit") == app._on_close, commands
+    assert commands.get("tk::mac::ShowPreferences") == app._open_settings, commands
+    commands["tk::mac::Quit"]()
+    assert app.ctl.closed and app.root.destroyed and app._exit_hard
+    print("app menu: Command-Q closes as the close box does")
+
+
+def test_failed_attach_reports_off_the_tk_thread():
+    reports.clear()
+    app, mac = make(film=False, attach=False)
+    app._show_video_window()            # as opening a film does first
+    assert "Video embedding is unavailable" in status(app), status(app)
+    assert pump(app, lambda: "Details: the log" in status(app)), status(app)
+    assert reports and TK not in reports, \
+        "the diagnostics report (Spotlight, codesign) ran on the Tk thread"
+    print("attach failure: said at once, the report written off the Tk thread")
 
 
 def main():
@@ -975,6 +1276,17 @@ def main():
     test_overtaken_pause_is_called_off()
     test_worker_stops_before_the_controller_closes()
     test_switch_to_embedded_shows_the_film_window()
+    test_settled_fullscreen_gives_the_film_the_keyboard()
+    test_leaving_hides_the_bar_first()
+    test_film_mouse_controls_wait_for_step_5()
+    test_keys_are_bound_everywhere()
+    test_green_button_fullscreen_is_left_in_one_press()
+    test_switch_to_external_leaves_fullscreen()
+    test_no_film_no_fullscreen()
+    test_refused_lookup_says_why()
+    test_nothing_runs_once_closed()
+    test_app_menu_reaches_the_app()
+    test_failed_attach_reports_off_the_tk_thread()
     print("MAC SWAP TEST PASSED")
 
 

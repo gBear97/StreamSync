@@ -20,7 +20,8 @@ truth read off the displayed frames):
   The stall guess is learned from those checks.
 - Seek-based nudges went the wrong way: a +0.1 s nudge by set_time
   netted about -170 ms, the stale get_time() and the stall together
-  outweighing it. Nudges are rate trims now.
+  outweighing it. Nudges are rate trims now - while playing: a paused
+  film is stepped by an exact seek, as it has no stall to allow for.
 """
 
 import base64
@@ -141,6 +142,7 @@ class _ClosedLoop:
         self._line = None           # (T, c): belongs at T + (now - c)
         self._working = False
         self._trimming = False
+        self._paused_at = None      # where the last paused nudge put playback
         self._loop_lock = threading.Lock()
 
     def _desired(self, at):
@@ -152,6 +154,7 @@ class _ClosedLoop:
             self._gen += 1
             self._line = None
             self._working = False
+            self._paused_at = None
             trimming, self._trimming = self._trimming, False
         if trimming:
             self._set_rate(1.0)
@@ -169,6 +172,7 @@ class _ClosedLoop:
             gen = self._gen
             self._line = (want, now)
             self._working = True
+            self._paused_at = None
             trimming, self._trimming = self._trimming, False
         if trimming:
             self._set_rate(1.0)
@@ -418,6 +422,14 @@ class EmbeddedPlayer(_ClosedLoop):
         if not view:
             return False
         self.mp.set_nsobject(view)
+        # Mouse input on, key input off: the one setting both Mac probes
+        # agree on. Clicks, double-clicks, right-clicks, the wheel, Space
+        # and F all reach Tk, and libvlc acts on none of them. (Windows
+        # keeps both off: with mouse input off its vout is created
+        # disabled and clicks fall through to our frame - see
+        # test_videomouse.vout_hits.)
+        self.mp.video_set_mouse_input(True)
+        self.mp.video_set_key_input(False)
         self.nsview = view
         self.embedded = True
         return True
@@ -439,6 +451,7 @@ class EmbeddedPlayer(_ClosedLoop):
         elif self.nsview is not None:
             self.mp.set_nsobject(self.nsview)
             self.mp.set_fullscreen(False)
+        self._paused_at = None      # a new film: no paused step to go on from
         self.has_media = True
 
     def ensure_playing(self, timeout=6.0):
@@ -459,6 +472,27 @@ class EmbeddedPlayer(_ClosedLoop):
         film belongs at match_t + offset then, and 1x from there."""
         self.ensure_playing()
         self.goto(match_t + offset, t0_perf)
+
+    def nudge(self, delta):
+        """Shift playback by `delta` seconds. Playing: the closed loop's
+        trim or seek, as before. Paused: an exact seek from where the last
+        paused step put it. The loop's seek adds the learned stall guess
+        (0.1 s, learned up to 2 s), which suits a playing film and not a
+        paused one: a one-frame step back landed 0.06 s *ahead*, and the
+        offset no longer said where the picture was."""
+        if self.mp.is_playing():
+            return super().nudge(delta)
+        base = self._paused_at
+        if base is None:
+            base = self.time()
+        if base is None:
+            return                      # never started: nothing to step
+        target = max(0.0, base + delta)
+        # seek() cancels the loop, which clears _paused_at, so it is set
+        # after: quick presses step on from here, not from a get_time()
+        # that has not caught up with the last one
+        self.seek(target)
+        self._paused_at = target
 
     def toggle_pause(self):
         if not self.has_media:
@@ -508,6 +542,18 @@ class EmbeddedPlayer(_ClosedLoop):
     def length(self):
         n = self.mp.get_length()
         return None if n is None or n <= 0 else n / 1000.0
+
+    def fps(self):
+        """The film's frame rate, or None while libvlc cannot say.
+
+        libvlc reports 0 until a picture is out. The video track's own
+        structs are not read: they differ between python-vlc versions
+        (3.0.21203 flattens the `u` union)."""
+        try:
+            f = float(self.mp.get_fps() or 0)
+        except Exception:
+            return None
+        return f if f > 0 else None
 
     def set_mute(self, mute):
         self.mp.audio_set_mute(bool(mute))

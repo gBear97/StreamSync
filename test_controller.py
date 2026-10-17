@@ -37,7 +37,11 @@ to leave playback alone:
   a moment before the player stops;
 - the time readout carries its rounding (119.96 s once read "1:60.0");
 - switching back from external VLC hands the built-in player a film
-  opened meanwhile, and leaves one it already holds where it is.
+  opened meanwhile, and leaves one it already holds where it is;
+- every decided match tells the shell what happened, once ("synced": a
+  manual sync trusted or weak, applied or not; an auto check only when it
+  could measure the drift; a resume), and a sync that failed says nothing;
+- a film the built-in player could not load is not named as loaded.
 """
 
 import queue
@@ -931,6 +935,108 @@ def test_switch_back_loads_the_film():
     print("player switch: the built-in player keeps its film, gets VLC's")
 
 
+def synced(events):
+    return [e[1] for e in events if e[0] == "synced"]
+
+
+def test_synced_events():
+    # a trusted manual sync: one event, before busy_off, at the stream's spot
+    ctl, stream, player, clock, q = make()
+    run_sync(ctl, ctl.sync, "")
+    got = drain(q)
+    infos = synced(got)
+    assert len(infos) == 1, got
+    info = infos[0]
+    assert (info["trusted"], info["applied"], info["source"]) == (True, True, "sync"), info
+    assert abs(info["match"] - stream.pos(info["at"])) < 1e-6, info
+    kinds = [e[0] for e in got]
+    assert kinds.index("synced") < kinds.index("busy_off"), kinds
+
+    # a weak first sync is used as a first guess; a weak later one is not
+    ctl, stream, player, clock, q = make()
+    stream.audible = False
+    run_sync(ctl, ctl.sync, "")
+    info, = synced(drain(q))
+    assert (info["trusted"], info["applied"]) == (False, True), info
+    run_sync(ctl, ctl.resync, "")
+    info, = synced(drain(q))
+    assert (info["trusted"], info["applied"], info["source"]) == (False, False, "sync"), info
+
+    # a sync that failed decided nothing: busy_off alone
+    ctl, stream, embedded, external, q = switchable()
+    ctl.video_path = "film.mkv"          # named, never loaded: sync_seek raises
+    run_sync(ctl, ctl.sync, "")
+    got = drain(q)
+    assert not synced(got) and ("busy_off",) in got, got
+
+    # auto checks: in sync (nothing moved), then drift corrected
+    ctl, stream, player, clock, q = make()
+    run_sync(ctl, ctl.sync, "")
+    drain(q)
+    state = new_state()
+    clock.now += ctl.auto_step(state)
+    info, = synced(drain(q))
+    assert (info["trusted"], info["applied"], info["source"]) == (True, False, "auto"), info
+    player.anchor = (player.pos() - 1.3, clock())
+    clock.now += ctl.auto_step(state)
+    info, = synced(drain(q))
+    assert (info["trusted"], info["applied"], info["source"]) == (True, True, "auto"), info
+    # ...and none when the drift could not be measured (the film paused
+    # while the stream was being heard): nothing was checked
+    ctl._loopback().on_capture = player.pause
+    clock.now += ctl.auto_step(state)
+    got = drain(q)
+    assert not synced(got), got
+    ctl._loopback().on_capture = None
+
+    # a resume after a pause auto mode followed
+    ctl, stream, player, clock, q = make()
+    run_sync(ctl, ctl.sync, "")
+    state = new_state()
+    stream.pause()
+    for _ in range(3):
+        clock.now += ctl.auto_step(state)
+    drain(q)
+    clock.now += 30
+    stream.play()
+    clock.now += ctl.auto_step(state)
+    info, = synced(drain(q))
+    assert (info["trusted"], info["applied"], info["source"]) == (True, True, "resume"), info
+    print("synced events: one per decided match - sync (trusted, weak, not "
+          "applied), auto only with a measured drift, resume; none on failure")
+
+
+class BrokenFilmPlayer(FilmPlayer):
+    """A player that cannot open one particular film."""
+    def load(self, path):
+        if path == "broken.mkv":
+            raise controller.VLCError("VLC could not open broken.mkv")
+        super().load(path)
+
+
+def test_failed_load_keeps_film():
+    clock = Clock()
+    player = BrokenFilmPlayer(clock)
+    ctl = controller.SyncController(queue.Queue(), player,
+                                    monitor_factory=lambda name: Monitor(clock))
+    try:
+        ctl.load_file("broken.mkv")
+        raise AssertionError("the failed load did not raise")
+    except controller.VLCError:
+        pass
+    assert ctl.video_path is None and ctl._embedded_path is None, \
+        f"a film that never loaded is named: {ctl.video_path!r}"
+    ctl.load_file("film.mkv")
+    try:
+        ctl.load_file("broken.mkv")
+    except controller.VLCError:
+        pass
+    assert ctl.video_path == "film.mkv" and ctl._embedded_path == "film.mkv", \
+        (ctl.video_path, ctl._embedded_path)
+    print("failed load: the film that was in stays named; none is named "
+          "when there was none")
+
+
 def main():
     test_nudged_film_left_alone()
     test_drift_corrected()
@@ -951,6 +1057,8 @@ def main():
     test_session_teardown_does_not_block()
     test_fmt_time_carries()
     test_switch_back_loads_the_film()
+    test_synced_events()
+    test_failed_load_keeps_film()
     print("CONTROLLER TEST PASSED")
 
 

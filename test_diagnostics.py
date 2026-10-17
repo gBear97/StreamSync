@@ -422,11 +422,11 @@ try:
 finally:
     diagnostics.LOG_DIR, diagnostics.LOG_FILE = saved_dir, saved_file
 
-# --- both shells install the hooks ---------------------------------------
-# A shell can be launched directly (`python app.py`, and CI's --selftest)
-# without streamsync.py, and only a shell holds the Tk root. Read rather
-# than run: main() opens the real window.
-for shell in ("app.py", "mac_app.py"):
+# --- the shell installs the hooks ----------------------------------------
+# The shell can be launched directly (`python -m ui.shell`) without
+# streamsync.py, and only the shell holds the Tk root. Read rather than
+# run: main() opens the real window.
+for shell in ("ui/shell.py",):
     tree = ast.parse(open(shell, encoding="utf-8").read(), shell)
     main_fn = next(n for n in tree.body
                    if isinstance(n, ast.FunctionDef) and n.name == "main")
@@ -505,9 +505,13 @@ if sys.platform != "darwin":
        players._tk_nsview(0) is None)
 
 _calls = []
+_inputs = []          # libvlc's own mouse and key handling, as attach_tk sets it
 _fake = types.SimpleNamespace(
     embedded=False,
-    mp=types.SimpleNamespace(set_nsobject=_calls.append))
+    mp=types.SimpleNamespace(
+        set_nsobject=_calls.append,
+        video_set_mouse_input=lambda on: _inputs.append(("mouse", on)),
+        video_set_key_input=lambda on: _inputs.append(("key", on))))
 
 _saved_nsview = players._tk_nsview
 try:
@@ -522,6 +526,9 @@ try:
        players.EmbeddedPlayer.attach_tk(_fake, 42) is True)
     check("as the view the bridge resolved", _calls, [0xD0A])
     ok("and the player is marked embedded", _fake.embedded is True)
+    # clicks and keys over the film go to Tk, and libvlc acts on neither
+    check("with libvlc's mouse input on and its key input off", _inputs,
+          [("mouse", True), ("key", False)])
 
     _calls.clear()
     ok("attaching twice is a cheap no-op",

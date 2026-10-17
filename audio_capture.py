@@ -95,7 +95,7 @@ def _open_source(kind, name):
             "must be routed through BlackHole: install BlackHole, create a "
             "Multi-Output Device (your speakers + BlackHole) in Audio MIDI "
             "Setup, select it as the system output, and pick BlackHole "
-            "under 'Listen on'.")
+            "under Settings > Listen to.")
     spk = None
     if name:
         for s in sc.all_speakers():
