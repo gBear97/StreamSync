@@ -5,7 +5,7 @@ ground truth read off the displayed frames):
 - get_time() changes only every 250-500 ms, exact at the change, then
   stale; the change event is occasionally delivered 50-150 ms late;
 - set_time() echoes its target at once, then playback stalls for a while
-  before it restarts - an amount that varies per seek;
+  before it restarts - an amount that varies per seek - unless paused;
 - set_rate() takes effect about 1 s late, and so does going back to 1x.
 
 On real libvlc the same code measured: sync error 5-9 ms median (was
@@ -14,8 +14,9 @@ seek-based nudge netted about -170 ms). This test holds the logic to
 that without needing VLC installed.
 
 It also pins what loading a film sends each player - external VLC's HTTP
-commands and command line, the embedded player's drawable - with fakes
-that record the calls.
+commands and command line, the embedded player's drawable and input
+flags - with fakes that record the calls, and the embedded player's frame
+rate and its exact step while paused (the fullscreen bar's +-1 frame).
 """
 
 import os
@@ -132,7 +133,8 @@ class FakeMP:
         with self.lock:
             self.segments = [s for s in self.segments if s[0] < now]
             self.segments.append((now, ms / 1000.0, 0.0))          # frozen...
-            self.segments.append((now + stall, ms / 1000.0, self._rate()))
+            if self.playing:                 # ...and a paused film stays so
+                self.segments.append((now + stall, ms / 1000.0, self._rate()))
 
     def set_rate(self, r):
         with self.lock:
@@ -142,6 +144,9 @@ class FakeMP:
         now = time.perf_counter()
         self._set_segment(now, self.truth(now), 0.0 if flag else self._rate())
         self.playing = not flag
+
+    def pause(self):
+        self.set_pause(self.playing)            # libvlc's pause() toggles
 
     def get_state(self):
         return "playing" if self.playing else "paused"
@@ -292,7 +297,8 @@ def external_load():
 
 
 class AnchorMP:
-    """The libvlc media player calls a load and a fullscreen make, in order."""
+    """The libvlc media player calls a load, a fullscreen and the input
+    flags make, in order."""
 
     def __init__(self):
         self.calls = []
@@ -313,10 +319,10 @@ class AnchorMP:
         self.calls.append(("set_fullscreen", flag))
 
     def video_set_mouse_input(self, flag):
-        pass
+        self.calls.append(("mouse_input", flag))
 
     def video_set_key_input(self, flag):
-        pass
+        self.calls.append(("key_input", flag))
 
 
 class AnchorInstance:
@@ -334,7 +340,12 @@ def embedded_anchor():
     """Every load hands libvlc our drawable again and turns its own
     fullscreen off - a guard only, as real libvlc keeps both across loads
     already. And once a drawable is set, set_fullscreen reports that it
-    does nothing rather than pretend."""
+    does nothing rather than pretend.
+
+    The drawable also sets who gets the mouse and the keys. Windows: both
+    off, so libvlc's vout is created disabled and clicks fall through to
+    our frame. macOS: mouse on, keys off - the one setting both Mac probes
+    agree on, where clicks, the wheel, Space and F all reach Tk."""
     saved = players.vlc, players._tk_nsview
     try:
         # Windows: the hwnd is given to the constructor
@@ -343,6 +354,8 @@ def embedded_anchor():
             Instance=lambda *args: AnchorInstance(mp),
             EventType=FAKE_VLC.EventType, State=FAKE_VLC.State)
         p = players.EmbeddedPlayer(0x1234)
+        assert mp.calls == [("set_hwnd", 0x1234), ("mouse_input", False),
+                            ("key_input", False)], mp.calls
         for film in ("one.mkv", "two.mkv"):
             mp.calls.clear()
             p.load(film)
@@ -352,15 +365,19 @@ def embedded_anchor():
         mp.calls.clear()
         assert p.set_fullscreen(True) is False
         assert mp.calls == [], mp.calls
-        print("embedded, Windows: every load re-anchors the hwnd, libvlc "
-              "fullscreen off; set_fullscreen reports a no-op")
+        print("embedded, Windows: mouse and key input off; every load "
+              "re-anchors the hwnd, libvlc fullscreen off; set_fullscreen "
+              "reports a no-op")
 
         # macOS: the NSView arrives later, through attach_tk
         mp = AnchorMP()
         p = players.EmbeddedPlayer._around(AnchorInstance(mp), mp)
         players._tk_nsview = lambda wid: 0xD0A
         assert p.attach_tk(42) is True
+        assert mp.calls == [("set_nsobject", 0xD0A), ("mouse_input", True),
+                            ("key_input", False)], mp.calls
         mp.calls.clear()
+        assert p.attach_tk(42) is True and mp.calls == [], mp.calls   # once
         p.load("one.mkv")
         assert mp.calls == [("set_media", ("media", "one.mkv")),
                             ("set_nsobject", 0xD0A),
@@ -368,7 +385,8 @@ def embedded_anchor():
         mp.calls.clear()
         assert p.set_fullscreen(True) is False
         assert mp.calls == [], mp.calls
-        print("embedded, macOS: every load re-anchors the NSView too")
+        print("embedded, macOS: attach_tk turns mouse input on and key "
+              "input off; every load re-anchors the NSView too")
 
         # no drawable: the window is libvlc's own, and so is fullscreen
         mp = AnchorMP()
@@ -420,6 +438,101 @@ def embedded_volume():
     assert p.current_subtitle() == -1
     print("embedded: volume clamped to 0-125, mute untouched; current "
           "subtitle read, -1 when libvlc can't say")
+
+
+class FpsMP(AnchorMP):
+    def __init__(self, fps):
+        super().__init__()
+        self.fps = fps
+
+    def get_fps(self):
+        if isinstance(self.fps, Exception):
+            raise self.fps
+        return self.fps
+
+
+def embedded_fps():
+    """The fullscreen bar's +-1 frame steps by the film's frame rate:
+    libvlc's, while it reports one (0 until a picture is out)."""
+    for given, want in ((23.976, 23.976), (25, 25.0), (0, None), (None, None),
+                        (-1.0, None), (OSError("no vout"), None)):
+        p = players.EmbeddedPlayer._around(None, FpsMP(given))
+        got = p.fps()
+        assert got == want and (got is None or isinstance(got, float)), \
+            (given, got)
+    print("embedded: fps() is libvlc's frame rate, None while it reports 0 "
+          "or fails")
+
+
+def paused_nudge():
+    """A paused film steps exactly. The loop's seek allows for a stall
+    that a paused film does not have - a one-frame step back landed 0.06 s
+    ahead - so paused, a nudge is a plain seek from where the last one put
+    it, never from a get_time() that may not have caught up yet."""
+    p, mp = make(stall=0.1, seed=3)
+    p.pause()
+    time.sleep(0.1)
+    t = mp.get_time() / 1000            # paused: libvlc's own reading
+    assert t > 0.5 and not mp.playing, (t, mp.playing)
+    sent = []
+    real_set_time = mp.set_time
+
+    def set_time(ms):
+        sent.append(ms)
+        real_set_time(ms)
+
+    mp.set_time = set_time
+    frame = 1 / 25
+    p.nudge(-frame)
+    assert sent == [round((t - frame) * 1000)], (sent, t)
+    assert not p._working
+    # libvlc's get_time() is stale for a moment after a seek; two quick
+    # presses must still land one frame and two frames on
+    mp.get_time = lambda: sent[0]
+    start = p._paused_at
+    p.nudge(+frame)
+    p.nudge(+frame)
+    assert sent[1:] == [round((start + frame) * 1000),
+                        round((start + 2 * frame) * 1000)], (sent, start)
+    assert abs(p._paused_at - (t + frame)) < 0.002, (p._paused_at, t)
+    time.sleep(0.5)
+    assert not p._working and not mp.playing
+    assert abs(mp.truth() - (t + frame)) < 0.002, (mp.truth(), t)
+    print(f"paused nudge: -1 frame, +1, +1 from {t:.3f} s sent exact "
+          f"seeks {[ms / 1000 for ms in sent]}, no correction thread, and "
+          f"the film stayed paused at {mp.truth():.3f} s")
+
+    # playing again, a nudge goes through the loop as before, and a later
+    # pause steps from where playback is, not from the old paused step
+    del mp.get_time
+    p.toggle_pause()
+    assert p._paused_at is None
+    time.sleep(1.0)
+    before = len(sent)
+    p.nudge(0.1)
+    assert p._working
+    wait_done(p)
+    p.pause()
+    time.sleep(0.1)
+    t = mp.get_time() / 1000
+    p.nudge(-frame)
+    assert sent[-1] == round((t - frame) * 1000), (sent[before:], t)
+    print("playing, a nudge is the loop's again; paused later, the step "
+          "starts from the film's own position")
+
+    # nothing to step before a film has started, and never before 0
+    p.seek(0.01)
+    p.nudge(-frame)
+    assert sent[-1] == 0 and p._paused_at == 0.0, sent[-2:]
+    mp.stop()
+    q = players.EmbeddedPlayer._around(None, AnchorMP())
+    q.mp.is_playing = lambda: False
+    q.mp.get_time = lambda: -1
+    q.mp.set_time = lambda ms: sent.append(("never", ms))
+    q.nudge(+frame)
+    assert not any(isinstance(ms, tuple) for ms in sent), sent
+    assert q._paused_at is None
+    print("paused nudge: clamped at 0; nothing at all before playback")
 
 
 def main():
@@ -483,6 +596,12 @@ def main():
 
     # 7. embedded: volume and subtitle reads for the video window's menu
     embedded_volume()
+
+    # 8. embedded: the frame rate the +-1 frame buttons step by
+    embedded_fps()
+
+    # 9. embedded: a paused nudge is an exact seek
+    paused_nudge()
     print("PLAYERS TEST PASSED")
 
 

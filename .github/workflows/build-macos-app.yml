@@ -81,20 +81,45 @@ jobs:
         timeout-minutes: 3
         run: python3 depcheck.py --demo
 
-      # MacApp builds a libvlc player while constructing its window, so
-      # without VLC the smoke test cannot get far enough to tell us anything.
+      # The app builds a libvlc player while constructing its window, and
+      # the dependency gate wants VLC too, so without it the smoke test
+      # cannot get far enough to tell us anything.
       - name: Install VLC for the main-window smoke test
         run: brew install --cask vlc
 
       # The main window is built and handed straight to mainloop, the same
-      # shape that left the first-run dialog unpainted. --selftest builds
-      # the real window against Aqua Tk and closes it after 3s.
+      # shape that left the first-run dialog unpainted. --selftest goes
+      # through the dependency gate (failing the run rather than waiting on
+      # its dialog), builds the real window against Aqua Tk, opens and
+      # closes every dialog, and closes it after 3s with a throwaway config.
       - name: Smoke-test the main window
         timeout-minutes: 5
-        run: python3 mac_app.py --selftest
+        run: python3 streamsync.py --selftest
 
       - name: Build StreamSync.app
         run: sh build_app_mac.sh
+
+      # The same smoke test inside the bundle. PyInstaller finds modules by
+      # following import statements; a ui module it missed would only fail
+      # when a user opened the app, so open it here.
+      #
+      # Its output goes to the log as it comes, through tee, and errexit is
+      # off until the exit status is read. Captured with $(...) instead,
+      # under this step's bash -e, a failing run ended the step before a
+      # word of the app's own reason was printed, and a run that hung until
+      # the timeout printed nothing at all.
+      - name: Smoke-test the built app
+        timeout-minutes: 3
+        run: |
+          log="$RUNNER_TEMP/selftest.txt"
+          set +e
+          dist/StreamSync.app/Contents/MacOS/StreamSync --selftest 2>&1 | tee "$log"
+          code=${PIPESTATUS[0]}
+          set -e
+          if [ "$code" -ne 0 ] || ! grep -q "SELFTEST OK" "$log"; then
+            echo "The built app did not finish its selftest (exit $code)."
+            exit 1
+          fi
 
       # The check that source-checkout tests cannot make. A frozen build
       # carries no CA roots unless they were deliberately collected into

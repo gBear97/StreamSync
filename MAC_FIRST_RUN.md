@@ -47,7 +47,7 @@ The first-run gate appears if anything is missing:
 Click **Open Audio MIDI Setup**, then: **+** (bottom-left) > **Create
 Multi-Output Device** > tick your speakers/headphones **and**
 BlackHole 2ch. Right-click the new device > **Use This Device For Sound
-Output**. In StreamSync: **Advanced > Listen On > BlackHole 2ch**.
+Output**. In StreamSync: **Settings > Listen to > BlackHole 2ch**.
 
 macOS will ask for **Microphone** permission on the first sync - allow it.
 
@@ -55,21 +55,23 @@ macOS will ask for **Microphone** permission on the first sync - allow it.
 
 Play any film in any player (QuickTime is fine) with audio going through
 the Multi-Output Device. In StreamSync open the *same* film file, type a
-rough position hint, hit **Sync**. It should match with a high score and
-start VLC playback at the right moment.
+rough position hint (Settings > Start searching near), hit **Sync to
+stream**. It should match with a high score and start VLC playback at
+the right moment.
 
 ## 6. Optional feature, with a one-time permission prompt
 
-- **Show stream while paused** (Advanced menu): needs *Automation*
-  permission (System Events) on first use.
+- **Settings > Show the stream while the film is paused**: needs
+  *Automation* permission (System Events) on first use.
 
 ## 6.5 Watch parties (optional)
 
-The **Session** menu hosts or joins watch-party sessions. To try it
-solo: run `python3 relay_server.py` in a second terminal, then Session >
-Host a Session with relay `ws://localhost:8765`. The status line shows
-your room code once the film is fingerprinted. Cross-machine tests need
-the relay on a box both sides can reach.
+The **Watch party** button hosts or joins watch-party sessions. To try
+it solo: run `python3 relay_server.py` in a second terminal, then
+**Watch party > Start hosting** with the relay server
+`ws://localhost:8765`. The Watch party window shows your session code
+once the relay answers. Cross-machine tests need the relay on a box
+both sides can reach.
 
 ## 7. When everything works
 
@@ -82,7 +84,7 @@ sh build_app_mac.sh        # produces dist/StreamSync.app
 If something misbehaves, it's most likely one of these - all fixable:
 
 - Widget spacing / fonts looking off in the main window.
-- The libvlc video window not appearing until playback starts (expected:
-  it opens on first sync, not on file load).
+- The film window staying black after a film is opened (expected: it
+  opens with the film, and the picture starts with the first sync).
 - `soundcard` errors naming a device -> send the exact device list from
-  Advanced > Listen On.
+  Settings > Listen to.

@@ -1,14 +1,15 @@
 """What StreamSync does, independent of how it is drawn.
 
-app.py (Windows) and mac_app.py (macOS) each used to carry their own copy
-of everything here - the sync workers, the auto re-sync loop, sessions,
+The Windows and macOS shells each used to carry their own copy of
+everything here - the sync workers, the auto re-sync loop, sessions,
 settings - nearly line for line. Every engine fix had to be made twice,
 some were only made once, and none of it could be tested without a
-window. The shells now own widgets, menus and window juggling; this owns
-the sync, and tests drive it with a fake player and fake audio.
+window. The shell (the ui package, one for both platforms) owns widgets,
+menus and window juggling; this owns the sync, and tests drive it with a
+fake player and fake audio.
 
-It talks to its shell only through the event queue, with the same
-("kind", payload...) tuples the shells already poll for:
+It talks to the shell only through the event queue, with
+("kind", payload...) tuples the shell polls for:
 
     ("status", text)     one line for the status bar
     ("session", text)    watch-party status
@@ -16,6 +17,14 @@ It talks to its shell only through the event queue, with the same
     ("busy_off",)        a manual sync finished; re-enable its buttons
     ("auto_off", text)   auto mode gave up and switched itself off; untick
                          it as a manual uncheck would, and show `text`
+    ("synced", info)     a match was decided: a manual sync's result, an
+                         auto check that heard the stream, or a resume.
+                         info is {"match": film seconds matched, "at":
+                         perf_counter when that audio was heard, "trusted":
+                         the match passed the matcher's gates, "applied":
+                         the film was moved to it, "source": "sync",
+                         "auto" or "resume"}. The stream is at
+                         match + (perf_counter() - at) now.
 """
 
 import json
@@ -156,11 +165,15 @@ class SyncController:
     def load_file(self, path):
         """Load `path` into the active player. VLCError propagates for the
         embedded player; external loads report through the queue."""
-        self.video_path = path
         if self.player is self.embedded:
             self.embedded.load(path)
+            # Named only once it holds: a load that raised used to leave
+            # video_path naming a film nothing held, so the shell showed it
+            # as open and Sync failed with "No video file loaded.".
+            self.video_path = path
             self._embedded_path = path
             return
+        self.video_path = path
         name = Path(path).name
 
         def spawn():
@@ -329,6 +342,8 @@ class SyncController:
                 msg += (" Weak match - NOT applied, playback left where it "
                         "was. " + self._weak_hint())
             self._say(msg)
+            self.q.put(("synced", {"match": match_t, "at": t0, "trusted": ok,
+                                   "applied": apply, "source": "sync"}))
         except Exception as e:
             self._say(f"Sync failed: {e}")
         finally:
@@ -407,6 +422,14 @@ class SyncController:
                     player.sync_seek(t, t0, self.offset)
                     self._say(f"Auto: corrected {drift:+.2f}s drift "
                               f"(score {score:.1f}, z {z:.0f}).")
+                if drift is not None:
+                    # heard and checked: the film is in sync now, moved or
+                    # not. (drift is None when the player's position at that
+                    # moment could not be read - it paused, or its clock had
+                    # not settled - so nothing was checked.)
+                    self.q.put(("synced", {"match": t, "at": t0, "trusted": True,
+                                           "applied": abs(drift) > DRIFT_TOLERANCE,
+                                           "source": "auto"}))
                 return self.auto_interval
             if hit:
                 return 1     # a manual sync or a session overtook this one
@@ -460,6 +483,8 @@ class SyncController:
             player.sync_seek(t, t0, self.offset)
             self.q.put(("swap", False))
             self._say("Auto: stream resumed - resynced.")
+            self.q.put(("synced", {"match": t, "at": t0, "trusted": True,
+                                   "applied": True, "source": "resume"}))
             state.update(mode="normal", failures=0)
             return self.auto_interval
         return 8
@@ -500,7 +525,7 @@ class SyncController:
                 why = f"the same error kept coming back ({e})"
             self.auto_enabled = False
             self.q.put(("auto_off", f"Auto re-sync stopped: {why}. "
-                                    "Tick Auto re-sync again to retry."))
+                                    "Turn Keep in sync automatically back on to retry."))
         return max(self.auto_interval, 20)
 
     def _auto_loop(self):
