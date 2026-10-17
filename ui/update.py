@@ -12,11 +12,9 @@ the installer. This module downloads and verifies, on a worker thread
 that talks to the Tk thread only through self.q, and closes the app the
 normal way once the platform has started the new version.
 
-updater is looked up at call time, so tests can swap it. Until the signed
-updates land (Step 3), updater.py is the one that only checks SHA256SUMS
-and has no Windows install: _download_update falls back to that API, and
-on Windows _installed_target() is None, so the dialog sends people to the
-Releases page instead of installing.
+updater is looked up at call time, so tests can swap it. A download is
+trusted only once SHA256SUMS.sig checks out against the release key
+built into updater and the file's hash is in those signed sums.
 """
 
 import shutil
@@ -146,18 +144,11 @@ class UpdateFlow:
 
     def _download_update(self, asset, rel, dest, progress):
         """Download and verify the asset into dest (worker thread)."""
-        if hasattr(updater, "verified_sums"):          # the signed updates (Step 3)
-            # checks SHA256SUMS.sig with the release key, then the file
-            return updater.download_verified(asset, rel, dest, progress)
-        # main's API (delete this branch and the hasattr when Step 3 lands):
-        sums = next((a["browser_download_url"] for a in rel.get("assets", [])
-                     if a.get("name") == updater.SUMS_ASSET), None)
-        return updater.download_verified(asset, sums, dest, progress)
+        # checks SHA256SUMS.sig with the release key, then the file
+        return updater.download_verified(asset, rel, dest, progress)
 
     def _verified_text(self):
-        if hasattr(updater, "verified_sums"):
-            return "Checked against the release's signed checksums. Installing..."
-        return "Checksum verified. Installing..."
+        return "Checked against the release's signed checksums. Installing..."
 
     def _cancel_update(self):
         self._update_cancel.set()

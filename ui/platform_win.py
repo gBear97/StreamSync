@@ -240,10 +240,9 @@ class Adapter(adapter.PlatformAdapter):
     # --- seam 4: installing an update (worker thread) ---------------------------------
 
     def _installed_target(self):
-        # Step 3 adds the installer's API; without it this copy can only
-        # point at the Releases page.
-        f = getattr(updater, "installed_exe_path", None)
-        return f() if f else None
+        # None for a copy the installer did not put there (a source
+        # checkout, an unzipped build): it can only point at the Releases page.
+        return updater.installed_exe_path()
 
     def _install_update(self, path, target, say):
         # The installer runs from `path`'s folder once the app has quit,

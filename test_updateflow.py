@@ -8,9 +8,9 @@ every check is deterministic. Covered:
 - a check always answers once - update, update_none or update_err - and
   only one runs at a time; every answer reaches the Settings line;
 - a newer release opens the offer once, and says when this copy cannot
-  install it (Windows without the installer's exe);
-- the download goes through the signed-updates API when updater has
-  verified_sums, and through main's SHA256SUMS URL when it does not;
+  install it (Windows not run from the installer's folder);
+- the download goes through updater's signed-checksums API with the
+  release itself;
 - Cancel removes the download folder and posts update_cancelled; a
   failure posts update_failed with the reason and removes it too;
 - progress posts at most one event per percent (per MB with no size);
@@ -63,23 +63,23 @@ RELEASES_PAGE = "https://github.com/gBear97/StreamSync/releases/latest"
 
 
 class FakeUpdater:
-    """main's updater API (signed=False) or Step 3's (signed=True)."""
+    """updater's API. exe is the installed StreamSync.exe that
+    installed_exe_path names (None: a copy the installer did not put
+    there)."""
 
     SUMS_ASSET = "SHA256SUMS"
     RELEASES_PAGE = RELEASES_PAGE
     UpdateError = UpdateError
 
-    def __init__(self, signed=False, exe=None):
+    def __init__(self, exe=None):
         self.available = ("v9.9.9", {"tag_name": "v9.9.9"})
         self.downloads = []
         self.total = 10 * MiB
         self.chunk = 4096
         self.during = None           # called after the first progress call
         self.download_error = None
-        if signed:
-            self.verified_sums = lambda rel, key=None: ""
-        if exe is not None:
-            self.installed_exe_path = lambda: exe
+        self.verified_sums = lambda rel, key=None: ""
+        self.installed_exe_path = lambda: exe
 
     def available_update(self):
         if isinstance(self.available, Exception):
@@ -204,7 +204,7 @@ class App(update.UpdateFlow):
 
 class WinApp(App):
     """Windows' own seam (ui/platform_win's _installed_target): the
-    installer's exe, which main's updater cannot name. It reads updater in
+    installer's exe, from updater.installed_exe_path. It reads updater in
     its own module, so that gets the same fake."""
 
     def _installed_target(self):
@@ -308,12 +308,12 @@ try:
     use(FakeUpdater())
     w = WinApp()
     w._on_update("v9.9.9", REL)
-    check("Windows on main's updater: the offer cannot install",
+    check("Windows not run from the installer's folder: the offer cannot install",
           (w._update_dialog.can_install, w._update_dialog.unavailable_text),
           (False, App.UPDATE_UNAVAILABLE))
     w._start_update("v9.9.9", REL)
     check("and Install does nothing", (w.drain(), w._update_running), ([], False))
-    use(FakeUpdater(signed=True, exe=r"C:\Programs\StreamSync\StreamSync.exe"))
+    use(FakeUpdater(exe=r"C:\Programs\StreamSync\StreamSync.exe"))
     w = WinApp()
     w._on_update("v9.9.9", REL)
     check("Windows with installed_exe_path: the offer installs", w._update_dialog.can_install,
@@ -322,7 +322,7 @@ try:
     m._on_update("v9.9.9", REL)
     check("a copy run from source cannot install", m._update_dialog.can_install, False)
 
-    # --- the download: Step 3's API, or main's ------------------------------
+    # --- the download ---------------------------------------------------------
     def run(fake, app=None, tag="v9.9.9", rel=REL):
         use(fake)
         app = app or App()
@@ -330,22 +330,7 @@ try:
         app._start_update(tag, rel)
         return app
 
-    up = FakeUpdater(signed=False)
-    a = run(up)
-    asset, second, dest = up.downloads[0]
-    check("main's updater gets the SHA256SUMS url", (asset, second),
-          (DMG, "https://x/sums"))
-    events = a.drain()
-    check("main's updater: the verified text", ("update_step", "Checksum verified. Installing...")
-          in events, True)
-    shutil.rmtree(dest, ignore_errors=True)
-
-    up = FakeUpdater(signed=False)
-    a = run(up, rel={"tag_name": "v9.9.9", "assets": [DMG]})
-    check("no SHA256SUMS: None, which updater refuses", up.downloads[0][1], None)
-    shutil.rmtree(up.downloads[0][2], ignore_errors=True)
-
-    up = FakeUpdater(signed=True)
+    up = FakeUpdater()
     a = run(up)
     asset, second, dest = up.downloads[0]
     check("the signed updater gets the release itself", (asset, second), (DMG, REL))
@@ -378,7 +363,7 @@ try:
     check("update_ready closes the app once", a.closes, 1)
     shutil.rmtree(dest, ignore_errors=True)
 
-    up = FakeUpdater(signed=True)
+    up = FakeUpdater()
     up.total = 0                              # a release asset with no size
     a = run(up)
     events = a.drain()
@@ -386,7 +371,7 @@ try:
     check("no size: one event per MB", mbs, [0, 1, 2, 3])
     shutil.rmtree(up.downloads[0][2], ignore_errors=True)
 
-    use(FakeUpdater(signed=True))
+    use(FakeUpdater())
     a = App()
     a._start_update("v9.9.9", REL)
     a._start_update("v9.9.9", REL)
@@ -394,7 +379,7 @@ try:
     shutil.rmtree(update.updater.downloads[0][2], ignore_errors=True)
 
     # --- cancelling ------------------------------------------------------------
-    up = FakeUpdater(signed=True)
+    up = FakeUpdater()
     a = App()
     up.during = a._cancel_update              # Cancel, mid-download
     run(up, a)
@@ -410,7 +395,7 @@ try:
     check("update_cancelled closes the dialog", (a._update_dialog, a._update_running),
           (None, False))
 
-    up = FakeUpdater(signed=True)
+    up = FakeUpdater()
     up.total = 4096                           # one chunk: Cancel comes after the last one
     a = App()
     up.during = a._cancel_update
@@ -433,7 +418,7 @@ try:
                 "The downloaded app's signature is not intact")),
              "The downloaded app's signature is not intact"),
             ("no asset for this machine", None, "That release has no disk image for arm64.")):
-        up = FakeUpdater(signed=True)
+        up = FakeUpdater()
         a = App()
         if setup:
             setup(up, a)
@@ -467,8 +452,6 @@ try:
     a._open_releases_page()
     check("release notes open GitHub only", opened_urls,
           [REL["html_url"]] + [RELEASES_PAGE] * 4)
-    check("main's updater: the verified text", a._verified_text(),
-          "Checksum verified. Installing...")
 finally:
     update.threading = real_threading
     update.dialogs = real_dialogs
@@ -513,7 +496,7 @@ def real_dialog():
         settle()
 
     try:
-        up = use(FakeUpdater(signed=True))
+        up = use(FakeUpdater())
         up.download_error = UpdateError("Checksum mismatch for x.dmg")
         a = TkApp()
         a._on_update("v9.9.9", REL)
@@ -528,7 +511,7 @@ def real_dialog():
         root.update()
         check("real: the close box closes a failed update", a._update_dialog, None)
 
-        up = use(FakeUpdater(signed=True))
+        up = use(FakeUpdater())
         a = TkApp()
         a._on_update("v9.9.9", REL)
         d = a._update_dialog
@@ -539,7 +522,7 @@ def real_dialog():
         check("real: a cancelled update closes its dialog", (a._update_dialog, d._closed),
               (None, True))
 
-        up = use(FakeUpdater(signed=True))
+        up = use(FakeUpdater())
         a = TkApp()
         a._on_update("v9.9.9", REL)
         d = a._update_dialog
