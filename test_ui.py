@@ -792,9 +792,12 @@ def first_run(env, root, app):
     from version import __version__
     check("FirstRun shows without a film", app.first_frame.winfo_ismapped(), 1)
     from ui import theme
-    # its full size: a window kept at Tk's 200x200 default (CI's macOS
-    # runner, once) cuts off most of the board, and pack unmaps what is cut
-    full = (root.winfo_width() >= theme.px(560), root.winfo_height() >= theme.px(664))
+    # its full size, or as much as the screen allows: a minimum past the
+    # screen's maximum (CI's macOS runner, at 1024x768) left the window at
+    # Tk's 200x200 default, and pack unmapped what did not fit
+    maxw, maxh = root.wm_maxsize()
+    full = (root.winfo_width() >= min(theme.px(560), maxw),
+            root.winfo_height() >= min(theme.px(664), maxh))
     check("the main window is its full size", full, (True, True))
     if full != (True, True):
         # what Tk thought, for a runner whose window came out small

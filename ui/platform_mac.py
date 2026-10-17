@@ -133,11 +133,6 @@ class Adapter(adapter.PlatformAdapter):
         # Same exposure the first-run dialog had: launched from Finder this
         # window can come up titled but unpainted until something forces a draw.
         depcheck.present_window(self.root)
-        # Its size goes back to the content too. Fixed, it kept whatever Tk
-        # had measured by then - on CI's macOS runner the 200x200 default,
-        # which minsize does not undo on a window that is not resizable, so
-        # most of the window was cut off.
-        self._fit_to_content(self.root)
 
     def _present(self, toplevel):
         # A Finder-launched app's dialogs can come up unpainted too - the
@@ -146,12 +141,7 @@ class Adapter(adapter.PlatformAdapter):
         # present_window leaves the window fixed at the size it had then.
         # Hand the size back to the content, where it is everywhere else:
         # an error line, or the Update dialog's next view, would otherwise
-        # be cut off at the bottom.
-        self._fit_to_content(toplevel)
-
-    @staticmethod
-    def _fit_to_content(toplevel):
-        """Size the window by its content again; it stays where it is."""
+        # be cut off at the bottom. The window stays where it is.
         try:
             g = toplevel.geometry()
             at = re.search(r"[+-]", g).start()
