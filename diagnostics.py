@@ -476,7 +476,7 @@ def report():
         from depcheck import REQUIRED_PKGS
         needed = [imp for imp, _pip in REQUIRED_PKGS if imp != "vlc"]
     except Exception:
-        needed = ["numpy", "PIL", "mss", "imageio_ffmpeg", "soundcard"]
+        needed = ["numpy", "imageio_ffmpeg", "soundcard"]
     for mod in needed:
         try:
             __import__(mod)

@@ -436,7 +436,6 @@ redistributes it.
 ## Verify the matchers
 
 ```
-python test_matcher.py        # video: synthetic clip, expects <0.35 s error
 python test_audio_matcher.py  # audio: commentary noise, quiet scenes, offset files
 python test_controller.py     # sync decisions against a simulated stream
 python test_session.py        # a whole watch party on localhost

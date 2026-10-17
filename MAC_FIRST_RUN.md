@@ -24,11 +24,10 @@ python3 -m pip install -r requirements.txt
 ## 2. Prove the engine (no UI, no VLC, no permissions involved)
 
 ```
-python3 test_matcher.py
 python3 test_audio_matcher.py
 ```
 
-Both should end with `... TEST PASSED`. If these pass, the sync brain -
+It should end with `... TEST PASSED`. If it passes, the sync brain -
 the hard part - is fully working on Apple hardware.
 
 ## 3. Launch
@@ -59,10 +58,8 @@ the Multi-Output Device. In StreamSync open the *same* film file, type a
 rough position hint, hit **Sync**. It should match with a high score and
 start VLC playback at the right moment.
 
-## 6. Optional features, each with a one-time permission prompt
+## 6. Optional feature, with a one-time permission prompt
 
-- **Video sync method** (Sync menu > Sync by Video Capture):
-  needs *Screen Recording* permission.
 - **Show stream while paused** (Advanced menu): needs *Automation*
   permission (System Events) on first use.
 
@@ -84,8 +81,6 @@ sh build_app_mac.sh        # produces dist/StreamSync.app
 
 If something misbehaves, it's most likely one of these - all fixable:
 
-- Region selector rectangle offset on Retina/multi-monitor -> report
-  your display setup.
 - Widget spacing / fonts looking off in the main window.
 - The libvlc video window not appearing until playback starts (expected:
   it opens on first sync, not on file load).

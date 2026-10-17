@@ -40,16 +40,17 @@ jobs:
       # Engine, capture timing, controller decisions, fingerprints, the
       # relay, a whole watch party and the Mac shell's swap (over a fake
       # Tk) - none needs a sound card, a display or VLC. (test_windowctl /
-      # test_macwindowctl drive real windows and skip themselves off their
-      # platform.)
+      # test_macwindowctl / test_videomouse drive real windows and skip
+      # themselves off their platform; test_videomouse's libvlc hit-test
+      # also skips where VLC is not installed.)
       - name: Engine and session tests
         shell: bash
         run: |
           set -e
-          for t in test_audio_capture test_players test_controller test_matcher \
+          for t in test_audio_capture test_players test_controller \
                    test_audio_matcher test_fingerprint test_relay \
                    test_session test_updater test_netcerts test_diagnostics \
-                   test_macswap test_windowctl; do
+                   test_macswap test_windowctl test_videomouse; do
             echo "=== $t"
             python "$t.py"
           done

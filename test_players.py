@@ -383,6 +383,45 @@ def embedded_anchor():
         players.vlc, players._tk_nsview = saved
 
 
+class VolumeMP(AnchorMP):
+    """libvlc's volume, mute and subtitle-track calls, as recorded state."""
+
+    def __init__(self):
+        super().__init__()
+        self.vol, self.muted, self.spu = -1, True, 3
+
+    def audio_get_volume(self):
+        return self.vol
+
+    def audio_set_volume(self, v):
+        self.vol = v
+
+    def audio_set_mute(self, flag):
+        self.muted = flag
+
+    def video_get_spu(self):
+        if self.spu is None:
+            raise OSError("no vout yet")
+        return self.spu
+
+
+def embedded_volume():
+    """The video window's wheel and menu read and step the volume; it is
+    clamped to libvlc's 0-125 and never touches mute."""
+    mp = VolumeMP()
+    p = players.EmbeddedPlayer._around(None, mp)
+    assert p.volume() is None            # no audio output yet: -1
+    for asked, kept in ((130, 125), (-5, 0), (87.6, 87)):
+        p.set_volume(asked)
+        assert mp.vol == kept and p.volume() == kept, (asked, mp.vol)
+    assert mp.muted is True
+    assert p.current_subtitle() == 3
+    mp.spu = None
+    assert p.current_subtitle() == -1
+    print("embedded: volume clamped to 0-125, mute untouched; current "
+          "subtitle read, -1 when libvlc can't say")
+
+
 def main():
     # 1. the clock: dated position vs truth, despite stale, late events
     p, mp = make()
@@ -441,6 +480,9 @@ def main():
 
     # 6. embedded: the drawable is re-anchored on every load
     embedded_anchor()
+
+    # 7. embedded: volume and subtitle reads for the video window's menu
+    embedded_volume()
     print("PLAYERS TEST PASSED")
 
 

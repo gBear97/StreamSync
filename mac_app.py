@@ -1,6 +1,6 @@
 """StreamSync for macOS.
 
-Same engine as the Windows app (audio-first sync against a live stream),
+Same engine as the Windows app (audio sync against a live stream),
 with a Mac-shaped shell: a small, minimal main window - film, Sync,
 Resync, nudges, status - and every less-used option living in the native
 menu bar (Sync, Playback, Advanced menus).
@@ -15,7 +15,6 @@ Platform notes:
 
 import os
 import queue
-import subprocess
 import sys
 import tempfile
 import threading
@@ -25,10 +24,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from PIL import Image, ImageTk
-
 import audio_capture
-import capture
 import controller
 import depcheck
 import macwindowctl
@@ -69,27 +65,22 @@ class MacApp:
         # clear while a pause waits for the film to get out of fullscreen
         self._left_fullscreen = threading.Event()
         self._left_fullscreen.set()
-        self._preview_photo = None
 
         root.title(f"StreamSync {__version__}")
         root.resizable(False, False)
 
         # menu variables (created before menus reference them)
-        self.method_var = tk.StringVar(value="audio")
         self.player_var = tk.StringVar(value="embedded")
         self.mute_var = tk.BooleanVar(value=True)
         self.auto_var = tk.BooleanVar(value=False)
         self.follow_var = tk.BooleanVar(value=True)
         self.interval_var = tk.IntVar(value=30)
-        self.facecam_var = tk.StringVar(value="none")
-        self.mirror_var = tk.BooleanVar(value=False)
         self.swap_var = tk.BooleanVar(value=True)
         self.device_var = tk.StringVar(value="")
         self.streamapp_var = tk.StringVar(value="")
         self.sub_var = tk.StringVar(value="")
 
         self._build_main()
-        self._build_preview_window()
 
         try:
             self.player_backend = EmbeddedPlayer(None)  # libvlc's own window
@@ -99,9 +90,9 @@ class MacApp:
                 # blocked dialog looks identical to a hung app.
                 print(f"SELFTEST: VLC unavailable - {e}", file=sys.stderr)
                 raise SystemExit(2)
-            # The Advanced menu is built further down, so it does not
-            # exist yet - this dialog is the entire user interface in
-            # this failure, and has to carry the diagnosis itself.
+            # The main window is not up yet, so this dialog is the entire
+            # user interface in this failure and has to carry the
+            # diagnosis itself.
             diagnostics.log(f"player failed to start: {e}")
             messagebox.showerror("StreamSync - VLC problem", str(e))
             raise SystemExit(1)
@@ -129,7 +120,7 @@ class MacApp:
         frm = ttk.Frame(self.root, padding=(18, 14, 18, 12))
         frm.grid(sticky="nsew")
 
-        self.file_lbl = ttk.Label(frm, text="No film loaded  -  ⌘O",
+        self.file_lbl = ttk.Label(frm, text="No film loaded  -  File > Open Film...",
                                   font=("SF Pro Text", 13))
         self.file_lbl.grid(row=0, column=0, columnspan=6, sticky="w")
 
@@ -138,10 +129,6 @@ class MacApp:
         ttk.Label(row, text="around").pack(side="left")
         self.hint_var = tk.StringVar()
         ttk.Entry(row, textvariable=self.hint_var, width=9).pack(
-            side="left", padx=(6, 0))
-        ttk.Label(row, text="±").pack(side="left", padx=(8, 0))
-        self.window_var = tk.StringVar(value="2:00")
-        ttk.Entry(row, textvariable=self.window_var, width=6).pack(
             side="left", padx=(6, 0))
 
         row = ttk.Frame(frm)
@@ -172,38 +159,20 @@ class MacApp:
         self.status_lbl.grid(row=5, column=0, columnspan=6, sticky="w",
                              pady=(2, 0))
 
-    def _build_preview_window(self):
-        self.preview_win = tk.Toplevel(self.root)
-        self.preview_win.title("Capture preview")
-        self.preview_lbl = ttk.Label(self.preview_win,
-                                     text="No capture yet - preview appears "
-                                          "after a video-method sync.")
-        self.preview_lbl.pack(padx=12, pady=12)
-        self.preview_win.protocol("WM_DELETE_WINDOW", self.preview_win.withdraw)
-        self.preview_win.withdraw()
-
     # --------------------------------------------------------------- menus
 
     def _build_menus(self):
         m = tk.Menu(self.root)
 
         filem = tk.Menu(m, tearoff=0)
-        filem.add_command(label="Open Film...", accelerator="Command-O",
-                          command=self._choose_file)
+        filem.add_command(label="Open Film...", command=self._choose_file)
         filem.add_command(label="Load Subtitle File...",
                           command=self._load_sub_file)
         m.add_cascade(label="File", menu=filem)
 
         syncm = tk.Menu(m, tearoff=0)
-        syncm.add_command(label="Sync Now", accelerator="Command-S",
-                          command=self._sync)
-        syncm.add_command(label="Resync", accelerator="Command-R",
-                          command=self._resync)
-        syncm.add_separator()
-        syncm.add_radiobutton(label="Sync by Audio", variable=self.method_var,
-                              value="audio")
-        syncm.add_radiobutton(label="Sync by Video Capture (Experimental)",
-                              variable=self.method_var, value="video")
+        syncm.add_command(label="Sync Now", command=self._sync)
+        syncm.add_command(label="Resync", command=self._resync)
         syncm.add_separator()
         syncm.add_checkbutton(label="Auto Re-sync", variable=self.auto_var,
                               command=self._on_auto_toggle)
@@ -230,10 +199,8 @@ class MacApp:
         m.add_cascade(label="Session", menu=self.session_menu)
 
         playm = tk.Menu(m, tearoff=0)
-        playm.add_command(label="Play / Pause", accelerator="Command-P",
-                          command=self._toggle_pause)
+        playm.add_command(label="Play / Pause", command=self._toggle_pause)
         playm.add_command(label="Toggle Fullscreen",
-                          accelerator="Shift-Command-F",
                           command=self._toggle_fullscreen)
         playm.add_command(label="Show Video Window",
                           command=self._show_video_window)
@@ -253,24 +220,6 @@ class MacApp:
         m.add_cascade(label="Playback", menu=playm)
 
         advm = tk.Menu(m, tearoff=0)
-        advm.add_command(label="Select Capture Region...",
-                         command=self._select_region)
-        fcm = tk.Menu(advm, tearoff=0)
-        fcm.add_radiobutton(label="No Facecam Ignore Zone",
-                            variable=self.facecam_var, value="none")
-        for val, label in (("tl", "Ignore Top-Left Corner"),
-                           ("tr", "Ignore Top-Right Corner"),
-                           ("bl", "Ignore Bottom-Left Corner"),
-                           ("br", "Ignore Bottom-Right Corner")):
-            fcm.add_radiobutton(label=label, variable=self.facecam_var,
-                                value=val)
-        fcm.add_radiobutton(label="Custom Zone (drag it)...",
-                            variable=self.facecam_var, value="custom",
-                            command=self._select_facecam_rect)
-        advm.add_cascade(label="Facecam", menu=fcm)
-        advm.add_checkbutton(label="Stream Is Mirror-Flipped",
-                             variable=self.mirror_var)
-        advm.add_separator()
         self.device_menu = tk.Menu(advm, tearoff=0)
         self._rebuild_device_menu([])
         advm.add_cascade(label="Listen On", menu=self.device_menu)
@@ -281,87 +230,11 @@ class MacApp:
                              variable=self.swap_var,
                              command=self._save_config)
         advm.add_separator()
-        advm.add_command(label="Show Last Capture Preview",
-                         command=self.preview_win.deiconify)
-        advm.add_separator()
-        advm.add_command(label="Diagnostics...",
-                         command=self._show_diagnostics)
         advm.add_command(label="Check for Updates...",
                          command=lambda: self._check_updates(quiet=False))
         m.add_cascade(label="Advanced", menu=advm)
 
         self.root.config(menu=m)
-        self.root.bind_all("<Command-o>", lambda e: self._choose_file())
-        self.root.bind_all("<Command-s>", lambda e: self._sync())
-        self.root.bind_all("<Command-r>", lambda e: self._resync())
-        self.root.bind_all("<Command-p>", lambda e: self._toggle_pause())
-        self.root.bind_all("<Shift-Command-f>",
-                           lambda e: self._toggle_fullscreen())
-
-    # --------------------------------------------------------- diagnostics
-
-    def _show_diagnostics(self):
-        """The report in a window, with a button that copies it.
-
-        Reading a diagnosis off a screen and retyping it is how detail
-        gets lost, and detail is the entire point here - so the report is
-        selectable, copyable in one click, and already on disk.
-        """
-        win = tk.Toplevel(self.root)
-        win.title("StreamSync Diagnostics")
-        win.geometry("760x520")
-
-        frame = ttk.Frame(win, padding=8)
-        frame.pack(fill="both", expand=True)
-
-        text = tk.Text(frame, wrap="none", font=("Menlo", 11))
-        ybar = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
-        xbar = ttk.Scrollbar(frame, orient="horizontal", command=text.xview)
-        text.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
-        text.grid(row=0, column=0, sticky="nsew")
-        ybar.grid(row=0, column=1, sticky="ns")
-        xbar.grid(row=1, column=0, sticky="ew")
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-
-        text.insert("1.0", "Collecting...")
-        text.config(state="disabled")
-
-        btns = ttk.Frame(win, padding=(8, 0, 8, 8))
-        btns.pack(fill="x")
-        status = ttk.Label(btns, text="")
-
-        def fill(body):
-            text.config(state="normal")
-            text.delete("1.0", "end")
-            text.insert("1.0", body)
-            text.config(state="disabled")
-
-        def copy():
-            self.root.clipboard_clear()
-            self.root.clipboard_append(text.get("1.0", "end-1c"))
-            status.config(text="Copied.")
-
-        def reveal():
-            subprocess.run(["open", "-R", diagnostics.LOG_FILE], check=False)
-
-        ttk.Button(btns, text="Copy to Clipboard",
-                   command=copy).pack(side="left")
-        ttk.Button(btns, text="Show Log in Finder",
-                   command=reveal).pack(side="left", padx=(8, 0))
-        status.pack(side="left", padx=(8, 0))
-
-        # Spotlight and codesign make this take a moment; collecting it on
-        # the UI thread would look like the app had hung.
-        def work():
-            try:
-                body = diagnostics.report()
-                diagnostics.log_report("opened from the Advanced menu")
-            except Exception as e:
-                body = f"Could not collect diagnostics: {e!r}"
-            self.root.after(0, lambda: fill(body))
-
-        threading.Thread(target=work, daemon=True).start()
 
     # ------------------------------------------------------------ video
 
@@ -398,12 +271,14 @@ class MacApp:
         if not self.player_backend.embedded:
             if not self.player_backend.attach_tk(self.video_frame.winfo_id()):
                 # The pre-1.0.5 behavior, named instead of silent: sound
-                # with no picture reads as a broken film otherwise.
-                self._set_status(
-                    "Video embedding is unavailable here - playback will "
-                    "be audio-only. Advanced > Diagnostics... has details.")
+                # with no picture reads as a broken film otherwise. The
+                # full report goes to the log, and the status says where.
                 diagnostics.log("attach_tk failed: no NSView from Tk; "
                                 "playback continues without video")
+                where = diagnostics.log_report("attach_tk failed")
+                self._set_status(
+                    "Video embedding is unavailable here - playback will "
+                    f"be audio-only. Details: {where}")
 
     # ------------------------------------------------------------- updates
 
@@ -572,76 +447,24 @@ class MacApp:
             self._set_status("Loaded. Playback starts on first sync.")
         self._save_config()
 
-    def _select_region(self):
-        region = capture.RegionSelector(self.root).select()
-        if region:
-            self.ctl.region = region
-            self._set_status(f"Capture region set ({region[2]}x{region[3]} px).")
-            self._save_config()
-
-    def _select_facecam_rect(self):
-        if not self.ctl.region:
-            messagebox.showinfo("StreamSync", "Set the capture region first "
-                                              "(Advanced menu).")
-            self.facecam_var.set("none")
-            return
-        rect = capture.RegionSelector(self.root).select()
-        if not rect:
-            self.facecam_var.set("none")
-            return
-        zone = controller.zone_in_region(self.ctl.region, rect)
-        if zone is None:
-            messagebox.showinfo("StreamSync", "That zone is outside the "
-                                              "capture region - try again.")
-            self.facecam_var.set("none")
-            return
-        self.ctl.facecam_rect = zone
-        self._save_config()
-
-    def _ready(self, need_region):
+    def _ready(self):
         if not self.ctl.video_path:
-            messagebox.showinfo("StreamSync", "Open a film first (Cmd-O).")
-            return False
-        if need_region and not self.ctl.region:
-            messagebox.showinfo("StreamSync", "Select the capture region "
-                                              "first (Advanced menu).")
+            messagebox.showinfo("StreamSync", "Open a film first (File > "
+                                              "Open Film...).")
             return False
         return True
 
     def _sync(self, resync=False):
         if self.ctl.busy:
             return
-        method = self.method_var.get()
-        if not self._ready(need_region=(method == "video")):
+        if not self._ready():
             return
-        video = {"mute": self.mute_var.get()}
-        if method == "video":
-            self._set_status("Capturing stream frames...")
-            # Our windows must not cover the stream - least of all the film
-            # window, which is up from the moment a film loads: inside the
-            # capture region, the matcher would find our own picture.
-            hidden = [self.root]
-            if self.video_win.state() not in ("withdrawn", "iconic"):
-                hidden.append(self.video_win)
-            for win in hidden:
-                win.withdraw()
-            self.root.update()
-            video.update(mask=controller.build_mask(self.facecam_var.get(),
-                                                    self.ctl.facecam_rect),
-                         mirror=self.mirror_var.get(),
-                         hidden=hidden)
         run = self.ctl.resync if resync else self.ctl.sync
         try:
-            started = run(self.hint_var.get(), self.window_var.get(), method,
-                          **video)
+            started = run(self.hint_var.get(), mute=self.mute_var.get())
         except ValueError as e:
-            for win in video.get("hidden") or ():
-                win.deiconify()
             messagebox.showerror("StreamSync", str(e))
             return
-        if not started:
-            for win in video.get("hidden") or ():
-                win.deiconify()      # a sync was already running
         if started:
             self.sync_btn.state(["disabled"])
             self.resync_btn.state(["disabled"])
@@ -720,7 +543,7 @@ class MacApp:
         Asking again is safe: Tk only passes on a request that differs
         from the window's state, and macOS drops it again if it is still
         not ready. A window that never takes it is believed instead, so
-        the next Cmd-Shift-F does what it says.
+        the next Toggle Fullscreen does what it says.
         """
         if self._fs_until is None:
             return
@@ -751,7 +574,8 @@ class MacApp:
             messagebox.showinfo("StreamSync", "Leave the current session first.")
             return
         if not self.ctl.video_path:
-            messagebox.showinfo("StreamSync", "Open the film first (Cmd-O).")
+            messagebox.showinfo("StreamSync", "Open the film first (File > "
+                                              "Open Film...).")
             return
         dlg = tk.Toplevel(self.root)
         dlg.title("Host a Session")
@@ -825,7 +649,7 @@ class MacApp:
             return
         if not self.ctl.video_path:
             messagebox.showinfo("StreamSync", "Open your copy of the film first "
-                                              "(Cmd-O).")
+                                              "(File > Open Film...).")
             return
         dlg = tk.Toplevel(self.root)
         dlg.title("Join a Session")
@@ -911,7 +735,7 @@ class MacApp:
                 # macOS has not taken a request to leave: this pause's,
                 # made while the film was still on its way into fullscreen
                 # (a pause straight after a resume), or the user's own
-                # Cmd-Shift-F a moment ago. The film leaves once
+                # Toggle Fullscreen a moment ago. The film leaves once
                 # _settle_fullscreen asks again, and the browser must not
                 # be raised before then - a window that leaves fullscreen
                 # brings its app to the front, so the film would end up
@@ -1077,9 +901,6 @@ class MacApp:
                     self._stream_swap(payload[0])
                 elif kind == "swapdone":
                     self._swap_done(*payload)
-                elif kind == "show":
-                    for win in payload[0] or ():
-                        win.deiconify()
                 elif kind == "devices":
                     self._rebuild_device_menu(payload[0])
                     if not self.device_var.get() and payload[0]:
@@ -1087,8 +908,6 @@ class MacApp:
                         self._on_device_pick()
                 elif kind == "apps":
                     self._rebuild_streamapp_menu(payload[0])
-                elif kind == "preview":
-                    self._show_preview(payload[0])
                 elif kind == "update":
                     self._offer_update(payload[0], payload[1])
                 elif kind == "update_none":
@@ -1126,12 +945,6 @@ class MacApp:
         self.ctl.audio_device = self.device_var.get()
         self._save_config()
 
-    def _show_preview(self, gray_img):
-        img = Image.fromarray((gray_img * 255).clip(0, 255).astype("uint8"))
-        img.thumbnail((320, 180))
-        self._preview_photo = ImageTk.PhotoImage(img)
-        self.preview_lbl.config(image=self._preview_photo, text="")
-
     def _set_status(self, text):
         self.status_lbl.config(text=text)
 
@@ -1148,12 +961,8 @@ class MacApp:
 
     def _save_config(self):
         self.ctl.save_config({
-            "window": self.window_var.get(),
             "hint": self.hint_var.get(),
-            "method": self.method_var.get(),
             "player": self.player_var.get(),
-            "facecam": self.facecam_var.get(),
-            "mirror": self.mirror_var.get(),
             "swap": self.swap_var.get(),
             "stream_app": self.stream_app,
         })
@@ -1168,17 +977,10 @@ class MacApp:
             self._show_video_window()
             self.ctl.load_file(path)
             self.file_lbl.config(text=Path(path).name)
-        if cfg.get("window"):
-            self.window_var.set(cfg["window"])
         if cfg.get("hint"):
             self.hint_var.set(cfg["hint"])
-        if cfg.get("method") in ("audio", "video"):
-            self.method_var.set(cfg["method"])
         if self.ctl.audio_device:
             self.device_var.set(self.ctl.audio_device)
-        if cfg.get("facecam"):
-            self.facecam_var.set(cfg["facecam"])
-        self.mirror_var.set(bool(cfg.get("mirror", False)))
         self.interval_var.set(self.ctl.auto_interval)
         self.follow_var.set(self.ctl.auto_follow)
         self.swap_var.set(bool(cfg.get("swap", True)))

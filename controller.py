@@ -13,8 +13,6 @@ It talks to its shell only through the event queue, with the same
     ("status", text)     one line for the status bar
     ("session", text)    watch-party status
     ("swap", show)       bring the stream window forward (True) or back
-    ("show", token)      re-show windows hidden for a screen capture
-    ("preview", image)   the frame a video sync captured
     ("busy_off",)        a manual sync finished; re-enable its buttons
     ("auto_off", text)   auto mode gave up and switched itself off; untick
                          it as a manual uncheck would, and show `text`
@@ -28,26 +26,21 @@ import time
 import traceback
 from pathlib import Path
 
-import numpy as np
-
 import audio_capture
 import audio_matcher
-import capture
 import diagnostics
 import matcher
 import session
 from players import ExternalPlayer, VLCError
 
 CONFIG_PATH = Path.home() / ".streamsync.json"
-BURST_FRAMES = 4
-BURST_SPACING = 1 / 3      # seconds between captured frames (aligns with 12 fps scan)
+SEARCH_WINDOW = 120.0      # a hinted sync searches this far either side
 AUDIO_SYNC_SECONDS = 6.0   # manual sync recording length...
 AUDIO_RETRY_SECONDS = (12.0, 18.0)  # ...extended this far when it is weak
 AUTO_RECORD_SECONDS = 4.0  # auto-mode recording length
 AUTO_RETRY_SECONDS = 8.0   # one longer look before counting a failure
 AUTO_FAIL_GIVEUP = 3       # an auto check failing the same way this many
                            # times running is not a blip: stop, and say so
-LOW_CONFIDENCE = 0.55      # video-match trust threshold
 DRIFT_TOLERANCE = 0.35
 PAUSE_LOOK_BACK = 25.0     # resume search: behind the pause point...
 PAUSE_LOOK_AHEAD = 40.0    # ...and ahead of it, plus time since the pause
@@ -87,28 +80,6 @@ def trusted(score, z):
     return score >= audio_matcher.SCORE_OK and z >= audio_matcher.Z_OK
 
 
-def build_mask(mode, rect):
-    """Facecam ignore mask for the video matcher, or None."""
-    if mode in ("tl", "tr", "bl", "br"):
-        return matcher.corner_mask(mode)
-    if mode == "custom" and rect:
-        return matcher.rect_mask(*rect)
-    return None
-
-
-def zone_in_region(region, rect):
-    """A dragged screen rectangle as 0..1 coordinates of the capture
-    region, clipped to it; None when it misses the region."""
-    left, top, w, h = region
-    x0 = max(0.0, min((rect[0] - left) / w, 1.0))
-    y0 = max(0.0, min((rect[1] - top) / h, 1.0))
-    x1 = max(0.0, min((rect[0] + rect[2] - left) / w, 1.0))
-    y1 = max(0.0, min((rect[1] + rect[3] - top) / h, 1.0))
-    if x1 - x0 < 0.02 or y1 - y0 < 0.02:
-        return None
-    return (x0, y0, x1, y1)
-
-
 def playing_position_at(player, perf):
     """Where `player` was at perf_counter() time `perf`, if it is playing.
 
@@ -135,8 +106,6 @@ class SyncController:
         self._embedded_path = None   # the film the built-in player holds
         self.offset = 0.0            # user's accumulated nudge, seconds
         self.audio_device = ""       # substring of the capture device name
-        self.region = None           # video method: screen box
-        self.facecam_rect = None     # normalized custom ignore zone
         self.auto_enabled = False
         self.auto_follow = True
         self.auto_interval = 30
@@ -285,41 +254,33 @@ class SyncController:
             self._busy = False
         self.q.put(("busy_off",))
 
-    def sync(self, hint_text, window_text, method, **video):
+    def sync(self, hint_text, mute=True):
         """Search around the hint (or the whole film). Raises ValueError
-        for unparseable times; returns False if a sync is already running."""
+        for an unparseable hint; returns False if a sync is already
+        running."""
         center = parse_time(hint_text)
-        window = parse_time(window_text) or 120.0
         if center is None:
-            return self.search(None, None, method, **video)
-        return self.search(center - window, center + window, method, **video)
+            return self.search(None, None, mute)
+        return self.search(center - SEARCH_WINDOW, center + SEARCH_WINDOW,
+                           mute)
 
-    def resync(self, hint_text, window_text, method, **video):
+    def resync(self, hint_text, mute=True):
         """Search around where the film is now - mostly backwards, since a
         paused stream leaves the local copy ahead."""
         t = self.player.time()
         if t is None:
-            return self.sync(hint_text, window_text, method, **video)
-        try:
-            window = parse_time(window_text) or 120.0
-        except ValueError:
-            window = 120.0
+            return self.sync(hint_text, mute)
         here = t - self.offset          # where the stream should be
-        return self.search(here - window, here + 30.0, method, **video)
+        return self.search(here - SEARCH_WINDOW, here + 30.0, mute)
 
-    def search(self, a, b, method, mute=True, mask=None, mirror=False,
-               hidden=None):
-        """Start a sync in the background. `hidden` is an opaque token the
-        shell gets back as ("show", hidden) once the screen is captured."""
+    def search(self, a, b, mute=True):
+        """Start a sync of the stretch a..b (None for the whole film) in
+        the background."""
         if not self._claim():
             return False
         args = (a, b, self.player, self.offset, mute)
-        if method == "audio":
-            target = self._audio_worker
-        else:
-            target = self._video_worker
-            args += (mask, mirror, hidden)
-        threading.Thread(target=target, args=args, daemon=True).start()
+        threading.Thread(target=self._audio_worker, args=args,
+                         daemon=True).start()
         return True
 
     def _first_sync(self, player):
@@ -377,47 +338,8 @@ class SyncController:
     def _weak_hint():
         if IS_MAC:
             return "Check BlackHole routing, or try a louder scene."
-        return ("The commentary may be drowning the film audio; try a louder "
-                "scene or use video sync.")
-
-    def _video_worker(self, a, b, player, offset, mute, mask, mirror, hidden):
-        try:
-            first = self._first_sync(player)
-            if hidden:
-                time.sleep(0.3)  # let withdrawn windows actually leave the screen
-            burst_raw, t0 = capture.grab_burst(self.region, BURST_FRAMES,
-                                               BURST_SPACING)
-            self.q.put(("show", hidden))
-            hidden = None
-            self.q.put(("preview", burst_raw[0][0]))
-            burst = []
-            for img, dt in burst_raw:
-                if mirror:
-                    img = np.fliplr(img)
-                burst.append((matcher.prep_gray(img, mask), dt))
-            match_t, score = matcher.find_match(
-                self.video_path, burst, a, b, progress=self._say, mask=mask)
-            ok = score >= LOW_CONFIDENCE
-            self._log("sync", "video", a, b, match_t, score, None, None,
-                      applied=ok or first, offset=offset)
-            if ok or first:
-                self._say("Seeking...")
-                player.sync_seek(match_t, t0, offset)
-                player.set_mute(mute)
-                self.q.put(("swap", False))
-            msg = f"Matched stream video at {fmt_time(match_t)} (confidence {score:.2f})."
-            if not ok:
-                msg += (" Low confidence - " +
-                        ("used as a first guess; " if first else
-                         "NOT applied, playback left where it was; ") +
-                        "check the capture region, or set a facecam ignore zone.")
-            self._say(msg)
-        except Exception as e:
-            self._say(f"Sync failed: {e}")
-        finally:
-            if hidden:
-                self.q.put(("show", hidden))
-            self._release()
+        return ("The commentary may be drowning the film audio; try a "
+                "louder scene.")
 
     # ----------------------------------------------------------- auto mode
 
@@ -682,9 +604,7 @@ class SyncController:
         cfg = dict(ui)
         cfg.update({
             "video_path": self.video_path,
-            "region": self.region,
             "audio_device": self.audio_device,
-            "facecam_rect": self.facecam_rect,
             "auto_interval": self.auto_interval,
             "auto_follow": self.auto_follow,
             "relay_url": self.relay_url,
@@ -711,12 +631,6 @@ class SyncController:
             return {}
         if not isinstance(cfg, dict):
             return {}
-        region = cfg.get("region")
-        if region and len(region) == 4:
-            self.region = tuple(int(v) for v in region)
-        rect = cfg.get("facecam_rect")
-        if rect and len(rect) == 4:
-            self.facecam_rect = tuple(float(v) for v in rect)
         self.audio_device = cfg.get("audio_device", "") or ""
         try:
             self.auto_interval = max(10, int(cfg.get("auto_interval", 30)))
