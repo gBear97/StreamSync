@@ -27,8 +27,9 @@ class PlatformAdapter:
 
     NAME = ""                          # "windows" or "mac"
     # Whether the film window takes the mouse - double-click, wheel, the
-    # right-click menu - and shows the fullscreen bar. The Mac's stay off
-    # until they have been checked by hand there; keys work on both.
+    # right-click menu - and shows the fullscreen bar. Both platforms do;
+    # it is the one switch that turns them off on a platform where they
+    # misbehave. Keys work either way.
     FILM_CONTROLS = True
     # Give the film window the keyboard once fullscreen settles. On the
     # Mac, entering fullscreen does not make the film's window key, so
@@ -139,7 +140,8 @@ class PlatformAdapter:
         film window took the last request. Default: nothing."""
 
     def _fullscreen_from_window(self):
-        """Called before a user's F, Esc or fullscreen toggle: bring
+        """Called before a user's F, Esc or fullscreen toggle, and when the
+        bar finds it may not show (_bar_allowed false): bring
         self.fullscreen in line with the window, which the system can
         change behind the app's back. Default: nothing."""
 

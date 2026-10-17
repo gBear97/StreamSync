@@ -1130,14 +1130,16 @@ def update_views(env, root, app):
 
 
 def bar_shot(env, root, app):
-    """08-bar: Windows only (the Mac's bar comes in Step 5). fullscreen
-    is set as a stand-in over a windowed film."""
+    """08-bar. fullscreen is set as a stand-in over a windowed film - on
+    the Mac's adapter too, which otherwise asks the window itself whether
+    it really is fullscreen before the bar may show."""
     vw = app.video_win
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     vw.geometry(f"{min(1280, sw - 80)}x{min(720, sh - 80)}+40+40")
     app._show_video_window()
     pump(root, 0.3)
     app.fullscreen = True
+    app._bar_allowed = lambda: True
     app._fs_moved = time.monotonic()         # as a mouse move over the film does
     try:
         app._show_fs_bar()
@@ -1146,6 +1148,7 @@ def bar_shot(env, root, app):
         shot(root, vw, "08-bar", on_top=False)
     finally:
         app._hide_fs_bar()
+        del app._bar_allowed
         app.fullscreen = False
         pump(root, 0.1)
 
@@ -1254,8 +1257,7 @@ def with_display(env):
         phase("Settings", settings, env, root, app)
         phase("Watch party", watch_party, env, root, app)
         phase("Update", update_views, env, root, app)
-        if sys.platform == "win32":
-            phase("the fullscreen bar", bar_shot, env, root, app)
+        phase("the fullscreen bar", bar_shot, env, root, app)
         phase("config written", config_written, env, root, app)
         phase("window titles", titles, env, root, app)
         check("the stream swap stand-in saw the pause", env.swaps[:1], [True])
