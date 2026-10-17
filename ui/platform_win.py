@@ -26,7 +26,10 @@ class Adapter(adapter.PlatformAdapter):
     NAME = "windows"
     FILM_CONTROLS = True
     FOCUS_FILM_ON_FULLSCREEN = False
+<<<<<<< HEAD
     OVERLAYS_PER_FULLSCREEN = False
+=======
+>>>>>>> origin/main
     WITHDRAW_FILM_FOR_EXTERNAL = True
     MENU_BUTTONS = ("<Button-3>",)
     SIDEWAYS_WHEEL = ()
