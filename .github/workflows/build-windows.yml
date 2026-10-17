@@ -3,7 +3,10 @@ name: Windows release build
 # Builds StreamSync's Windows installer for a release and attaches it to
 # that release. The Release workflow calls this for every new version, and
 # it can be run by hand (Actions > Windows release build > Run workflow) to
-# add a Windows build to a release that went out without one.
+# add a Windows build to a release that went out without one - including
+# one tagged before the installer existed: the app is built from the tag,
+# and only the tooling the tag lacks (installer script, signing script)
+# comes from the commit this workflow runs from.
 #
 # The download is a per-user installer (installer/StreamSync.iss): no admin
 # prompt, into %LOCALAPPDATA%\Programs\StreamSync, which is where the app's
@@ -58,7 +61,10 @@ jobs:
       # A new release has no tag yet - it is created when the draft is
       # published - so it builds the commit the Release workflow runs on.
       # A release that is already out is rebuilt from its own tag, not
-      # from whatever main has become since.
+      # from whatever main has become since. A tag from before the
+      # installer existed has no installer script or signing script; those
+      # are build tooling, not part of the app, so they come from this
+      # workflow's own commit - only where the tag has none of its own.
       - name: Check out the release's commit
         env:
           EVENT: ${{ github.event_name }}
@@ -67,6 +73,12 @@ jobs:
           if [ "$EVENT" != "pull_request" ] &&
              git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             git checkout -q "refs/tags/$TAG"
+            for tool in installer/StreamSync.iss ci/sign_sums.sh; do
+              if ! git cat-file -e "HEAD:$tool" 2>/dev/null; then
+                git checkout -q "$GITHUB_SHA" -- "$tool"
+                echo "$TAG has no $tool; using the one from $(git rev-parse --short "$GITHUB_SHA")."
+              fi
+            done
           fi
           FILE=$(python -c 'from version import __version__; print(__version__)')
           if [ "$EVENT" = "pull_request" ]; then
@@ -173,6 +185,14 @@ jobs:
               f.write("\n".join(new) + "\n")
           print("\n".join(new))
           EOF
+          # sign_sums.sh checks the secret against updater.RELEASE_KEY with
+          # sigcheck. A tag from before signed releases has neither, so take
+          # both from this workflow's commit. The app is already built and
+          # packed by now, so this changes nothing that ships.
+          if ! git cat-file -e HEAD:sigcheck.py 2>/dev/null ||
+             ! git grep -q '^RELEASE_KEY' HEAD -- updater.py; then
+            git checkout -q "$GITHUB_SHA" -- sigcheck.py updater.py
+          fi
           bash ci/sign_sums.sh SHA256SUMS
           gh release upload "$TAG" SHA256SUMS SHA256SUMS.sig \
             --repo "$GITHUB_REPOSITORY" --clobber

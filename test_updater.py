@@ -196,8 +196,30 @@ check("another key's signature", sigcheck.verify(
 for label, args in (("short key", (pk1[:31], b"", sig1)),
                     ("short signature", (pk1, b"", sig1[:63])),
                     ("not bytes", ("key", b"", sig1)),
-                    ("s out of range", (pk1, b"", sig1[:32] + b"\xff" * 32))):
+                    ("s = L", (pk1, b"", sig1[:32]
+                               + sigcheck.L.to_bytes(32, "little"))),
+                    ("s all ones", (pk1, b"", sig1[:32] + b"\xff" * 32))):
     check(label, sigcheck.verify(*args), False)
+
+# Malleability (RFC 8032 5.1.7): (R, s + L) satisfies the group equation
+# exactly as (R, s) does, since [L]B is the identity - only the s < L
+# check turns it away. Each case first proves the equation still holds,
+# so this fails if that check is dropped or loosened (say to s >= 2L).
+for i, (pk, msg, sig) in enumerate(RFC, 1):
+    pk, msg, sig = bytes.fromhex(pk), bytes.fromhex(msg), bytes.fromhex(sig)
+    s_plus_l = int.from_bytes(sig[32:], "little") + sigcheck.L
+    check(f"RFC test {i}, s + L still fits in 32 bytes",
+          s_plus_l < 2 ** 256, True)
+    malleated = sig[:32] + s_plus_l.to_bytes(32, "little")
+    h = int.from_bytes(hashlib.sha512(sig[:32] + pk + msg).digest(),
+                       "little") % sigcheck.L
+    check(f"RFC test {i}, s + L passes the group equation",
+          sigcheck._equal(sigcheck._mul(s_plus_l, sigcheck.G),
+                          sigcheck._add(sigcheck._decompress(sig[:32]),
+                                        sigcheck._mul(h, sigcheck._decompress(pk)))),
+          True)
+    check(f"RFC test {i}, s + L rejected", sigcheck.verify(pk, msg, malleated),
+          False)
 
 # the app's own release key must at least be a point on the curve
 check("release key length", len(updater.RELEASE_KEY), 32)
