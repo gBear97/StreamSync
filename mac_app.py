@@ -315,8 +315,8 @@ class MacApp:
         if not messagebox.askyesno(
                 "StreamSync - update available",
                 f"Version {tag} is available. You have {__version__}.\n\n"
-                "StreamSync will download it, check it against the checksum "
-                "published with the release, then restart into the new "
+                "StreamSync will download it, check it against the release's "
+                "signed checksums, then restart into the new "
                 "version. Your settings are kept.\n\nUpdate now?"):
             return
 
@@ -337,9 +337,6 @@ class MacApp:
         def work():
             try:
                 asset = updater.pick_asset(rel.get("assets", []))
-                sums = next((a["browser_download_url"]
-                             for a in rel.get("assets", [])
-                             if a.get("name") == updater.SUMS_ASSET), None)
 
                 def progress(done, total):
                     if total:
@@ -350,7 +347,7 @@ class MacApp:
                              f"{done // 1024 // 1024} MB"))
 
                 tmp = tempfile.mkdtemp(prefix="streamsync-dl-")
-                dmg = updater.download_verified(asset, sums, tmp, progress)
+                dmg = updater.download_verified(asset, rel, tmp, progress)
                 say("Checksum verified. Installing...")
                 staged = updater.stage(dmg, app_path, say)
                 say("Restarting into the new version...")
