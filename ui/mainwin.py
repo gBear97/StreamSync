@@ -69,7 +69,15 @@ class MainWindow:
 
     def _build_main(self):
         px = theme.px
-        self.root.minsize(px(560), px(664))
+        # Never more than the screen allows a window. On a small screen
+        # (CI's 1024x768, or a 13-inch Mac set to "Larger Text") a minimum
+        # taller than that maximum left Tk at its 200x200 default, with
+        # most of the board cut off.
+        try:
+            maxw, maxh = (int(v) for v in self.root.wm_maxsize())
+        except (TypeError, ValueError, AttributeError, tk.TclError):
+            maxw = maxh = 1 << 20    # a stand-in Tk (tests) has no screen
+        self.root.minsize(min(px(560), maxw), min(px(664), maxh))
         outer = tk.Frame(self.root, bg=theme.GROUND)
         outer.pack(fill="both", expand=True, padx=px(26), pady=(px(22), px(20)))
 
