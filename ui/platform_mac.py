@@ -12,7 +12,6 @@
   again through System Events (macwindowctl, osascript). Each round trip
   can block for seconds, so they run on a worker thread (_swap_worker),
   and the result comes back through the queue as "swapdone".
-<<<<<<< HEAD
 - The film window's mouse controls and fullscreen bar are Windows' own
   (ui/video.py). The bar only shows over a window that really is
   fullscreen (_bar_allowed), and goes before the window leaves
@@ -20,8 +19,6 @@
   out onto the browser a stream pause raises. The wheel's direction
   follows the fingers, whatever the scroll-direction setting
   (_wheel_sign).
-=======
->>>>>>> origin/main
 - The app menu: About, Settings (Command-,) and Quit (Command-Q), which
   goes through the app's own close.
 - An update swaps the installed .app for the new one and relaunches.
@@ -63,7 +60,6 @@ FULLSCREEN_SETTLE = 3.0
 
 class Adapter(adapter.PlatformAdapter):
     NAME = "mac"
-<<<<<<< HEAD
     # The film window's mouse controls and the fullscreen bar, as on
     # Windows. They work here because players.attach_tk turns libvlc's
     # mouse input on and its key input off (the two overlay probes), and
@@ -72,12 +68,6 @@ class Adapter(adapter.PlatformAdapter):
     FILM_CONTROLS = True
     FOCUS_FILM_ON_FULLSCREEN = True
     OVERLAYS_PER_FULLSCREEN = True
-=======
-    # Step 5 turns the film window's mouse controls and the bar on, once
-    # they have been checked by hand on a Mac.
-    FILM_CONTROLS = False
-    FOCUS_FILM_ON_FULLSCREEN = True
->>>>>>> origin/main
     WITHDRAW_FILM_FOR_EXTERNAL = False
     MENU_BUTTONS = ("<Button-3>", "<Button-2>", "<Control-Button-1>")
     SIDEWAYS_WHEEL = ("<Shift-MouseWheel>",)
@@ -297,28 +287,17 @@ class Adapter(adapter.PlatformAdapter):
         self._left_fullscreen.set()
         if self.fullscreen:
             # settled in fullscreen, now that the screen shows it: the
-<<<<<<< HEAD
             # film takes the keyboard and shows the bar - a fullscreen
             # handed back after a stream pause included
-=======
-            # film takes the keyboard (and, from Step 5, shows the bar)
->>>>>>> origin/main
             self._fullscreen_entered()
 
     def _fullscreen_from_window(self):
         # The green button and Ctrl-Cmd-F change the window behind the
-<<<<<<< HEAD
         # app's back; a user's F or Esc, and the bar, go by what the screen
         # shows. Only with no request in flight, which _settle_fullscreen
         # is still checking, and only once the film is in our window:
         # before that, fullscreen is libvlc's own, which the window knows
         # nothing of.
-=======
-        # app's back; a user's F or Esc goes by what the screen shows. Only
-        # with no request in flight, which _settle_fullscreen is still
-        # checking, and only once the film is in our window: before that,
-        # fullscreen is libvlc's own, which the window knows nothing of.
->>>>>>> origin/main
         if self._fs_until is None and self.embedded.embedded:
             self.fullscreen = self._window_fullscreen()
 
@@ -328,7 +307,6 @@ class Adapter(adapter.PlatformAdapter):
         return self._fs_until is None and self._window_fullscreen()
 
     def _bar_hold_stands(self):
-<<<<<<< HEAD
         # A click on the bar never takes the keyboard here (probe 2), so
         # the app still has it while a resync from the bar runs - unless
         # the user has gone to another app (Command-Tab to the browser).
@@ -339,11 +317,6 @@ class Adapter(adapter.PlatformAdapter):
             return self.root.focus_get() is not None
         except Exception:            # a widget path tkinter cannot resolve
             return True
-=======
-        # A click on the bar never takes the foreground here, so a held bar
-        # stays up. Step 5 revisits this with the bar on.
-        return True
->>>>>>> origin/main
 
     def _no_activate(self, toplevel, hook, hwnd):
         # Nothing to do: a click on the bar or the OSD leaves the film the
