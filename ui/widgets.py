@@ -614,7 +614,9 @@ class Check(_Toggle):
         if on:
             fill = theme.ACCENT_HOVER if self._hover else theme.ACCENT
             return fill, fill, theme.ON_ACCENT
-        return theme.FIELD, theme.FAINT if self._hover else theme.LINE, ""
+        # FAINT, not LINE: a LINE outline all but vanishes on a card
+        # (about 1.4:1), and a control's edge needs 3:1 to be seen
+        return theme.FIELD, theme.MUTED if self._hover else theme.FAINT, ""
 
     def _mark(self, x, y, box):
         fill, outline, mark = self._box_colours()
