@@ -791,6 +791,12 @@ def first_run(env, root, app):
     from ui import widgets
     from version import __version__
     check("FirstRun shows without a film", app.first_frame.winfo_ismapped(), 1)
+    from ui import theme
+    # its full size: a window kept at Tk's 200x200 default (CI's macOS
+    # runner, once) cuts off most of the board, and pack unmaps what is cut
+    check("the main window is its full size",
+          (root.winfo_width() >= theme.px(560), root.winfo_height() >= theme.px(664)),
+          (True, True))
     check("Main is hidden without a film", app.main_frame.winfo_ismapped(), 0)
     shown = texts(app.root)
     for s in ("Open the film you're watching along to", "Your own copy, on this computer.",
