@@ -541,6 +541,7 @@ def fs_bar(root, a):
     a._set_fullscreen(True)
     move(root, a, 12, 10)
     assert shown(a)
+    bar = a.fs_bar                         # the Mac makes it again on entry
     assert a._fs_play.cget("text") == "Pause"
     assert a._fs_time.cget("text") == "12:34", a._fs_time.cget("text")
     assert a._fs_len.cget("text") == "1:52:30", a._fs_len.cget("text")
@@ -1017,6 +1018,7 @@ def bar_follows_film(root, a):
     a._set_fullscreen(True)
     move(root, a, 80, 30)
     assert shown(a)
+    bar = a.fs_bar                         # the Mac makes it again on entry
     win.geometry("800x450+60+50")
     move(root, a, 81, 30)                        # and keep it up
     pump(root, 0.2)
@@ -1235,6 +1237,45 @@ def vout_hits(root, a):
           "a click there still lands on our frame")
 
 
+def overlays_per_fullscreen(root, a):
+    """The Mac makes the bar and the volume overlay again as fullscreen
+    begins: macOS keeps a window on the Space it was first shown on, and
+    a bar made at startup showed on the desktop, behind the fullscreen
+    film. What the app had told the old bar carries over. Windows keeps
+    the one bar."""
+    old_bar = a.fs_bar
+    a._fs_status.config(text="Synced (test)")
+    for b in (a._fs_resync, a._fs_full):
+        b.config(state="disabled")
+    a._fs_hold = True
+    a._flash_osd("Volume 50%", ms=10000)
+    old_osd = a._osd_win
+    try:
+        a._set_fullscreen(True)
+        pump(root, 0.2)
+        assert shown(a)
+        if a.OVERLAYS_PER_FULLSCREEN:
+            assert a.fs_bar is not old_bar and not old_bar.winfo_exists()
+            assert a._osd_win is None and not old_osd.winfo_exists()
+            assert a._osd_after is None
+        else:
+            assert a.fs_bar is old_bar and a._osd_win is old_osd
+        assert a._fs_status.cget("text") == "Synced (test)", a._fs_status.cget("text")
+        assert [b.cget("state") for b in (a._fs_resync, a._fs_full)] == ["disabled"] * 2
+        assert a._fs_hold
+        a._flash_osd("Volume 55%", ms=10)       # made again where it is needed
+        assert a._osd_win is not None and a._osd_win.winfo_exists()
+    finally:
+        a._fs_hold = False
+        for b in (a._fs_resync, a._fs_full):
+            b.config(state="normal")
+        a._fs_status.config(text="")
+        a._set_fullscreen(False)
+        pump(root, 0.2)
+    print("overlays " + ("made again on each fullscreen, the bar's state carried over"
+                         if a.OVERLAYS_PER_FULLSCREEN else "kept across fullscreen"))
+
+
 def main():
     wheel_steps()
     if sys.platform == "win32":
@@ -1275,6 +1316,7 @@ def main():
             if windows:
                 no_activate(root, a)
             keys(root, a)
+            overlays_per_fullscreen(root, a)
             if not windows:
                 film_keeps_keys(root, a)
                 left_behind_the_back(root, a)

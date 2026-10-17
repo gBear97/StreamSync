@@ -35,6 +35,11 @@ class PlatformAdapter:
     # Mac, entering fullscreen does not make the film's window key, so
     # Space, F and Esc over the film would go nowhere.
     FOCUS_FILM_ON_FULLSCREEN = False
+    # Make the bar and the volume overlay again each time fullscreen
+    # begins. macOS keeps a window on the Space it was first shown on, and
+    # a fullscreen film gets a new Space every time, so overlays made
+    # earlier would show on the desktop behind it.
+    OVERLAYS_PER_FULLSCREEN = False
     # Hide the built-in player's film window on a switch to the VLC app.
     # The Mac has always kept it up.
     WITHDRAW_FILM_FOR_EXTERNAL = True

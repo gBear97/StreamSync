@@ -347,6 +347,8 @@ class FilmWindow:
             # Mac: entering fullscreen didn't make the film's window key
             # (probe 2), so Space, F and Esc over it would go nowhere
             self.video_win.after(1, self.video_win.focus_force)
+        if self.OVERLAYS_PER_FULLSCREEN:
+            self._rebuild_overlays()
         if self.FILM_CONTROLS:
             # A mouse resting over the film brings no motion with it
             # (Windows only repeats the last position, which
@@ -354,6 +356,34 @@ class FilmWindow:
             # here: they show, then go with the pointer as usual.
             self._fs_moved = time.monotonic()
             self.video_win.after(1, self._show_fs_bar)
+
+    def _rebuild_overlays(self):
+        """Make the bar and the volume overlay again, on the Space the
+        fullscreen film is on now. Built once at startup, the bar showed
+        on the desktop's Space, behind the film; the overlay probes, which
+        built their bar after entering fullscreen, never met this. What the
+        rest of the app has told the bar is carried over."""
+        if self._fs_up:
+            self._hide_fs_bar()
+        if self._fs_after is not None:
+            self.video_win.after_cancel(self._fs_after)
+        status = self._fs_status.cget("text")
+        states = [b.cget("state") for b in (self._fs_resync, self._fs_full)]
+        # the pointer's last place and time too: a move repeating it is
+        # still not a move
+        kept = (self._fs_hold, self._fs_xy, self._fs_moved, self._fs_pos)
+        self.fs_bar.destroy()
+        self._build_fs_bar()
+        self._fs_status.config(text=status)
+        for b, state in zip((self._fs_resync, self._fs_full), states):
+            b.config(state=state)
+        self._fs_hold, self._fs_xy, self._fs_moved, self._fs_pos = kept
+        if self._osd_win is not None:
+            if self._osd_after is not None:
+                self.video_win.after_cancel(self._osd_after)
+                self._osd_after = None
+            self._osd_win.destroy()
+            self._osd_win = None      # _flash_osd makes it again when needed
 
     # ------------------------------------------------ fullscreen control bar
 

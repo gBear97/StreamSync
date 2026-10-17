@@ -67,6 +67,7 @@ class Adapter(adapter.PlatformAdapter):
     # and hidden before it leaves (_set_fullscreen).
     FILM_CONTROLS = True
     FOCUS_FILM_ON_FULLSCREEN = True
+    OVERLAYS_PER_FULLSCREEN = True
     WITHDRAW_FILM_FOR_EXTERNAL = False
     MENU_BUTTONS = ("<Button-3>", "<Button-2>", "<Control-Button-1>")
     SIDEWAYS_WHEEL = ("<Shift-MouseWheel>",)
