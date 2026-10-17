@@ -60,8 +60,10 @@ jobs:
       # and screens: they skip where there is no display, and test_ui runs
       # under a virtual one on Linux. (test_windowctl / test_macwindowctl /
       # test_videomouse drive real windows and skip themselves off their
-      # platform; test_videomouse's libvlc hit-test also skips where VLC
-      # is not installed.)
+      # platform: test_videomouse runs the film window's mouse controls,
+      # keys and bar on Windows and, with the Mac's bindings, on macOS,
+      # and skips on Linux. Its libvlc hit-test is Windows-only and also
+      # skips where VLC is not installed.)
       - name: Engine, session and UI tests
         shell: bash
         env:

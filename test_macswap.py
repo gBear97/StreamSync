@@ -46,8 +46,14 @@ Events round trip ran on. It runs on Windows and Linux too. What is tested:
 - leaving fullscreen hides the fullscreen bar first, before the window
   leaves and before the worker can raise the browser (the bar joins
   every Space);
-- with the film window's mouse controls off (until Step 5 turns them on)
-  nothing but keys is bound on it, and the bar never shows;
+- the film window takes the mouse as on Windows, with the Mac's own
+  buttons (Button-2, Control-click) and sideways scrolling swallowed; the
+  bar shows only once fullscreen has settled and while the window really
+  is fullscreen, and a resync's hold on it stands only while the app has
+  the keyboard;
+- the wheel's direction follows the fingers: natural scrolling (the
+  default, or the setting unreadable) turns the deltas round, and the
+  setting is read once;
 - Space, Left, Right, F and Esc are bound on the main window, the film
   window and the bar;
 - a fullscreen the green button made is left by one Esc or one F;
@@ -162,6 +168,9 @@ class Window(Widget):
 
     def focus_force(self):
         self.focused += 1
+
+    def winfo_viewable(self):
+        return int(self.shown)
 
     def winfo_id(self):
         return 0x5EED
@@ -1136,21 +1145,101 @@ def test_leaving_hides_the_bar_first():
     print("fullscreen: leaving hides the bar first")
 
 
-MOUSE = ("Button", "Double", "MouseWheel", "Motion", "Enter", "Leave")
+FILM_MOUSE = ("<Double-Button-1>", "<MouseWheel>", "<Shift-MouseWheel>", "<Button-3>",
+              "<Button-2>", "<Control-Button-1>", "<Motion>")
 
 
-def test_film_mouse_controls_wait_for_step_5():
-    # Step 5 turns these on after they have been checked by hand; until
-    # then the film window takes keys only, and the bar never shows
-    assert platform_mac.Adapter.FILM_CONTROLS is False
+def bar_asked(app):
+    """Whether the film window has asked, for later, to show the bar."""
+    return any(fn == app._show_fs_bar for _, fn, _ in app.video_win.later)
+
+
+def test_film_mouse_controls_and_bar():
+    assert platform_mac.Adapter.FILM_CONTROLS is True
     app, mac = make()
-    mouse = [s for s, _ in app.video_win.bindings if any(m in s for m in MOUSE)]
-    assert not mouse, f"mouse bound on the film window: {mouse}"
-    app._toggle_fullscreen()
-    assert quiet_fullscreen(app) and fullscreen(app) == (True, True)
+    bound = dict(app.video_win.bindings)
+    missing = [s for s in FILM_MOUSE if s not in bound]
+    assert not missing, f"the film window lacks {missing}"
+    # sideways scrolling (Shift-wheel on Aqua) is swallowed, not a volume step
+    assert bound["<Shift-MouseWheel>"](types.SimpleNamespace(delta=40)) == "break"
+    app._place_fs_bar = lambda: None    # the fake Tk has no geometry to place by
+
+    # windowed: no bar
     app._show_fs_bar()
     assert not app._fs_up and not app.fs_bar.shown
-    print("film window: keys only, no bar, until Step 5")
+    # asked for, not yet settled: no bar - it would show at the old size,
+    # or over a window macOS is about to drop the request for
+    app.video_win.later.clear()
+    app._toggle_fullscreen()
+    assert app.fullscreen and app._fs_until is not None
+    app._show_fs_bar()
+    assert not app._fs_up and not app.fs_bar.shown
+    # settled: the film asks for the keyboard and the bar
+    assert quiet_fullscreen(app) and fullscreen(app) == (True, True)
+    assert focus_asked(app) and bar_asked(app)
+    app._show_fs_bar()
+    assert app._fs_up and app.fs_bar.shown
+    # the green button takes the window out behind the app's back: the
+    # bar's next tick hides it, and a move over the film brings nothing
+    app.video_win.fullscreen = False
+    app._fs_tick()
+    assert not app._fs_up and not app.fs_bar.shown
+    app._show_fs_bar()
+    assert not app._fs_up and not app.fs_bar.shown
+    print("film window: the mouse bound with the Mac's buttons; the bar only "
+          "over a settled, real fullscreen")
+
+
+def test_held_bar_stands_while_the_app_has_the_keyboard():
+    # a resync from the bar holds it up; gone to another app meanwhile
+    # (Command-Tab), the topmost bar must not sit over that app
+    app, mac = make()
+    app.root.focus_get = lambda: app.video_win
+    assert app._bar_hold_stands()
+    app.root.focus_get = lambda: None         # Tk: another app is active
+    assert not app._bar_hold_stands()
+
+    def unresolvable():
+        raise KeyError("#menu")                # focus on a Tk-made clone
+    app.root.focus_get = unresolvable
+    assert app._bar_hold_stands()
+    print("bar: a resync's hold stands only while the app has the keyboard")
+
+
+def test_wheel_follows_the_fingers():
+    runs = []
+
+    def answer(stdout, returncode=0):
+        def run(cmd, **kw):
+            runs.append(cmd)
+            if stdout is None:
+                raise OSError("no defaults here")
+            return types.SimpleNamespace(stdout=stdout, returncode=returncode)
+        return types.SimpleNamespace(run=run)
+
+    real = platform_mac.subprocess
+    try:
+        # natural scrolling, the key missing (never changed: natural),
+        # unreadable, and natural off
+        for stdout, code, sign in (("1\n", 0, -1), ("", 1, -1), (None, 0, -1), ("0\n", 0, 1)):
+            app, mac = make()
+            platform_mac.subprocess = answer(stdout, code)
+            runs.clear()
+            assert app._wheel_sign() == sign, (stdout, app._wheel_sign())
+            assert app._wheel_sign() == sign and len(runs) == 1, runs   # read once
+            assert runs[0][-1] == "com.apple.swipescrolldirection", runs
+    finally:
+        platform_mac.subprocess = real
+
+    # through the film window: fingers up under natural scrolling sends
+    # negative deltas, and turns the volume up
+    app, mac = make()
+    app._wheel_dir = -1
+    app.video_win.later.clear()
+    wheel = dict(app.video_win.bindings)["<MouseWheel>"]
+    wheel(types.SimpleNamespace(delta=-3))
+    assert (1, app._step_volume, (5,)) in app.video_win.later, app.video_win.later
+    print("wheel: natural scrolling turns the deltas round, read once; fingers up is louder")
 
 
 KEYS = ("<space>", "<Left>", "<Right>", "<KeyPress-f>", "<KeyPress-F>", "<Escape>")
@@ -1278,7 +1367,9 @@ def main():
     test_switch_to_embedded_shows_the_film_window()
     test_settled_fullscreen_gives_the_film_the_keyboard()
     test_leaving_hides_the_bar_first()
-    test_film_mouse_controls_wait_for_step_5()
+    test_film_mouse_controls_and_bar()
+    test_held_bar_stands_while_the_app_has_the_keyboard()
+    test_wheel_follows_the_fingers()
     test_keys_are_bound_everywhere()
     test_green_button_fullscreen_is_left_in_one_press()
     test_switch_to_external_leaves_fullscreen()

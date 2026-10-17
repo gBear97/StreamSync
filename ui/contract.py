@@ -296,6 +296,7 @@ STATE = {
         "_fs_hook", "_fs_hwnd", "_fs_up", "_fs_after", "_fs_xy", "_fs_moved", "_fs_hold",
         "_fs_pos", "_fs_time", "_fs_track", "_fs_len", "_fs_play", "_fs_stop",
         "_fs_frame_back", "_fs_frame_fwd", "_fs_resync", "_fs_full", "_fs_status",
+        "_fs_placed",
     ),
     "ui/update.py": (
         "_update_checking", "_update_offer", "_update_running", "_update_cancel",

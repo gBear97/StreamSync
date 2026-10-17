@@ -11,7 +11,7 @@ real screen:
 
     python3 test_macapp_live.py [/path/to/film]
 
-It takes over the screen for about two minutes. The film goes in and out
+It takes over the screen for about three minutes. The film goes in and out
 of fullscreen, a small helper window stands in for the stream's browser
 (no real browser is touched), and VLC opens for the External VLC steps
 and is closed again. It needs VLC, Automation permission for System
@@ -28,6 +28,16 @@ for the film's path and never written.
   C  External VLC and back, with a film opened and the film window closed
      meanwhile
   D  fullscreen asked for twice inside one animation
+  E  the film window's own controls over the fullscreen film: in by a
+     double-click, the bar up once fullscreen has settled, at the bottom
+     of the screen once the animation is over, the film holding the
+     keyboard; keys, the wheel (sideways ignored, mute kept), the bar
+     resting and coming back with the pointer, +-1 frame, the film menu
+     on Button-2 and Control-click; a pause by Space - the bar gone
+     before the stream app comes up, and back with the keyboard on the
+     resume - then Esc, F and F. Its events are Tk's own, generated in
+     the app (event_generate), not the system's: a real trackpad, a real
+     pointer and a lost first click on the bar stay hand checks.
 
 The picture itself is not looked at (that would need Screen Recording
 permission): "plays" means libvlc reports a video output in our window.
@@ -221,7 +231,37 @@ def state():
         "helper_visible": seen["helper_visible"],
         "helper_front": seen["helper_front"],
         "mine_front": seen["mine_front"],
+        "bar_up": bar_up(),
+        "bar_placed": bar_placed(),
+        "film_keys": film_keys(),
+        "cursor": app.video_frame.cget("cursor"),
     }
+
+
+def bar_up():
+    return bool(app._fs_up and app.fs_bar.winfo_viewable())
+
+
+def bar_placed():
+    """The bar centred, 40 px above the bottom of the film, which covers
+    the screen from its top - not where it was while still animating."""
+    vw, bar = app.video_win, app.fs_bar
+    if not bar_up():
+        return None
+    mid = bar.winfo_rootx() + bar.winfo_width() // 2
+    return (vw.winfo_rooty() == 0
+            and abs(mid - (vw.winfo_rootx() + vw.winfo_width() // 2)) <= 1
+            and bar.winfo_rooty() + bar.winfo_height()
+            == vw.winfo_rooty() + vw.winfo_height() - 40)
+
+
+def film_keys():
+    """Whether the film window has the keyboard."""
+    try:
+        w = app.root.focus_get()
+    except Exception:
+        return None
+    return w is not None and w.winfo_toplevel() is app.video_win
 
 
 def _tick():
@@ -283,6 +323,8 @@ def status():
 FULL = {"fs_flag": True, "fs_attr": True, "fills_screen": True}
 WINDOWED = {"fs_flag": False, "fs_attr": False, "fills_screen": False}
 FILM_FRONT = {"helper_visible": False, "mine_front": True}
+BAR = {"bar_up": True, "bar_placed": True, "film_keys": True}
+NO_BAR = {"bar_up": False}
 STREAM_FRONT = {"helper_visible": True, "helper_front": True}
 
 helper_proc = None
@@ -528,6 +570,164 @@ def script():
     app._toggle_fullscreen()
     yield 3.0
     check("D5 fullscreen off at the end", dict(**WINDOWED))
+
+    yield from film_controls()
+
+
+clicks = {"t": 10_000}        # Tk pairs presses into a double-click by their times
+
+
+def double_click():
+    for _ in range(2):
+        clicks["t"] += 100
+        for kind in ("<ButtonPress-1>", "<ButtonRelease-1>"):
+            app.video_frame.event_generate(kind, button=1, x=200, y=200,
+                                           time=clicks["t"])
+    clicks["t"] += 2000
+
+
+def key(name):
+    """A key as the system hands it to Tk: to whichever window has the
+    keyboard, so it only reaches the film if the film holds it."""
+    w = app.root.focus_get()
+    if w is not None:
+        w.event_generate(f"<KeyPress-{name}>")
+    return w
+
+
+def film_controls():
+    # the real pointer is wherever it is: a bar it happens to rest over
+    # would stay up, which is right but not what these steps look at
+    app._pointer_on_fs_bar = lambda: False
+    app.player.seek(10.0)                   # well clear of the clip's end
+    yield 1.0
+
+    double_click()
+    yield from until(lambda: app._fs_up, 4)
+    yield 1.5
+    check("E1 double-click: fullscreen, the bar up at the bottom of the "
+          "screen, the film holding the keyboard", dict(
+              playing=True, **FULL, **BAR))
+
+    seeks = []
+    seek_by = app._seek_by
+    app._seek_by = lambda d: (seeks.append(d), seek_by(d))
+    key("Right")
+    key("Left")
+    yield 0.3
+    check("E2 Right and Left over the film seek 5 s each way", dict(
+        playing=True, **FULL), note=f"seeks {seeks}")
+    if seeks != [5, -5]:
+        results[-1]["ok"] = False
+        results[-1]["wrong"]["seeks"] = f"{seeks!r}, wanted [5, -5]"
+        print(f"         FAIL E2: the keys sought {seeks}", flush=True)
+    del app._seek_by
+
+    # the wheel: a scroll from rest steps once at once, upward by the
+    # fingers whatever the scroll-direction setting; sideways does nothing
+    yield 0.4
+    vol0, muted0 = app.embedded.volume(), app.embedded.mp.audio_get_mute()
+    up = 3 * app._wheel_sign()               # fingers up, as this Mac reports it
+    app.video_frame.event_generate("<MouseWheel>", delta=up, x=200, y=200)
+    yield 0.3
+    vol1 = app.embedded.volume()
+    for _ in range(5):
+        app.video_frame.event_generate("<MouseWheel>", delta=60, x=200,
+                                       y=200, state=0x1)
+    yield 0.4
+    vol2 = app.embedded.volume()
+    check("E3 the wheel over the film: 5 louder, sideways nothing, still "
+          "muted", dict(**FULL), note=f"volume {vol0} -> {vol1} -> {vol2}")
+    want = min(125, (100 if vol0 is None else vol0) + 5)
+    if (vol1, vol2) != (want, want) \
+            or app.embedded.mp.audio_get_mute() != muted0 \
+            or not app._osd_lbl.cget("text").startswith(f"Volume {want}%"):
+        results[-1]["ok"] = False
+        results[-1]["wrong"]["volume"] = (
+            f"{vol0} -> {vol1} -> {vol2}, wanted {want} twice; mute "
+            f"{muted0} -> {app.embedded.mp.audio_get_mute()}; OSD "
+            f"{app._osd_lbl.cget('text')!r}")
+        print(f"         FAIL E3: {results[-1]['wrong']['volume']}", flush=True)
+
+    yield app.FS_BAR_IDLE + 1.0
+    check("E4 a resting pointer: the bar and the pointer go", dict(
+        cursor="none", **NO_BAR, **FULL))
+    app.video_frame.event_generate("<Motion>", x=300, y=200)
+    # (and the film keeps the keyboard: the bar coming back can hand it
+    # to the main window up to 0.4 s later, and the film takes it back a
+    # moment after that - see FilmWindow._keep_film_keys - so the check
+    # waits for both)
+    yield 0.8
+    check("E5 a move: the bar and the pointer come back", dict(
+        cursor="", **BAR, **FULL))
+
+    offset, fps = app.ctl.offset, app._film_fps()
+    app._fs_frame_fwd.invoke()
+    yield 0.3
+    fwd = app.ctl.offset - offset
+    app._fs_frame_back.invoke()
+    app._fs_frame_back.invoke()
+    yield 0.3
+    back = app.ctl.offset - offset
+    check("E6 +1 frame, then -1 frame twice: the offset follows by a "
+          "frame at a time", dict(playing=True, film_keys=True, **FULL),
+          note=f"fps {fps}: {fwd:+.4f}, then {back:+.4f}")
+    if abs(fwd - 1 / fps) > 1e-6 or abs(back + 1 / fps) > 1e-6:
+        results[-1]["ok"] = False
+        results[-1]["wrong"]["offset"] = f"{fwd:+.4f}, {back:+.4f} at {fps} fps"
+        print(f"         FAIL E6: {results[-1]['wrong']['offset']}", flush=True)
+
+    # a real menu runs a native loop that waits for a human
+    popups = []
+    popup = app.video_menu.tk_popup
+    app.video_menu.tk_popup = lambda x, y: popups.append((x, y))
+    clicks["t"] += 2000
+    app.video_frame.event_generate("<ButtonPress-2>", button=2, x=300, y=200,
+                                   time=clicks["t"])
+    clicks["t"] += 2000
+    app.video_frame.event_generate("<ButtonPress-1>", button=1, x=300, y=200,
+                                   state=0x4, time=clicks["t"])
+    clicks["t"] += 2000
+    yield 0.4
+    app.video_menu.tk_popup = popup
+    check("E7 Button-2 and Control-click open the film menu, and stay in "
+          "fullscreen", dict(film_keys=True, **FULL), note=f"popups {popups}")
+    if len(popups) != 2:
+        results[-1]["ok"] = False
+        results[-1]["wrong"]["popups"] = f"{popups!r}, wanted two"
+        print(f"         FAIL E7: the menu opened {len(popups)} times", flush=True)
+
+    # Space pauses: the stream app comes up, and the bar - topmost, on
+    # every Space - is gone before it does
+    key("space")
+    hidden_at_once = not bar_up()
+    yield 4.0
+    check("E8 Space pauses: film out of fullscreen, no bar left on the "
+          "stream app", dict(playing=False, owes_fullscreen=True, **NO_BAR,
+                             **WINDOWED, **STREAM_FRONT),
+          note=f"bar hidden as the pause began: {hidden_at_once}")
+    if not hidden_at_once:
+        results[-1]["ok"] = False
+        results[-1]["wrong"]["bar"] = "still up as the pause began"
+        print("         FAIL E8: the bar was still up as the pause began", flush=True)
+    app._toggle_pause()
+    yield from until(lambda: app._fs_up, 6)
+    yield 1.0
+    check("E9 resume: fullscreen back, the bar up, the film holding the "
+          "keyboard again", dict(playing=True, owes_fullscreen=False,
+                                 **FULL, **FILM_FRONT, **BAR))
+
+    key("Escape")
+    yield 3.0
+    check("E10 Esc leaves fullscreen, the bar with it", dict(
+        playing=True, **WINDOWED, **NO_BAR))
+    key("f")
+    yield from until(lambda: app._fs_up, 4)
+    yield 1.5
+    check("E11 F goes back in, the bar up", dict(**FULL, **BAR))
+    key("F")
+    yield 3.0
+    check("E12 and F leaves again", dict(**WINDOWED, **NO_BAR))
 
 
 def finish():
