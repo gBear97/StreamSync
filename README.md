@@ -696,6 +696,18 @@ RELEASE_SIGNING_KEY="$(cat release-key.pem)" bash ci/sign_sums.sh "$f"
 The right key ends with `signed; the app's verifier accepts it`; any
 other says `RELEASE_SIGNING_KEY is not the key the app trusts`.
 
+Once the secret is saved, check the secret itself with the **Check the
+release signing key** workflow. It runs the same `ci/sign_sums.sh` on a
+throwaway file in under a minute, without making a release, and prints
+nothing of the key:
+
+```
+gh workflow run check-release-key.yml
+```
+
+It also runs on pull requests that touch `version.py`, `updater.py`,
+`sigcheck.py` or `ci/sign_sums.sh`.
+
 The private key **never goes in the repository**: it lives in the
 maintainer's password manager and in the repository secret, nowhere
 else; delete the `.pem` file once the secret is saved. At release time
