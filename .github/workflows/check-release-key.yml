@@ -1,0 +1,38 @@
+name: Check the release signing key
+
+# Proves the RELEASE_SIGNING_KEY secret is the key the apps trust, in
+# under a minute and without making a release. sign_sums.sh signs a
+# throwaway file and refuses a key whose public half is not
+# updater.RELEASE_KEY. A release would otherwise find out only in its
+# last job, after both Macs have notarized. Run it by hand after setting
+# or replacing the secret; it also runs on pull requests that touch the
+# key, the verifier or the version.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - version.py
+      - updater.py
+      - sigcheck.py
+      - ci/sign_sums.sh
+      - .github/workflows/check-release-key.yml
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Release signing key
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sign a throwaway file with the secret
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          f="$RUNNER_TEMP/SHA256SUMS"
+          echo "0000000000000000000000000000000000000000000000000000000000000000  check.txt" > "$f"
+          bash ci/sign_sums.sh "$f"
