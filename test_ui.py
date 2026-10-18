@@ -795,9 +795,12 @@ def first_run(env, root, app):
     # its full size, or as much as the screen allows: a minimum past the
     # screen's maximum (CI's macOS runner, at 1024x768) left the window at
     # Tk's 200x200 default, and pack unmapped what did not fit
+    # (the screen's maximum can move a point or two between the window
+    # being made and this check: CI's runner reported 647, then 649)
     maxw, maxh = root.wm_maxsize()
-    full = (root.winfo_width() >= min(theme.px(560), maxw),
-            root.winfo_height() >= min(theme.px(664), maxh))
+    slack = 4
+    full = (root.winfo_width() >= min(theme.px(560), maxw) - slack,
+            root.winfo_height() >= min(theme.px(664), maxh) - slack)
     check("the main window is its full size", full, (True, True))
     if full != (True, True):
         # what Tk thought, for a runner whose window came out small
@@ -1141,14 +1144,16 @@ def update_views(env, root, app):
 
 
 def bar_shot(env, root, app):
-    """08-bar: Windows only (the Mac's bar comes in Step 5). fullscreen
-    is set as a stand-in over a windowed film."""
+    """08-bar. fullscreen is set as a stand-in over a windowed film - on
+    the Mac's adapter too, which otherwise asks the window itself whether
+    it really is fullscreen before the bar may show."""
     vw = app.video_win
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     vw.geometry(f"{min(1280, sw - 80)}x{min(720, sh - 80)}+40+40")
     app._show_video_window()
     pump(root, 0.3)
     app.fullscreen = True
+    app._bar_allowed = lambda: True
     app._fs_moved = time.monotonic()         # as a mouse move over the film does
     try:
         app._show_fs_bar()
@@ -1157,6 +1162,7 @@ def bar_shot(env, root, app):
         shot(root, vw, "08-bar", on_top=False)
     finally:
         app._hide_fs_bar()
+        del app._bar_allowed
         app.fullscreen = False
         pump(root, 0.1)
 
@@ -1265,8 +1271,7 @@ def with_display(env):
         phase("Settings", settings, env, root, app)
         phase("Watch party", watch_party, env, root, app)
         phase("Update", update_views, env, root, app)
-        if sys.platform == "win32":
-            phase("the fullscreen bar", bar_shot, env, root, app)
+        phase("the fullscreen bar", bar_shot, env, root, app)
         phase("config written", config_written, env, root, app)
         phase("window titles", titles, env, root, app)
         check("the stream swap stand-in saw the pause", env.swaps[:1], [True])
