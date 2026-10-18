@@ -795,9 +795,12 @@ def first_run(env, root, app):
     # its full size, or as much as the screen allows: a minimum past the
     # screen's maximum (CI's macOS runner, at 1024x768) left the window at
     # Tk's 200x200 default, and pack unmapped what did not fit
+    # (the screen's maximum can move a point or two between the window
+    # being made and this check: CI's runner reported 647, then 649)
     maxw, maxh = root.wm_maxsize()
-    full = (root.winfo_width() >= min(theme.px(560), maxw),
-            root.winfo_height() >= min(theme.px(664), maxh))
+    slack = 4
+    full = (root.winfo_width() >= min(theme.px(560), maxw) - slack,
+            root.winfo_height() >= min(theme.px(664), maxh) - slack)
     check("the main window is its full size", full, (True, True))
     if full != (True, True):
         # what Tk thought, for a runner whose window came out small
