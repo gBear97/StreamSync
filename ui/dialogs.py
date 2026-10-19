@@ -21,6 +21,7 @@ checking the screens against the boards, at any scale.
 import math
 import tkinter as tk
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import controller
 import session
@@ -570,6 +571,23 @@ class SettingsDialog(_Dialog):
 # --- Watch party -------------------------------------------------------------
 
 
+def relay_address(text):
+    """The relay address the Relay server field holds, or None if it holds
+    none. An https:// or http:// address - what cloudflared prints for a
+    tunnel - stands for the wss:// or ws:// one, which is what is meant:
+    websockets refuses it as typed."""
+    text = text.strip()
+    try:
+        scheme = urlsplit(text).scheme
+        if scheme in ("https", "http"):
+            text = {"https": "wss", "http": "ws"}[scheme] + text[len(scheme):]
+        parts = urlsplit(text)
+        parts.port                    # a port that is no port raises
+    except ValueError:
+        return None
+    return text if parts.scheme in ("ws", "wss") and parts.hostname else None
+
+
 class WatchPartyDialog(_Dialog):
     """Host and Join side by side, the relay underneath; while a session
     runs, its code, its latest line and Leave instead."""
@@ -768,6 +786,19 @@ class WatchPartyDialog(_Dialog):
         lbl.config(text=text)
         _show(lbl, bool(text), side="bottom", anchor="w", after=btn, pady=(theme.px(12), 0))
 
+    def _relay(self, lbl, btn):
+        """The relay address in its field, shown as it will be used - an
+        https:// one as wss:// - or None, and why under `btn`, if there
+        is none: at once, not after the session's retries run out."""
+        url = relay_address(self.relay_var.get())
+        self.relay_field.set_error(url is None)
+        if url is None:
+            self.relay_field.entry.focus_set()
+            self._error(lbl, btn, "The relay server needs ws:// or wss://")
+            return None
+        self.relay_var.set(url)
+        return url
+
     def _host(self):
         app, ctl = self.app, self.app.ctl
         self._error(self.host_err, self.host_btn, "")
@@ -783,9 +814,12 @@ class WatchPartyDialog(_Dialog):
             self._error(self.host_err, self.host_btn, "2 to 45 seconds")
             return
         self.delay_field.set_error(False)
+        relay = self._relay(self.host_err, self.host_btn)
+        if relay is None:
+            return
         mic = self.mic_var.get()
         try:
-            ctl.host(self.relay_var.get().strip(),
+            ctl.host(relay,
                      self.host_pw.get().strip() or None,
                      from_player=self.src_var.get() == "player",
                      mic_name=None if mic == DEFAULT_MIC else (mic or None),
@@ -803,8 +837,11 @@ class WatchPartyDialog(_Dialog):
         self._error(self.join_err, self.join_btn, "")
         if not ctl.video_path:
             return
+        relay = self._relay(self.join_err, self.join_btn)
+        if relay is None:
+            return
         try:
-            ctl.join(self.relay_var.get().strip(), self.join_code.get().strip().upper(),
+            ctl.join(relay, self.join_code.get().strip().upper(),
                      self.join_pw.get().strip() or None, app.mute_var.get())
         except Exception as e:
             self._error(self.join_err, self.join_btn, f"Could not start: {e}")
