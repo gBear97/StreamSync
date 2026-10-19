@@ -22,6 +22,21 @@ def connect(url):
     return _connect(url).__enter__()   # as session.Link does
 
 
+def wait_for_relay(port, timeout=15):
+    """Until a relay just started accepts connections. A fixed 1.5 s
+    sleep was not always enough on CI's Intel Mac runner, where Python
+    can take longer than that to start and import websockets."""
+    end = time.monotonic() + timeout
+    while True:
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=1).close()
+            return
+        except OSError:
+            if time.monotonic() > end:
+                raise
+            time.sleep(0.1)
+
+
 def send(ws, obj):
     ws.send(json.dumps(obj))
 
@@ -56,7 +71,7 @@ def main():
     relay = subprocess.Popen([sys.executable, "relay_server.py",
                               "--port", str(PORT), "--host-grace", "2"])
     try:
-        time.sleep(1.5)
+        wait_for_relay(PORT)
 
         host = connect(URL)
         send(host, {"type": "create", "password": "swordfish",
