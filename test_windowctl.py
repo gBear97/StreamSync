@@ -5,6 +5,7 @@ a made-up list of windows: what Automatic picks."""
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 TITLE = "WinCtlTest-9271"
@@ -58,14 +59,29 @@ def main():
 
     stream_window_fallback(windowctl)
 
+    # The window's process says when its window is up: it creates `shown`
+    # once update() has mapped it. On a CI runner the part that varies is
+    # Tk() itself: usually under a second, now and then far longer - two
+    # runs failed at the old 10 s limit with the rest of their jobs at
+    # normal speed. That is the runner, not windowctl, so opening gets a
+    # minute. Finding the window, which is what this tests, still gets 5 s
+    # from when it is up; on the runners it took under 50 ms.
+    shown = os.path.join(tempfile.mkdtemp(), "shown")
     proc = subprocess.Popen([
         sys.executable, "-c",
         f"import tkinter as tk; r = tk.Tk(); r.title('{TITLE}'); "
-        "r.geometry('200x100+50+50'); r.mainloop()",
+        f"r.geometry('200x100+50+50'); r.update(); open({shown!r}, 'w')"
+        ".close(); r.mainloop()",
     ])
     try:
+        deadline = time.time() + 60
+        while not os.path.exists(shown):
+            assert proc.poll() is None, \
+                f"the test window's process exited ({proc.returncode})"
+            assert time.time() < deadline, "the test window never opened"
+            time.sleep(0.05)
         hwnd = None
-        deadline = time.time() + 10
+        deadline = time.time() + 5
         while time.time() < deadline and hwnd is None:
             for h, t in windowctl.list_windows():
                 if t == TITLE:
