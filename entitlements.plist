@@ -29,5 +29,16 @@
     <!-- Audio sync records from the loopback device (BlackHole). -->
     <key>com.apple.security.device.audio-input</key>
     <true/>
+
+    <!-- "Show the stream while the film is paused" drives System Events
+         through an osascript child, and macOS holds the app that started
+         it responsible. Under the hardened runtime TCC refuses Apple
+         Events outright without this - it never shows the Automation
+         prompt, and StreamSync never appears in that settings list - so
+         the swap did nothing in every signed release up to 2.0.2.
+         NSAppleEventsUsageDescription (build_app_mac.sh) is the prompt's
+         text; this is what lets the prompt happen at all. -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
 </dict>
 </plist>

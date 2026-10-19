@@ -48,6 +48,11 @@ from ui import adapter
 BROWSERS = ("Safari", "Google Chrome", "Firefox", "Arc", "Brave Browser",
             "Microsoft Edge", "Opera", "Vivaldi")
 
+# Where a refused swap is put right: the exact switch, since a refusal
+# leaves nothing on screen to follow.
+AUTOMATION_HINT = (" (allow StreamSync to control System Events in System "
+                   "Settings > Privacy & Security > Automation).")
+
 # macOS takes a moment to move a window into or out of fullscreen, and a
 # request made during that moment is dropped without a word: measured on
 # macOS 27 with Tk 8.6.16, one made up to 0.5 s after the last change was
@@ -439,9 +444,8 @@ class Adapter(adapter.PlatformAdapter):
             if not app_name:
                 if show:
                     if why is not None:
-                        self.q.put(("status", f"App swap failed: {why} (grant "
-                                              "Automation permission in System "
-                                              "Settings > Privacy)."))
+                        self.q.put(("status", f"App swap failed: {why}"
+                                              f"{AUTOMATION_HINT}"))
                     else:
                         self.q.put(("status", "Pick the stream's browser in "
                                               "Settings > Stream app first."))
@@ -475,9 +479,8 @@ class Adapter(adapter.PlatformAdapter):
                         macwindowctl.activate_app("VLC")
             except Exception as e:
                 self._swap_app = ""  # that app may have quit - look again
-                self.q.put(("status", f"App swap failed: {e} (grant "
-                                      "Automation permission in System "
-                                      "Settings > Privacy)."))
+                self.q.put(("status", f"App swap failed: {e}"
+                                      f"{AUTOMATION_HINT}"))
                 self.q.put(("swapdone", seq, show, False, shown))
                 continue
             self.q.put(("swapdone", seq, show, True, shown))

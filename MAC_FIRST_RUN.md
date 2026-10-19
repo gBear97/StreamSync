@@ -109,8 +109,12 @@ The film plays in StreamSync's own film window. Try:
 
 ## 7. Optional feature, with a one-time permission prompt
 
-- **Settings > Show the stream while the film is paused**: needs
-  *Automation* permission (System Events) on first use.
+- **Settings > Show the stream while the film is paused**: on the first
+  pause, macOS asks whether StreamSync may control *System Events*.
+  Answer **Allow**. To check it later, or to change a "Don't Allow",
+  look under **System Settings > Privacy & Security > Automation >
+  StreamSync**. Running from source (B), the prompt names your terminal
+  instead of StreamSync.
 
 ## 7.5 Watch parties (optional)
 

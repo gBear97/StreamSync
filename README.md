@@ -257,8 +257,11 @@ fullscreen).
   and the only way to show it.
 - **macOS**: pick the browser app under **Stream app** (*Automatic* takes
   the first browser it finds). The app comes forward during pauses and
-  hides on resume. macOS asks for *Automation* permission (System
-  Events) the first time.
+  hides on resume. macOS asks once whether StreamSync may control
+  *System Events*; answer **Allow**. If you answered no, switch it on
+  under **System Settings > Privacy & Security > Automation >
+  StreamSync > System Events**. (Up to 2.0.2 the signed app never got
+  as far as asking, so the swap did nothing there.)
 
 ## The film window
 
