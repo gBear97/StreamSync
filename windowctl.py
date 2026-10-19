@@ -6,9 +6,11 @@ has the film paused, then tuck it away again when the film resumes.
 """
 
 import ctypes
+import os
 from ctypes import wintypes
 
 user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
 
 SW_MINIMIZE = 6
 SW_RESTORE = 9
@@ -22,6 +24,15 @@ SWP_FRAMECHANGED = 0x0020
 MONITOR_DEFAULTTONEAREST = 2
 WM_MOUSEACTIVATE = 0x0021
 MA_NOACTIVATE = 3
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+# The programs a stream is watched in, known by their process's file name:
+# their window titles end in a dozen ways (Edge's "Microsoft Edge" holds a
+# zero-width space, Firefox's dash is an em dash).
+BROWSER_EXES = frozenset((
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
+    "vivaldi.exe", "chromium.exe", "arc.exe", "librewolf.exe", "waterfox.exe",
+    "floorp.exe", "zen.exe"))
 
 
 class MONITORINFO(ctypes.Structure):
@@ -34,10 +45,10 @@ WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
                              wintypes.WPARAM, wintypes.LPARAM)
 
 
-def _proto(name, restype, *argtypes):
+def _proto(name, restype, *argtypes, dll=user32):
     # Typed privately: windll.user32 is one object for the whole process,
     # so setting argtypes on it would change these calls for everyone.
-    return ctypes.WINFUNCTYPE(restype, *argtypes)((name, user32))
+    return ctypes.WINFUNCTYPE(restype, *argtypes)((name, dll))
 
 
 _MonitorFromWindow = _proto("MonitorFromWindow", wintypes.HMONITOR,
@@ -55,6 +66,14 @@ _GetForegroundWindow = _proto("GetForegroundWindow", wintypes.HWND)
 _CallWindowProcW = _proto("CallWindowProcW", LRESULT, ctypes.c_void_p,
                           wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
                           wintypes.LPARAM)
+_OpenProcess = _proto("OpenProcess", wintypes.HANDLE, wintypes.DWORD,
+                      wintypes.BOOL, wintypes.DWORD, dll=kernel32)
+_QueryFullProcessImageNameW = _proto(
+    "QueryFullProcessImageNameW", wintypes.BOOL, wintypes.HANDLE,
+    wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+    dll=kernel32)
+_CloseHandle = _proto("CloseHandle", wintypes.BOOL, wintypes.HANDLE,
+                      dll=kernel32)
 
 
 def monitor_rect(hwnd):
@@ -180,9 +199,29 @@ def find_by_pid(pid):
     return best
 
 
+def window_exe(hwnd):
+    """The file name of the program a window belongs to, lower case
+    ("chrome.exe"); "" if Windows won't say (an elevated process, a
+    window gone)."""
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
+    proc = _OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if not proc:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(len(buf))
+        if not _QueryFullProcessImageNameW(proc, 0, buf, ctypes.byref(size)):
+            return ""
+        return os.path.basename(buf.value).lower()
+    finally:
+        _CloseHandle(proc)
+
+
 def find_stream_window(preferred_hwnd=None, title_hint=""):
     """The stream's browser window: the pinned pick if still alive, else the
-    saved title, else anything that looks like Twitch/Kick."""
+    saved title, else anything that looks like Twitch/Kick, else the one
+    browser window open."""
     if preferred_hwnd and is_valid(preferred_hwnd):
         return preferred_hwnd
     wins = list_windows()
@@ -195,4 +234,8 @@ def find_stream_window(preferred_hwnd=None, title_hint=""):
         t = title.lower()
         if "twitch" in t or "kick.com" in t:
             return hwnd
-    return None
+    # A live stream's tab is titled "... - Twitch", but a VOD's is named
+    # after the VOD. A lone browser window is the stream; of several, any
+    # pick is a guess, and a wrong one is raised over the film every pause.
+    browsers = [hwnd for hwnd, _title in wins if window_exe(hwnd) in BROWSER_EXES]
+    return browsers[0] if len(browsers) == 1 else None

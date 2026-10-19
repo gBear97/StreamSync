@@ -17,6 +17,8 @@ It also pins what loading a film sends each player - external VLC's HTTP
 commands and command line, the embedded player's drawable and input
 flags - with fakes that record the calls, and the embedded player's frame
 rate and its exact step while paused (the fullscreen bar's +-1 frame).
+And external VLC's time, length and play state come from its poller,
+not from HTTP on the reading (Tk) thread, even while VLC hangs.
 """
 
 import os
@@ -294,6 +296,110 @@ def external_load():
             sys.modules["matcher"] = real_matcher
         for p in made:
             p.stop()
+
+
+class HangingHTTP:
+    """External VLC's HTTP interface, which can hang: while `hung` is set
+    a request takes its whole timeout and fails, as one to a stuck VLC
+    does. Playing moves the position at 1x over a 100 s film. Records the
+    thread each request came from, and counts the ones answered to
+    another thread (the poller)."""
+
+    def __init__(self, player):
+        self.hung = threading.Event()
+        self.state = "paused"
+        self.pos, self.since = 25.0, time.perf_counter()
+        self.callers = []
+        self.polled = 0
+        player._request = self.request
+
+    def play(self):
+        self.pos, self.since, self.state = self.where(), time.perf_counter(), "playing"
+
+    def where(self):
+        run = time.perf_counter() - self.since if self.state == "playing" else 0.0
+        return self.pos + run
+
+    def request(self, params=None, timeout=2.0):
+        self.callers.append(threading.current_thread())
+        if self.hung.is_set():
+            time.sleep(timeout)
+            raise TimeoutError("timed out")
+        t = self.where()
+        if threading.current_thread() is not threading.main_thread():
+            self.polled += 1
+        return {"state": self.state, "position": t / 100.0, "length": 100,
+                "time": int(t)}
+
+    def asked_from_here(self, since):
+        return sum(c is threading.current_thread() for c in self.callers[since:])
+
+
+def external_cached_status():
+    """The window reads time(), length() and is_playing() on the Tk
+    thread every 700 ms. Once a film is loaded they answer from what the
+    poller last heard, without a request of their own, so a hung VLC
+    cannot freeze the window. And a VLC that stops answering is no longer
+    reported as playing on: not after EXT_STATUS_STALE."""
+    def no_probe(path):
+        raise OSError("no ffprobe")      # length comes from VLC's status
+
+    saved = sys.modules.get("matcher"), players.EXT_STATUS_STALE
+    sys.modules["matcher"] = types.SimpleNamespace(probe=no_probe)
+    players.EXT_STATUS_STALE = 0.4
+    p = players.ExternalPlayer(exe="vlc")
+    http = HangingHTTP(p)
+    try:
+        p.load("C:/Films/First Film.mkv")
+        assert p.duration is None, p.duration
+        deadline = time.perf_counter() + 5
+        while http.polled < 2 and time.perf_counter() < deadline:
+            time.sleep(0.02)
+
+        def reads():
+            mark, start = len(http.callers), time.perf_counter()
+            got = p.time(), p.length(), p.is_playing()
+            took = time.perf_counter() - start
+            asked = http.asked_from_here(mark)
+            assert asked == 0, f"{asked} HTTP request(s) from the reading thread"
+            assert took < 0.25, f"reads took {took:.2f} s"
+            return got
+
+        t, n, playing = reads()
+        assert (t, n, playing) == (25.0, 100.0, False), (t, n, playing)
+        http.hung.set()
+        t, n, playing = reads()
+        assert (t, n, playing) == (25.0, 100.0, False), (t, n, playing)
+        print("external VLC, paused: time, length and play state read with "
+              "no request of their own, and still while VLC hangs")
+
+        http.hung.clear()
+        http.play()
+        deadline = time.perf_counter() + 5
+        while p.clock() is None and time.perf_counter() < deadline:
+            time.sleep(0.02)
+        t, n, playing = reads()
+        assert playing and n == 100.0, (t, n, playing)
+        assert abs(t - http.where()) < 0.2, (t, http.where())
+        http.hung.set()
+        hung_at = time.perf_counter()
+        t, n, playing = reads()
+        assert playing and n == 100.0, (t, n, playing)
+        time.sleep(1.2)                  # past the stale limit, two polls failed
+        t, n, playing = reads()
+        assert (t, n, playing) == (None, None, False), (t, n, playing)
+        assert p.clock() is None
+        print(f"external VLC, playing then hung: still playing at once, "
+              f"nothing claimed {time.perf_counter() - hung_at:.1f} s later "
+              f"(stale after {players.EXT_STATUS_STALE} s)")
+    finally:
+        http.hung.clear()
+        p.stop()
+        real_matcher, players.EXT_STATUS_STALE = saved
+        if real_matcher is None:
+            sys.modules.pop("matcher", None)
+        else:
+            sys.modules["matcher"] = real_matcher
 
 
 class AnchorMP:
@@ -590,6 +696,9 @@ def main():
 
     # 5. external VLC: a second film, a fresh spawn, a Tk path
     external_load()
+
+    # 5b. external VLC: the window's reads never wait on HTTP
+    external_cached_status()
 
     # 6. embedded: the drawable is re-anchored on every load
     embedded_anchor()

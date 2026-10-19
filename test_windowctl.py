@@ -1,10 +1,52 @@
-"""Live check of windowctl: spawn a real window, find, minimize, restore."""
+"""Live check of windowctl: spawn a real window, find, minimize, restore,
+and read the program it belongs to. Before that, find_stream_window over
+a made-up list of windows: what Automatic picks."""
 
+import os
 import subprocess
 import sys
 import time
 
 TITLE = "WinCtlTest-9271"
+
+
+def stream_window_fallback(windowctl):
+    """Automatic's pick: a Twitch or Kick title first, else the browser
+    window if it is the only one - a VOD's tab is named after the VOD,
+    not Twitch. Of several browser windows none is guessed at. A saved
+    title and a pinned window that is still open come before all that."""
+    saved = windowctl.list_windows, windowctl.window_exe, windowctl.is_valid
+
+    def desktop(*wins):              # (hwnd, title, program)
+        windowctl.list_windows = lambda: [(h, t) for h, t, _exe in wins]
+        exes = {h: exe for h, _t, exe in wins}
+        windowctl.window_exe = lambda h: exes.get(h, "")
+
+    vod = (11, "Day 3 of the marathon - Google Chrome", "chrome.exe")
+    others = [(12, "Downloads", "explorer.exe"), (13, "StreamSync", "python.exe"),
+              (14, "notes.txt - Notepad", "notepad.exe")]
+    windowctl.is_valid = lambda h: h == 99
+    try:
+        desktop(vod, *others)
+        assert windowctl.find_stream_window() == 11, "the lone browser wasn't picked"
+        desktop(*others, (21, "A film night - Personal - Microsoft\u200b Edge", "msedge.exe"))
+        assert windowctl.find_stream_window() == 21, "a lone Edge wasn't picked"
+        desktop(vod, *others, (22, "Inbox \u2014 Mozilla Firefox", "firefox.exe"))
+        assert windowctl.find_stream_window() is None, "guessed between two browsers"
+        desktop(vod, *others, (23, "Picture in picture", "chrome.exe"))
+        assert windowctl.find_stream_window() is None, "guessed between two windows"
+        desktop(vod, *others, (24, "streamer - Twitch \u2014 Mozilla Firefox",
+                               "firefox.exe"))
+        assert windowctl.find_stream_window() == 24, "Twitch lost to the browser rule"
+        desktop(vod, *others)
+        assert windowctl.find_stream_window(None, "Notes.txt") == 14, "saved title lost"
+        assert windowctl.find_stream_window(99, "Notes.txt") == 99, "pinned pick lost"
+        desktop(*others)
+        assert windowctl.find_stream_window() is None, "picked a window with no browser"
+        print("Automatic: Twitch/Kick title, else the one browser window; "
+              "two browsers or two of one browser's windows: no guess")
+    finally:
+        windowctl.list_windows, windowctl.window_exe, windowctl.is_valid = saved
 
 
 def main():
@@ -13,6 +55,8 @@ def main():
               "(use test_macwindowctl.py on macOS)")
         return
     import windowctl  # touches ctypes.windll, so only after the guard
+
+    stream_window_fallback(windowctl)
 
     proc = subprocess.Popen([
         sys.executable, "-c",
@@ -31,6 +75,10 @@ def main():
         assert hwnd, "spawned window never appeared in list_windows()"
         assert windowctl.is_valid(hwnd)
         assert windowctl.find_by_pid(proc.pid) == hwnd
+        exe = windowctl.window_exe(hwnd)
+        assert exe == os.path.basename(sys.executable).lower(), exe
+        assert windowctl.window_exe(0) == "", "a window that isn't there has a program"
+        print(f"the spawned window's program read: {exe}")
 
         windowctl.minimize(hwnd)
         time.sleep(0.4)

@@ -47,6 +47,7 @@ except Exception as e:  # missing libvlc.dll, bitness mismatch, etc.
 EMBED_STALL_GUESS = 0.10    # first guess at a seek's stall; learned after
 EXT_CMD_LEAD = 0.12         # fire external seeks this early (http + exec time)
 EXT_STALL_GUESS = 0.10
+EXT_STATUS_STALE = 2.0      # VLC unheard this long: closed, hung or swamped
 TRIM_RATE = 0.05            # trims run at 1 +- this
 TRIM_MAX = 0.6              # errors up to this are trimmed; beyond, re-seeked
 SETTLE_TOL = 0.02           # close enough - leave it
@@ -628,6 +629,11 @@ class ExternalPlayer(_ClosedLoop):
     ffmpeg measures it. A poller watches for that value to change - like
     get_time() it only moves every few hundred ms - and feeds the changes
     to the same PlaybackClock the embedded player uses.
+
+    time(), length() and is_playing() answer from what the poller last
+    heard: the window reads them on the Tk thread every 700 ms, and a
+    request of their own there would freeze it for as long as a slow or
+    hung VLC took to answer.
     """
 
     POLL = 0.05
@@ -640,6 +646,7 @@ class ExternalPlayer(_ClosedLoop):
         self.has_media = False
         self.duration = None
         self._playing = False
+        self._heard = (None, float("-inf"))   # (status, when) the poller got
         self._auth = "Basic " + base64.b64encode(
             (":" + password).encode()).decode()
         self._init_loop(EXT_STALL_GUESS)
@@ -737,11 +744,16 @@ class ExternalPlayer(_ClosedLoop):
             st = self._status(timeout=0.5)
             after = time.perf_counter()
             if st:
+                self._heard = (st, after)
                 self._playing = st.get("state") == "playing"
                 pos = self._position(st)
                 if self._playing and pos is not None and pos != last:
                     self._clk.observe(pos, (before + after) / 2)
                 last = pos
+            elif after - self._heard[1] > EXT_STATUS_STALE:
+                # not known to be playing any more, so its clock is not
+                # one to run on: time() would count up a closed VLC
+                self._playing = False
             self._stop_poll.wait(self.POLL)
 
     def _status(self, timeout=1.0):
@@ -749,6 +761,17 @@ class ExternalPlayer(_ClosedLoop):
             return self._request(timeout=timeout)
         except Exception:
             return None
+
+    def _latest(self):
+        """VLC's status as the poller last heard it, None if it has not
+        heard VLC lately. Before the poller starts (nothing loaded yet) a
+        request of its own: there is nothing else to go on."""
+        if self._poller is None or not self._poller.is_alive():
+            return self._status()
+        st, at = self._heard
+        if time.perf_counter() - at > EXT_STATUS_STALE:
+            return None
+        return st
 
     def ensure_playing(self, timeout=8.0):
         if not self.has_media:
@@ -827,7 +850,7 @@ class ExternalPlayer(_ClosedLoop):
     def time(self):
         if self._playing and self._clk.count():
             return self._clk.position()
-        return self._position(self._status())
+        return self._position(self._latest())
 
     def _position(self, st):
         if not st:
@@ -852,13 +875,13 @@ class ExternalPlayer(_ClosedLoop):
         now = time.perf_counter()
         if self._playing and self._clk.count():
             return self._clk.position(now), True, now
-        st = self._status()
+        st = self._latest()
         return self._position(st), bool(st and st.get("state") == "playing"), now
 
     def length(self):
         if self.duration:
             return self.duration
-        st = self._status()
+        st = self._latest()
         if st and (st.get("length") or 0) > 0:
             return float(st["length"])
         return None
@@ -870,7 +893,7 @@ class ExternalPlayer(_ClosedLoop):
             pass
 
     def is_playing(self):
-        st = self._status()
+        st = self._latest()
         return bool(st and st.get("state") == "playing")
 
     def fullscreen_toggle(self):
