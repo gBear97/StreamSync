@@ -21,5 +21,16 @@ __pycache__/
 *.m4a
 *.wav
 
+# signing keys and secrets: they live in the password manager and the
+# repository's Actions secrets, never in a commit. The README keeps them
+# outside the checkout; this is the backstop for when one lands here.
+*.pem
+*.p12
+*.p8
+*.key
+*.pfx
+.env
+.env.*
+
 # agent worktrees (also in .git/info/exclude, which clones don't inherit)
 .claude/worktrees/
