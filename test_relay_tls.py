@@ -236,6 +236,16 @@ def tls_front(certfile, keyfile, backend_port):
     a tunnel does in front of one. Returns the port it listens on."""
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(certfile, keyfile)
+    # No TLS 1.3 session tickets. A server sends them as its handshake
+    # ends, and over loopback they reach the client while it is still
+    # writing its upgrade request - with websockets' reader thread already
+    # reading the same TLS connection, which OpenSSL does not support. On
+    # a busy machine about one connection in a hundred then lost its
+    # request without a word and waited out open_timeout: "timed out while
+    # waiting for handshake response". A real relay is a round trip away,
+    # so its tickets come after the request has gone. Nothing here resumes
+    # a session.
+    ctx.num_tickets = 0
     ready, port = threading.Event(), []
 
     async def pipe(r, w):
