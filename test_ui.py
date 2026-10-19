@@ -1110,6 +1110,71 @@ def watch_party(env, root, app):
               (tunnel, "readonly"))
         app.ctl.session.stop_flag.set()
         pump(root, 0.9)
+        app.ctl.session = None
+
+        # cloudflared prints an https:// address. Pasted as it is, it is
+        # taken for the wss:// one it stands for, and shown and saved so;
+        # http:// likewise for ws://. From Host as from Join.
+        from ui import theme
+        hosted = []
+
+        class Host(SimpleNamespace):
+            def __init__(self, relay_url, *a, **kw):
+                super().__init__(code=None, stop_flag=threading.Event())
+                hosted.append(relay_url)
+
+            def start(self):
+                pass
+
+        def press(button, relay):
+            d.relay_field.entry.delete(0, "end")
+            d.relay_field.entry.insert(0, relay)
+            button()
+            pump(root, 0.1)
+            if app.ctl.session is not None:
+                app.ctl.session.stop_flag.set()
+                pump(root, 0.9)
+                app.ctl.session = None
+
+        def saved():
+            return json.loads(env.config.read_text()).get("relay_url")
+
+        real_host = engine.HostSession
+        engine.HostSession = Host
+        try:
+            for name, button, started, err in (
+                    ("Join", d._join, joined, d.join_err),
+                    ("Host", d._host, hosted, d.host_err)):
+                started.clear()
+                press(button, "https://example-words-here.trycloudflare.com")
+                check(f"{name} takes an https:// relay as wss://", started, [tunnel])
+                check(f"{name}: the field shows the wss:// address", d.relay_var.get(),
+                      tunnel)
+                check(f"{name}: the wss:// address is saved", saved(), tunnel)
+
+                # Anything else that is no ws:// or wss:// address is
+                # refused at once, under the button pressed - where it
+                # used to start a session that said, after its retries,
+                # only "could not reach the relay".
+                started.clear()
+                press(button, "localhost:8765")
+                check(f"{name}: no session for an address without ws://", started, [])
+                check(f"{name}: says why", (err.cget("text"), bool(err.winfo_ismapped())),
+                      ("The relay server needs ws:// or wss://", True))
+                check(f"{name}: the relay field is marked",
+                      d.relay_field.entry.cget("highlightbackground"), theme.ERROR)
+                check(f"{name}: the refused address is not saved", saved(), tunnel)
+                check(f"{name}: and is left to correct", d.relay_var.get(), "localhost:8765")
+                if name == "Join":
+                    shot(root, d.win, "05-watch-party-relay-error")
+
+            press(d._join, " http://203.0.113.7:8765 ")
+            check("http:// is taken as ws://", joined, ["ws://203.0.113.7:8765"])
+            check("ws:// is saved", saved(), "ws://203.0.113.7:8765")
+            check("a good address clears the mark",
+                  d.relay_field.entry.cget("highlightbackground") == theme.ERROR, False)
+        finally:
+            engine.HostSession = real_host
     finally:
         engine.ViewerSession = real_viewer
         app.ctl.session = None

@@ -380,9 +380,10 @@ to open in a router or firewall.
 
    After a few seconds it prints an address like
    `https://some-random-words.trycloudflare.com`.
-3. Everyone, host included, sets **Relay server** to that address with
-   `wss://` in place of `https://`:
-   `wss://some-random-words.trycloudflare.com`.
+3. Everyone, host included, pastes that address into **Relay server**.
+   StreamSync connects to the `wss://` address it stands for -
+   `wss://some-random-words.trycloudflare.com` - and the field shows it
+   so once Host or Join is pressed.
 
 Keep both windows open while the party lasts. The address changes every
 time `cloudflared` starts, so share the new one each time. This suits a
@@ -390,6 +391,10 @@ group of friends rather than a large audience: the relay is only up
 while the host's computer is, and a quick tunnel is a free service
 Cloudflare offers for testing, with a cap on how much it carries at
 once.
+
+If the party cannot reach the relay, the message says why when it can
+tell: a certificate that did not verify, say, or a tunnel answering
+HTTP 502, which means the relay behind it is not running.
 
 **On a server.** For a relay that is always there, run it on a machine
 both sides can reach - a $5 VPS or small AWS instance serves thousands
