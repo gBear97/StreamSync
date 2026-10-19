@@ -24,6 +24,7 @@ import base64
 import json
 import math
 import queue
+import ssl
 import threading
 import time
 import traceback
@@ -361,13 +362,40 @@ def _open(url):
                             ssl=ctx).__enter__())
 
 
+def _why(exc):
+    """What an attempt to open the relay's websocket ran into, in a few
+    words for the user - or None when nothing went wrong but that nothing
+    answered (refused, no such host, timed out), which "could not reach
+    the relay" already says. Without this, a certificate that will never
+    verify or an https:// address looked just like a relay that was down."""
+    from websockets.exceptions import InvalidHandshake, InvalidStatus, InvalidURI
+
+    if isinstance(exc, InvalidURI):
+        return "not a ws:// or wss:// address"
+    if isinstance(exc, ssl.SSLCertVerificationError):
+        return "its certificate did not verify"
+    if isinstance(exc, ssl.SSLError):
+        return "its TLS handshake failed"
+    if isinstance(exc, InvalidStatus):
+        code = exc.response.status_code
+        if code in (502, 504):      # a tunnel or proxy with nothing behind it
+            return f"it answered HTTP {code}; is the relay behind it running?"
+        if code == 530:             # Cloudflare's, for a tunnel that stopped
+            return f"it answered HTTP {code}; is its tunnel still running?"
+        return f"it answered HTTP {code}, not as a relay"
+    if isinstance(exc, InvalidHandshake):
+        return "it did not answer as a relay"
+    return None
+
+
 def _connect(url, inbox, hello, ok_types, stop, deadline):
     """Open a Link and send `hello`, retrying with backoff until a reply
     in ok_types arrives. Returns (link, reply); raises RuntimeError with
-    the relay's reason if it refuses."""
-    delay = 1.0
+    the relay's reason if it refuses, or once out of time "could not
+    reach the relay" and what the last attempt ran into (see _why)."""
+    delay, last = 1.0, None
     while not stop.is_set():
-        link = None
+        link, last = None, None
         try:
             link = Link(url, inbox)
             link.send(hello)
@@ -388,15 +416,17 @@ def _connect(url, inbox, hello, ok_types, stop, deadline):
                 # anything else predates this connection; drop it
         except RuntimeError:
             raise
-        except Exception:
-            pass
+        except Exception as e:
+            last = e
         if link is not None:
             link.close()
         if time.monotonic() + delay > deadline:
             break
         stop.wait(delay)
         delay = min(delay * 2, 8.0)
-    raise RuntimeError("could not reach the relay")
+    why = _why(last)
+    raise RuntimeError("could not reach the relay"
+                       + (f" - {why}" if why else ""))
 
 
 # --------------------------------------------------------------------------

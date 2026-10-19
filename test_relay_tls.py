@@ -17,7 +17,12 @@ showed.
     the bundled roots and OpenSSL's own CA paths taken away - the shipped
     app's situation. Also the TLS-inspecting network, where only the
     keychain's roots can verify, and a certificate no root vouches for,
-    which must still be refused.
+    which must still be refused;
+  - what the watch party says when it gives up: what the last attempt
+    ran into - a pasted https:// address, a certificate that did not
+    verify, a web server or tunnel answering instead of a relay - where
+    all of it used to read "could not reach the relay", like a relay
+    that is simply down (which still reads just that).
 
 The round trip needs the openssl command to make certificates; where
 there is none (some Windows setups) it is skipped and says so.
@@ -26,6 +31,7 @@ there is none (some Windows setups) it is skipped and says so.
 """
 
 import asyncio
+import http.server
 import os
 import queue
 import socket
@@ -402,6 +408,117 @@ else:
             else:
                 os.environ[k] = v
         rebuild()
+
+# --- what the watch party says when it gives up --------------------------
+# _connect keeps retrying whatever goes wrong, then names what the last
+# attempt ran into.
+
+REACH = "could not reach the relay"
+
+
+def gives_up(url, within=0.5):
+    """session._connect's message once it runs out of time - after one
+    attempt, given half a second."""
+    try:
+        session._connect(url, queue.Queue(), {"type": "join", "code": "X"},
+                         ("joined",), threading.Event(),
+                         time.monotonic() + within)
+    except RuntimeError as e:
+        return str(e)
+    return "connected"
+
+
+class Answers(http.server.BaseHTTPRequestHandler):
+    """A web server, not a relay: every request gets `status`."""
+    status = 200
+    protocol_version = "HTTP/1.1"     # websockets reads no status in 1.0
+
+    def do_GET(self):
+        self.send_response(self.status)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *a):
+        pass
+
+
+def hangs_up():
+    """Reads the request and closes without a word. Returns its port."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen()
+
+    def serve():
+        while True:
+            conn, _ = srv.accept()
+            with conn:
+                conn.recv(65536)
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv.getsockname()[1]
+
+
+# Addresses pasted from cloudflared, or typed without a scheme. websockets
+# refuses them before reaching for the network.
+for url in ("https://example-words-here.trycloudflare.com",
+            "http://example-words-here.trycloudflare.com", "localhost:8765"):
+    check(f"{url}: says why", gives_up(url),
+          f"{REACH} - not a ws:// or wss:// address")
+
+# A relay that is not there reads as before.
+check("nothing listening", gives_up(f"ws://127.0.0.1:{free_port()}"), REACH)
+
+web = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Answers)
+threading.Thread(target=web.serve_forever, daemon=True).start()
+try:
+    for status, want in (
+            (200, "it answered HTTP 200, not as a relay"),
+            (404, "it answered HTTP 404, not as a relay"),
+            # a quick tunnel whose relay is not running ...
+            (502, "it answered HTTP 502; is the relay behind it running?"),
+            # ... and one whose cloudflared has stopped
+            (530, "it answered HTTP 530; is its tunnel still running?")):
+        Answers.status = status
+        check(f"a web server answering {status}",
+              gives_up(f"ws://127.0.0.1:{web.server_port}"),
+              f"{REACH} - {want}")
+    # wss:// to something that does not speak TLS - a plain relay, say
+    check("wss:// to a plain server",
+          gives_up(f"wss://127.0.0.1:{web.server_port}"),
+          f"{REACH} - its TLS handshake failed")
+finally:
+    web.shutdown()
+    web.server_close()
+check("a server that hangs up", gives_up(f"ws://127.0.0.1:{hangs_up()}"),
+      f"{REACH} - it did not answer as a relay")
+
+if certs is not None:
+    check("an untrusted certificate", gives_up(stranger),
+          f"{REACH} - its certificate did not verify")
+    # ws:// to a TLS-only server - a tunnel's https side, say
+    check("ws:// to a TLS server", gives_up("ws" + stranger[3:]),
+          f"{REACH} - it did not answer as a relay")
+
+# It still retries after a TLS failure, and only the last attempt counts:
+# a certificate that failed once and a relay then down reads as down.
+real_widen = netcerts._widen
+netcerts._widen = lambda: False
+try:
+    tries = []
+
+    def connect(url, **kw):
+        tries.append(url)
+        raise (ssl.SSLCertVerificationError("certificate verify failed")
+               if len(tries) == 1 else ConnectionRefusedError("down"))
+
+    wsclient.connect = connect
+    check("the last attempt is the one named",
+          (gives_up("wss://relay.example", within=1.5), len(tries)),
+          (REACH, 2))
+finally:
+    wsclient.connect = real_connect
+    netcerts._widen = real_widen
+
 
 if fails:
     print("RELAY TLS TEST FAILED")
