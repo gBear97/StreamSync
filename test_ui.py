@@ -764,7 +764,23 @@ class Env:
         root.report_callback_exception = lambda exc, val, tb: self.errors.append(
             f"Tk callback: {exc.__name__}: {val}\n"
             + "".join(traceback.format_tb(tb))[-1200:])
-        app = self.shell.create_app(root, self.platform)
+        # The screen's maximum as the app reads it while it builds the
+        # main window, where it caps the window's minimum. On a Mac Tk's
+        # maximum is the screen less the menu bar and the Dock, and the Dock
+        # resizes as apps start and quit, so a read made later can differ.
+        self.screen_max = []
+        read_max = root.wm_maxsize
+
+        def wm_maxsize(width=None, height=None):
+            got = read_max(width, height)
+            if width is None and height is None:
+                self.screen_max.append(tuple(got))
+            return got
+        root.wm_maxsize = root.maxsize = wm_maxsize
+        try:
+            app = self.shell.create_app(root, self.platform)
+        finally:
+            del root.wm_maxsize, root.maxsize
         ctl = app.ctl
         real_set_auto = ctl.set_auto
 
@@ -794,13 +810,16 @@ def first_run(env, root, app):
     from ui import theme
     # its full size, or as much as the screen allows: a minimum past the
     # screen's maximum (CI's macOS runner, at 1024x768) left the window at
-    # Tk's 200x200 default, and pack unmapped what did not fit
-    # (the screen's maximum can move a point or two between the window
-    # being made and this check: CI's runner reported 647, then 649)
-    maxw, maxh = root.wm_maxsize()
-    slack = 4
-    full = (root.winfo_width() >= min(theme.px(560), maxw) - slack,
-            root.winfo_height() >= min(theme.px(664), maxh) - slack)
+    # Tk's 200x200 default, and pack unmapped what did not fit.
+    # As much as the screen allowed when the app built the window, not
+    # now: the Dock shrinks a point or two once this app's icon joins it,
+    # or grows once the last test's leaves, up to a second later. CI's
+    # runner had 647 there and 649 here, failing a window at its full 647.
+    check("the app read the screen's maximum to build the main window",
+          bool(env.screen_max), True)
+    maxw, maxh = env.screen_max[-1] if env.screen_max else root.wm_maxsize()
+    full = (root.winfo_width() >= min(theme.px(560), maxw),
+            root.winfo_height() >= min(theme.px(664), maxh))
     check("the main window is its full size", full, (True, True))
     if full != (True, True):
         # what Tk thought, for a runner whose window came out small
@@ -809,6 +828,7 @@ def first_run(env, root, app):
             "outer req": [(str(c), c.winfo_reqwidth(), c.winfo_reqheight(), c.winfo_manager())
                           for c in root.winfo_children()][:4],
             "minsize": root.wm_minsize(), "maxsize": root.wm_maxsize(),
+            "maxsize when built": env.screen_max,
             "state": root.state(), "screen": (root.winfo_screenwidth(), root.winfo_screenheight()),
             "resizable": root.resizable(), "tk": root.tk.call("info", "patchlevel")})
     check("Main is hidden without a film", app.main_frame.winfo_ismapped(), 0)
