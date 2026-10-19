@@ -33,6 +33,9 @@ on both.
   Screen Recording permission.
 - **The ±2 s nudge buttons** and **F11**. Fine-tune now steps by 0.1 s and
   0.5 s; **F** toggles fullscreen.
+- **The Search ± box** beside the position hint. A sync with a hint always
+  searches 2 minutes either side of it, 1.x's default; a different width
+  set in 1.x is not kept.
 - **Global hotkeys** on Windows (Ctrl+Alt+S and friends) and the Mac's
   menu shortcuts (Command-S, Command-R, Command-P). The app's keys work
   while one of its windows has the keyboard - see [Keys](#keys).
