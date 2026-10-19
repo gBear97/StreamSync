@@ -1,7 +1,8 @@
 """End-to-end relay test on localhost: rooms, passwords, caching for late
 joiners, host->viewer broadcast, viewer->host routing, malformed input,
 a host reconnecting with its token (also over its own stale socket), and
-both ways a session ends."""
+both ways a session ends. Plus the cache's keys on their own: one per
+chunk number, however the number is spelt."""
 
 import base64
 import json
@@ -13,6 +14,8 @@ import time
 
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect as _connect
+
+import relay_server
 
 PORT = 8899
 URL = f"ws://127.0.0.1:{PORT}"
@@ -67,7 +70,42 @@ def quiet_link(obj):
     return s
 
 
+def check_cache_keys():
+    """A host fills one cache slot per chunk number, however it spells
+    the number. Each spelling used to get a slot of its own, so one
+    connection could grow the relay's memory without limit."""
+    key = relay_server.cache_key
+    chunk = lambda ck: key({"ck": ck}, "fp_chunk")
+    # what session.py sends comes out unchanged
+    for i in (0, 7, 42, relay_server.MAX_FP_CHUNKS - 1):
+        assert chunk(f"fp_chunk_{i}") == f"fp_chunk_{i}", i
+    assert key({}, "state") == "state"
+    assert key({}, "fp_meta") == "fp_meta"
+    # leading zeros name the same slot
+    for ck in ("fp_chunk_01", "fp_chunk_001"):
+        assert chunk(ck) == "fp_chunk_1", (ck, chunk(ck))
+    assert chunk("fp_chunk_000") == "fp_chunk_0"
+    # and anything else gets none: too many digits, out of range,
+    # non-ASCII digits (Arabic-Indic, fullwidth, Devanagari), signs,
+    # spaces, a trailing newline ($ allowed one), other prefixes
+    for ck in ("fp_chunk_0001", "fp_chunk_" + "0" * 50 + "1",
+               f"fp_chunk_{relay_server.MAX_FP_CHUNKS}", "fp_chunk_999",
+               "fp_chunk_\u0661", "fp_chunk_\uff11", "fp_chunk_\u0967",
+               "fp_chunk_1\u0660", "fp_chunk_-1", "fp_chunk_+1",
+               "fp_chunk_ 1", "fp_chunk_1\n", "fp_chunk_", "xfp_chunk_1",
+               "FP_CHUNK_1", "", None, 5):
+        assert chunk(ck) is None, (ck, chunk(ck))
+    # only the three message types are cached at all
+    assert key({"ck": "fp_chunk_1"}, "hello") is None
+    # so however many spellings a host sends, the slots stay bounded
+    spellings = {chunk(f"fp_chunk_{z}{i}") for z in ("", "0", "00")
+                 for i in range(1000)} - {None}
+    assert len(spellings) == relay_server.MAX_FP_CHUNKS, len(spellings)
+    print("cache keys: one slot per chunk number, however it is spelt")
+
+
 def main():
+    check_cache_keys()
     relay = subprocess.Popen([sys.executable, "relay_server.py",
                               "--port", str(PORT), "--host-grace", "2"])
     try:
@@ -133,6 +171,10 @@ def main():
         send(host, {"type": 7})
         send(host, {"type": "fp_chunk", "ck": "anything-at-all", "i": 0,
                     "data": ""})
+        # other spellings of chunk 0, which used to get slots of their own
+        for ck in ("fp_chunk_00", "fp_chunk_000", "fp_chunk_\u0660",
+                   "fp_chunk_0\n"):
+            send(host, {"type": "fp_chunk", "ck": ck, "i": 0, "data": ""})
         send(host, {"type": "state", "ck": "state", "seq": 2, "pos": 131.0,
                     "utc": 154.0, "playing": True, "default_delay": 9})
         got = recv(viewer)
