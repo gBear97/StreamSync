@@ -310,6 +310,22 @@ def shown(a):
     return a._fs_up and a.fs_bar.winfo_viewable()
 
 
+def bar_up(root, a, timeout=2.0):
+    """shown(a), for a check made just after asking for fullscreen: the
+    event loop runs until the bar is up, or the timeout says it is not
+    coming. The Mac only shows it once _settle_fullscreen has seen the
+    window fullscreen (_bar_allowed) - no sooner than FULLSCREEN_RETRY
+    after asking, and on a later pass of the loop than the request - and
+    makes it again first. That took 60-95 ms of move()'s 0.1 s on a Mac
+    here, so one late pass on a loaded runner (GitHub's macos-latest) left
+    the bar not up yet when it was checked."""
+    end = time.monotonic() + timeout
+    while not shown(a) and time.monotonic() < end:
+        root.update()
+        time.sleep(0.01)
+    return shown(a)
+
+
 def mouse_controls(root, a):
     win, frame = a.video_win, a.video_frame
     win.geometry("320x180+40+40")
@@ -540,7 +556,7 @@ def fs_bar(root, a):
     assert not a._fs_up and bar.state() == "withdrawn"
     a._set_fullscreen(True)
     move(root, a, 12, 10)
-    assert shown(a)
+    assert bar_up(root, a)
     bar = a.fs_bar                         # the Mac makes it again on entry
     assert a._fs_play.cget("text") == "Pause"
     assert a._fs_time.cget("text") == "12:34", a._fs_time.cget("text")
@@ -692,7 +708,7 @@ def fs_bar(root, a):
     # position at most, yet the bar shows and then goes, pointer and all
     a._set_fullscreen(True)
     move(root, a, 44, 30)                        # the same place again
-    assert shown(a)
+    assert bar_up(root, a)
     pump(root, 0.8)
     assert not shown(a) and frame.cget("cursor") == "none"
     a._set_fullscreen(False)
@@ -770,7 +786,7 @@ def no_activate(root, a):
     win, bar = a.video_win, a.fs_bar
     a._set_fullscreen(True)
     move(root, a, 60, 30)
-    assert shown(a)
+    assert bar_up(root, a)
     msg = (WM_LBUTTONDOWN << 16) | HTCLIENT
     bh, vh = int(bar.frame(), 16), int(win.frame(), 16)
     assert send(bh, WM_MOUSEACTIVATE, bh, msg) == MA_NOACTIVATE
@@ -871,7 +887,7 @@ def film_keeps_keys(root, a):
     try:
         a._set_fullscreen(True)
         pump(root, 0.2)
-        assert shown(a)
+        assert bar_up(root, a)
         a._hide_fs_bar()
         assert change(lambda: move(root, a, 131, 37)) == 1, "bar coming"
         assert shown(a)
@@ -939,7 +955,7 @@ def left_behind_the_back(root, a):
         # before the bar's next tick
         a._set_fullscreen(True)
         pump(root, 0.2)
-        assert shown(a)
+        assert bar_up(root, a)
         win.attributes("-fullscreen", 0)
         assert a.fullscreen
         a._overlay_at = None
@@ -957,7 +973,7 @@ def left_behind_the_back(root, a):
         have["w"] = win
         a._set_fullscreen(True)
         pump(root, 0.2)
-        assert shown(a)
+        assert bar_up(root, a)
         a._hide_fs_bar(hide_pointer=True)
         assert win.cget("cursor") == "none"
         win.attributes("-fullscreen", 0)
@@ -986,7 +1002,7 @@ def frame_steps(root, a):
     e.t, e.n, e.playing = 754.4, 6750.0, True
     a._set_fullscreen(True)
     move(root, a, 70, 30)
-    assert shown(a)
+    assert bar_up(root, a)
     a._fs_refresh()
     texts = [b.cget("text") for b in (a._fs_play, a._fs_stop,
                                       a._fs_frame_back, a._fs_frame_fwd,
@@ -1017,7 +1033,7 @@ def bar_follows_film(root, a):
     win, bar = a.video_win, a.fs_bar
     a._set_fullscreen(True)
     move(root, a, 80, 30)
-    assert shown(a)
+    assert bar_up(root, a)
     bar = a.fs_bar                         # the Mac makes it again on entry
     win.geometry("800x450+60+50")
     move(root, a, 81, 30)                        # and keep it up
@@ -1064,7 +1080,7 @@ def external_fullscreen(root, a):
     win = a.video_win
     a._set_fullscreen(True)
     move(root, a, 90, 30)
-    assert shown(a)
+    assert bar_up(root, a)
     hwnd = int(win.frame(), 16)
     a.player_var.set("external")
     a._apply_player_choice()
@@ -1253,7 +1269,7 @@ def overlays_per_fullscreen(root, a):
     try:
         a._set_fullscreen(True)
         pump(root, 0.2)
-        assert shown(a)
+        assert bar_up(root, a)
         if a.OVERLAYS_PER_FULLSCREEN:
             assert a.fs_bar is not old_bar and not old_bar.winfo_exists()
             assert a._osd_win is None and not old_osd.winfo_exists()
