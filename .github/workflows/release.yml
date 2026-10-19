@@ -187,6 +187,15 @@ jobs:
 
       # A keychain of our own, unlocked only for this job, so the
       # certificate never touches the runner's default keychain.
+      #
+      # It must stay unlocked for the whole job: the disk image is signed
+      # with it only after the app's notarization, which ci/notarize.sh
+      # may wait 75 minutes for. The lock timeout was once 900 s, so a
+      # slow day at Apple would have failed the release at the image's
+      # codesign, after a notarization had been spent. 21600 s is six
+      # hours, the most any GitHub-hosted job may run - longer than this
+      # job's own 180 minutes, so the keychain cannot lock before the
+      # runner is torn down.
       - name: Import the signing certificate
         env:
           P12: ${{ secrets.MACOS_CERT_P12 }}
@@ -196,7 +205,7 @@ jobs:
           KEYCHAIN_PASSWORD=$(uuidgen)
           echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 900 "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
             -P "$P12_PASSWORD" -T /usr/bin/codesign
