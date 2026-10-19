@@ -32,6 +32,7 @@ import imageio_ffmpeg
 import audio_capture
 import session
 import test_fingerprint
+import test_relay
 
 PORT = 8898
 URL = f"ws://127.0.0.1:{PORT}"
@@ -177,7 +178,7 @@ def main():
                              stdout=subprocess.DEVNULL)
     host = viewer = None
     try:
-        time.sleep(1.5)
+        test_relay.wait_for_relay(PORT)
         # the host plays its film from FILM_START, in its own player
         t_start = time.perf_counter()
 
