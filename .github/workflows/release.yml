@@ -42,7 +42,7 @@ jobs:
     name: Open a draft release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Checked here as well as in each build, so a mismatched tag never
       # leaves a stray draft behind.
@@ -109,9 +109,9 @@ jobs:
           - runner: macos-15-intel
             arch: x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -399,7 +399,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # for ci/sign_sums.sh and the updater's own key and verifier
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Fetch the builds from the draft
         env:
