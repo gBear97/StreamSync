@@ -246,11 +246,12 @@ browser goes back and the film comes back (fullscreen restored if it was
 fullscreen).
 
 - **Windows**: pick the browser window under **Stream window** (Refresh
-  lists open windows; *Automatic* picks a Twitch or Kick window). The
-  window is restored, then minimized again. "Piping" the stream's video
-  into the app isn't possible while the window is minimized - Windows
-  doesn't render minimized windows - so restoring the real window is both
-  the cheapest and the only way to show it.
+  lists open windows; *Automatic* picks a Twitch or Kick window, or the
+  browser window if only one is open). The window is restored, then
+  minimized again. "Piping" the stream's video into the app isn't
+  possible while the window is minimized - Windows doesn't render
+  minimized windows - so restoring the real window is both the cheapest
+  and the only way to show it.
 - **macOS**: pick the browser app under **Stream app** (*Automatic* takes
   the first browser it finds). The app comes forward during pauses and
   hides on resume. macOS asks for *Automation* permission (System

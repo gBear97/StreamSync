@@ -35,7 +35,7 @@ class Adapter(adapter.PlatformAdapter):
     FILM_GEOMETRY = (960, 540, (80, 80))
     OLD_STREAM_KEY = "stream_title"
     STREAM_LABEL = "Stream window"
-    STREAM_AUTO_LABEL = "Automatic (Twitch or Kick window)"
+    STREAM_AUTO_LABEL = "Automatic (Twitch, Kick or the only browser)"
     REFRESH_STREAMS_ON_SETTINGS = True
     LISTEN_HELP = ("The sound output the stream plays through. StreamSync hears it there, "
                    "even with the browser minimized.")
@@ -185,7 +185,8 @@ class Adapter(adapter.PlatformAdapter):
 
     def _refresh_stream_list(self):
         # No pick is made here: "" is Automatic, and find_stream_window
-        # falls back to any Twitch or Kick window when the swap runs.
+        # falls back to any Twitch or Kick window, or to the one browser
+        # window open, when the swap runs.
         # Picking one here pinned a title at every launch and every
         # Settings open - undoing an explicit Automatic - and saved the
         # settings with nobody asking.
