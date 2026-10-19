@@ -764,7 +764,23 @@ class Env:
         root.report_callback_exception = lambda exc, val, tb: self.errors.append(
             f"Tk callback: {exc.__name__}: {val}\n"
             + "".join(traceback.format_tb(tb))[-1200:])
-        app = self.shell.create_app(root, self.platform)
+        # The screen's maximum as the app reads it while it builds the
+        # main window, where it caps the window's minimum. On a Mac Tk's
+        # maximum is the screen less the menu bar and the Dock, and the Dock
+        # resizes as apps start and quit, so a read made later can differ.
+        self.screen_max = []
+        read_max = root.wm_maxsize
+
+        def wm_maxsize(width=None, height=None):
+            got = read_max(width, height)
+            if width is None and height is None:
+                self.screen_max.append(tuple(got))
+            return got
+        root.wm_maxsize = root.maxsize = wm_maxsize
+        try:
+            app = self.shell.create_app(root, self.platform)
+        finally:
+            del root.wm_maxsize, root.maxsize
         ctl = app.ctl
         real_set_auto = ctl.set_auto
 
@@ -794,8 +810,14 @@ def first_run(env, root, app):
     from ui import theme
     # its full size, or as much as the screen allows: a minimum past the
     # screen's maximum (CI's macOS runner, at 1024x768) left the window at
-    # Tk's 200x200 default, and pack unmapped what did not fit
-    maxw, maxh = root.wm_maxsize()
+    # Tk's 200x200 default, and pack unmapped what did not fit.
+    # As much as the screen allowed when the app built the window, not
+    # now: the Dock shrinks a point or two once this app's icon joins it,
+    # or grows once the last test's leaves, up to a second later. CI's
+    # runner had 647 there and 649 here, failing a window at its full 647.
+    check("the app read the screen's maximum to build the main window",
+          bool(env.screen_max), True)
+    maxw, maxh = env.screen_max[-1] if env.screen_max else root.wm_maxsize()
     full = (root.winfo_width() >= min(theme.px(560), maxw),
             root.winfo_height() >= min(theme.px(664), maxh))
     check("the main window is its full size", full, (True, True))
@@ -806,6 +828,7 @@ def first_run(env, root, app):
             "outer req": [(str(c), c.winfo_reqwidth(), c.winfo_reqheight(), c.winfo_manager())
                           for c in root.winfo_children()][:4],
             "minsize": root.wm_minsize(), "maxsize": root.wm_maxsize(),
+            "maxsize when built": env.screen_max,
             "state": root.state(), "screen": (root.winfo_screenwidth(), root.winfo_screenheight()),
             "resizable": root.resizable(), "tk": root.tk.call("info", "patchlevel")})
     check("Main is hidden without a film", app.main_frame.winfo_ismapped(), 0)
@@ -1075,6 +1098,106 @@ def watch_party(env, root, app):
     pump(root, 0.9)
     check("a session that ended shows the idle view again", d.idle.winfo_ismapped(), 1)
     app.ctl.session = None
+
+    # A relay at a wss:// address - a tunnel's - goes to the session as
+    # typed and is the relay saved for next time.
+    import session as engine
+    joined = []
+
+    class Viewer(SimpleNamespace):
+        def __init__(self, relay_url, code, *a, **kw):
+            super().__init__(code=code, stop_flag=threading.Event())
+            joined.append(relay_url)
+
+        def start(self):
+            pass
+
+    real_viewer = engine.ViewerSession
+    engine.ViewerSession = Viewer
+    try:
+        tunnel = "wss://example-words-here.trycloudflare.com"
+        d.relay_field.entry.delete(0, "end")
+        d.relay_field.entry.insert(0, f" {tunnel} ")
+        d.join_code.set("ABCD-EFGH")
+        d._join()
+        pump(root, 0.1)
+        check("Join hands the wss:// relay to the session", joined, [tunnel])
+        check("the controller keeps it", app.ctl.relay_url, tunnel)
+        check("it is saved as relay_url",
+              json.loads(env.config.read_text()).get("relay_url"), tunnel)
+        check("the field shows it while the session runs",
+              (d.relay_var.get().strip(), d.relay_field.entry.cget("state")),
+              (tunnel, "readonly"))
+        app.ctl.session.stop_flag.set()
+        pump(root, 0.9)
+        app.ctl.session = None
+
+        # cloudflared prints an https:// address. Pasted as it is, it is
+        # taken for the wss:// one it stands for, and shown and saved so;
+        # http:// likewise for ws://. From Host as from Join.
+        from ui import theme
+        hosted = []
+
+        class Host(SimpleNamespace):
+            def __init__(self, relay_url, *a, **kw):
+                super().__init__(code=None, stop_flag=threading.Event())
+                hosted.append(relay_url)
+
+            def start(self):
+                pass
+
+        def press(button, relay):
+            d.relay_field.entry.delete(0, "end")
+            d.relay_field.entry.insert(0, relay)
+            button()
+            pump(root, 0.1)
+            if app.ctl.session is not None:
+                app.ctl.session.stop_flag.set()
+                pump(root, 0.9)
+                app.ctl.session = None
+
+        def saved():
+            return json.loads(env.config.read_text()).get("relay_url")
+
+        real_host = engine.HostSession
+        engine.HostSession = Host
+        try:
+            for name, button, started, err in (
+                    ("Join", d._join, joined, d.join_err),
+                    ("Host", d._host, hosted, d.host_err)):
+                started.clear()
+                press(button, "https://example-words-here.trycloudflare.com")
+                check(f"{name} takes an https:// relay as wss://", started, [tunnel])
+                check(f"{name}: the field shows the wss:// address", d.relay_var.get(),
+                      tunnel)
+                check(f"{name}: the wss:// address is saved", saved(), tunnel)
+
+                # Anything else that is no ws:// or wss:// address is
+                # refused at once, under the button pressed - where it
+                # used to start a session that said, after its retries,
+                # only "could not reach the relay".
+                started.clear()
+                press(button, "localhost:8765")
+                check(f"{name}: no session for an address without ws://", started, [])
+                check(f"{name}: says why", (err.cget("text"), bool(err.winfo_ismapped())),
+                      ("The relay server needs ws:// or wss://", True))
+                check(f"{name}: the relay field is marked",
+                      d.relay_field.entry.cget("highlightbackground"), theme.ERROR)
+                check(f"{name}: the refused address is not saved", saved(), tunnel)
+                check(f"{name}: and is left to correct", d.relay_var.get(), "localhost:8765")
+                if name == "Join":
+                    shot(root, d.win, "05-watch-party-relay-error")
+
+            press(d._join, " http://203.0.113.7:8765 ")
+            check("http:// is taken as ws://", joined, ["ws://203.0.113.7:8765"])
+            check("ws:// is saved", saved(), "ws://203.0.113.7:8765")
+            check("a good address clears the mark",
+                  d.relay_field.entry.cget("highlightbackground") == theme.ERROR, False)
+        finally:
+            engine.HostSession = real_host
+    finally:
+        engine.ViewerSession = real_viewer
+        app.ctl.session = None
     d.close()
     pump(root, 0.1)
     check("Close unregisters Watch party", app._party, None)
@@ -1141,14 +1264,16 @@ def update_views(env, root, app):
 
 
 def bar_shot(env, root, app):
-    """08-bar: Windows only (the Mac's bar comes in Step 5). fullscreen
-    is set as a stand-in over a windowed film."""
+    """08-bar. fullscreen is set as a stand-in over a windowed film - on
+    the Mac's adapter too, which otherwise asks the window itself whether
+    it really is fullscreen before the bar may show."""
     vw = app.video_win
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     vw.geometry(f"{min(1280, sw - 80)}x{min(720, sh - 80)}+40+40")
     app._show_video_window()
     pump(root, 0.3)
     app.fullscreen = True
+    app._bar_allowed = lambda: True
     app._fs_moved = time.monotonic()         # as a mouse move over the film does
     try:
         app._show_fs_bar()
@@ -1157,6 +1282,7 @@ def bar_shot(env, root, app):
         shot(root, vw, "08-bar", on_top=False)
     finally:
         app._hide_fs_bar()
+        del app._bar_allowed
         app.fullscreen = False
         pump(root, 0.1)
 
@@ -1265,8 +1391,7 @@ def with_display(env):
         phase("Settings", settings, env, root, app)
         phase("Watch party", watch_party, env, root, app)
         phase("Update", update_views, env, root, app)
-        if sys.platform == "win32":
-            phase("the fullscreen bar", bar_shot, env, root, app)
+        phase("the fullscreen bar", bar_shot, env, root, app)
         phase("config written", config_written, env, root, app)
         phase("window titles", titles, env, root, app)
         check("the stream swap stand-in saw the pause", env.swaps[:1], [True])

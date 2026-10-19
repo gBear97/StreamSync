@@ -27,13 +27,19 @@ class PlatformAdapter:
 
     NAME = ""                          # "windows" or "mac"
     # Whether the film window takes the mouse - double-click, wheel, the
-    # right-click menu - and shows the fullscreen bar. The Mac's stay off
-    # until they have been checked by hand there; keys work on both.
+    # right-click menu - and shows the fullscreen bar. Both platforms do;
+    # it is the one switch that turns them off on a platform where they
+    # misbehave. Keys work either way.
     FILM_CONTROLS = True
     # Give the film window the keyboard once fullscreen settles. On the
     # Mac, entering fullscreen does not make the film's window key, so
     # Space, F and Esc over the film would go nowhere.
     FOCUS_FILM_ON_FULLSCREEN = False
+    # Make the bar and the volume overlay again each time fullscreen
+    # begins. macOS keeps a window on the Space it was first shown on, and
+    # a fullscreen film gets a new Space every time, so overlays made
+    # earlier would show on the desktop behind it.
+    OVERLAYS_PER_FULLSCREEN = False
     # Hide the built-in player's film window on a switch to the VLC app.
     # The Mac has always kept it up.
     WITHDRAW_FILM_FOR_EXTERNAL = True
@@ -139,7 +145,8 @@ class PlatformAdapter:
         film window took the last request. Default: nothing."""
 
     def _fullscreen_from_window(self):
-        """Called before a user's F, Esc or fullscreen toggle: bring
+        """Called before a user's F, Esc or fullscreen toggle, and when the
+        bar finds it may not show (_bar_allowed false): bring
         self.fullscreen in line with the window, which the system can
         change behind the app's back. Default: nothing."""
 

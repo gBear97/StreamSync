@@ -1,4 +1,5 @@
-"""Live check of the Windows film window's mouse controls and keys.
+"""Live check of the film window's mouse controls and keys, on Windows and
+the Mac.
 
 Real Tk events on a real (small) film window: double-click toggles
 fullscreen, right-click opens the player menu, the wheel steps the volume
@@ -6,11 +7,19 @@ a notch at a time without ever unmuting, and in fullscreen a moving mouse
 brings up the control bar (timeline, play/pause, stop, -1/+1 frame, resync
 here / full) that hides again, with the pointer, once the mouse rests,
 and follows the film when it moves or resizes. The app's keys (Space,
-Left/Right, F, Esc) are bound on the film window and the bar. Fullscreen
-itself is checked on every monitor attached: it must cover the monitor
-the window is on. Then, where VLC is installed, real libvlc plays a still
-image into the window, and a click over the picture must land on our frame
-- where those bindings are - not on libvlc's vout.
+Left/Right, F, Esc) are bound on the film window and the bar.
+
+The same checks run with the Mac's adapter on a Mac, where the menu also
+opens on Button-2 and Control-click, sideways scrolling is ignored and the
+wheel adds up a trackpad's small deltas; fullscreen there is the window's
+own, recorded instead of done (as Windows' frame-style swap is) and
+settled the way the app's queue loop settles it.
+
+Windows only: fullscreen itself is checked on every monitor attached: it
+must cover the monitor the window is on. Then, where VLC is installed,
+real libvlc plays a still image into the window, and a click over the
+picture must land on our frame - where those bindings are - not on
+libvlc's vout. And a click on the bar or the OSD must not activate it.
 
 The wheel's arithmetic (WheelSteps) is checked first, on every OS: it is
 plain counting, with Windows' and the Mac's settings.
@@ -36,8 +45,9 @@ def wheel_steps():
     afresh when turned back. The Mac: every scroll is a stream of small
     deltas (a trackpad's run from -8 to 2), so one starting from rest
     steps at once - a mouse notch is one event - and the rest of it steps
-    once per 60; with natural scrolling the deltas are turned round, so
-    the fingers going up is louder either way."""
+    once per 60 it adds up to, whatever the signs of the deltas in it;
+    with natural scrolling the deltas are turned round, so the fingers
+    going up is louder either way."""
     from ui.video import WheelSteps
 
     # Windows: a notch is 120, and there is no rest rule
@@ -64,14 +74,19 @@ def wheel_steps():
     assert sorted(set(steps)) == [0, 1] and sum(steps) == 2, steps
     assert feed(m, 1, dt=0.3) == 1               # a rest again: at once
     assert feed(m, 1, dt=0.2) == 0               # not a rest: it adds up
-    assert [feed(m, -30), feed(m, -30)] == [0, -1]   # turned back: afresh
+    # turned back: the sum decides, not the last delta's sign
+    assert [feed(m, -30), feed(m, -30), feed(m, -2)] == [0, 0, -1]
     assert feed(m, -3, dt=1) == -1               # a notch down from rest
+    # a slow scroll as the trackpad sends it: small deltas of both signs,
+    # one step per 60 they add up to (probe 2: -8 to 2, summing -217)
+    steps = [feed(m, d) for d in [-8, 2] * 20]   # -120
+    assert set(steps) <= {0, -1} and sum(steps) == -2, steps
     # natural scrolling: the deltas are turned round
     n = WheelSteps(60, sign=-1, quiet=0.25, clock=clock)
     assert feed(n, 3, dt=5) == -1
     assert sum(feed(n, -6) for _ in range(10)) == 1
-    print("wheel, Mac: from rest a scroll steps at once, then once per 60; "
-          "natural scrolling turns the direction round")
+    print("wheel, Mac: from rest a scroll steps at once, then once per 60 "
+          "of mixed-sign deltas; natural scrolling turns the direction round")
 
 
 class FakeEmbedded:
@@ -84,6 +99,9 @@ class FakeEmbedded:
         self.t, self.n, self.playing = None, None, False
         self.seeks, self.stops = [], 0
         self.rate = 25.0             # what libvlc reports for the film
+        # the Mac: libvlc has the film window's view, so fullscreen is
+        # the window's own
+        self.embedded = True
 
     def time(self):
         return self.t
@@ -123,19 +141,15 @@ class FakeEmbedded:
         self.picked.append(tid)
 
 
-def make_app(root):
-    import tkinter as tk
-
+def stub_windowctl(platform, fs_calls, fg, app):
+    """Windows: the frame-style swap is recorded, not done - the bar's
+    checks must not take the screen over for seconds at a time (monitors()
+    checks the real swap, a moment per monitor). The foreground window is
+    stubbed too: the film has the keyboard unless a check hands it to
+    another window (fg["hwnd"]), on the film's monitor unless the check
+    puts it on another (fg["monitor"])."""
     import windowctl
-    from ui import mainwin, platform_win, shell, widgets
 
-    # The frame-style swap is recorded, not done: the bar's checks must
-    # not take the screen over for seconds at a time (monitors() checks
-    # the real swap, a moment per monitor).
-    # The foreground window is stubbed too: the film has the keyboard
-    # unless a check hands it to another window (fg["hwnd"]), on the
-    # film's monitor unless the check puts it on another (fg["monitor"]).
-    fs_calls, fg = [], {}
     film_monitor = (0, 0, 1920, 1080)
 
     class Windowctl:
@@ -146,7 +160,7 @@ def make_app(root):
             lambda h, saved: fs_calls.append(("off", h, saved)))
         no_activate_on_click = staticmethod(windowctl.no_activate_on_click)
         foreground = staticmethod(
-            lambda: fg.get("hwnd") or int(a.video_win.frame(), 16))
+            lambda: fg.get("hwnd") or int(app().video_win.frame(), 16))
         monitor_rect = staticmethod(
             lambda h: (fg.get("monitor", film_monitor)
                        if h == fg.get("hwnd") else film_monitor))
@@ -154,9 +168,49 @@ def make_app(root):
         def __getattr__(self, name):
             return getattr(windowctl, name)
 
-    platform_win.windowctl = Windowctl()
+    platform.windowctl = Windowctl()
 
-    class FakeApp(shell.app_class(platform_win)):
+
+def stub_mac_fullscreen(root, a, fs_calls):
+    """The Mac: fullscreen is the film window's own -fullscreen, which is
+    recorded instead of done - a real one takes the screen over and
+    animates for most of a second. A change is recorded as Windows' stub
+    records one, so the checks read alike, and only a change (Tk passes
+    on nothing else). _settle_fullscreen runs every 20 ms, as the app's
+    queue loop runs it every pass."""
+    win = a.video_win
+    real = win.attributes
+    state = {"fullscreen": False}
+
+    def attributes(*args):
+        if args == ("-fullscreen",):
+            return int(state["fullscreen"])
+        if len(args) == 2 and args[0] == "-fullscreen":
+            want = bool(args[1])
+            if want != state["fullscreen"]:
+                state["fullscreen"] = want
+                h = int(win.frame(), 16)
+                fs_calls.append(("on", h) if want else ("off", h, "kept"))
+            return ""
+        return real(*args)
+    win.attributes = attributes
+
+    def settle():
+        a._settle_fullscreen()
+        root.after(20, settle)
+    root.after(20, settle)
+
+
+def make_app(root, platform):
+    import tkinter as tk
+
+    from ui import mainwin, shell, widgets
+
+    fs_calls, fg = [], {}
+    if platform.Adapter.NAME == "windows":
+        stub_windowctl(platform, fs_calls, fg, lambda: a)
+
+    class FakeApp(shell.app_class(platform)):
         """The App with only the film window built - see the module note.
         The shell's own sync, fullscreen, key and player-switch code runs;
         the controller's side is recorded."""
@@ -229,6 +283,8 @@ def make_app(root):
         setattr(FakeApp, name, lambda self, *a, **kw: "")
 
     a = FakeApp(root)
+    if platform.Adapter.NAME == "mac":
+        stub_mac_fullscreen(root, a, fs_calls)
     return a
 
 
@@ -254,6 +310,22 @@ def shown(a):
     return a._fs_up and a.fs_bar.winfo_viewable()
 
 
+def bar_up(root, a, timeout=2.0):
+    """shown(a), for a check made just after asking for fullscreen: the
+    event loop runs until the bar is up, or the timeout says it is not
+    coming. The Mac only shows it once _settle_fullscreen has seen the
+    window fullscreen (_bar_allowed) - no sooner than FULLSCREEN_RETRY
+    after asking, and on a later pass of the loop than the request - and
+    makes it again first. That took 60-95 ms of move()'s 0.1 s on a Mac
+    here, so one late pass on a loaded runner (GitHub's macos-latest) left
+    the bar not up yet when it was checked."""
+    end = time.monotonic() + timeout
+    while not shown(a) and time.monotonic() < end:
+        root.update()
+        time.sleep(0.01)
+    return shown(a)
+
+
 def mouse_controls(root, a):
     win, frame = a.video_win, a.video_frame
     win.geometry("320x180+40+40")
@@ -263,6 +335,12 @@ def mouse_controls(root, a):
 
     for seq in ("<Double-Button-1>", "<Button-3>", "<MouseWheel>"):
         assert win.bind(seq), f"video window has no {seq} binding"
+    if a.NAME == "mac":
+        # Aqua's right button is Button-2, a one-button mouse sends
+        # Control-click, and sideways scrolling comes as Shift-wheel
+        for seq in ("<Button-2>", "<Control-Button-1>",
+                    "<Shift-MouseWheel>"):
+            assert win.bind(seq), f"video window has no {seq} binding"
     # no focus grab on <Enter>: it would pull typing away from the main
     # window whenever the pointer crossed the video (Space = pause)
     assert not win.bind("<Enter>")
@@ -298,6 +376,19 @@ def mouse_controls(root, a):
     assert a._sub_pick.get() == 2
     sub.invoke(2)                         # "Francais"
     assert a.embedded.picked == [3], a.embedded.picked
+    if a.NAME == "mac":
+        # the Mac's other ways to the menu, at the pointer as well
+        t += 2000
+        click(frame, "<ButtonPress-2>", button=2, rootx=210, rooty=160,
+              time=t)
+        t += 2000
+        click(frame, "<ButtonPress-1>", button=1, state=0x4, rootx=220,
+              rooty=170, time=t)
+        t += 2000
+        pump(root)
+        assert a.popups[1:] == [(210, 160), (220, 170)], a.popups
+        assert a.fullscreen is False      # a Control-click is no double-click
+        del a.popups[1:]
     a.embedded.tracks = []
     a._rebuild_sub_menu()
     assert sub.entrycget(0, "state") == "disabled"
@@ -323,7 +414,42 @@ def mouse_controls(root, a):
     a._closing = False
     assert len(a.popups) == 1, a.popups
 
-    # wheel: +/-5 a notch (120) from 100 when libvlc has no volume yet,
+    (wheel_mac if a.NAME == "mac" else wheel_windows)(root, a)
+    a._flash_osd("bye", ms=50)
+    pump(root, 0.3)
+    assert a._osd_win.state() == "withdrawn", a._osd_win.state()
+    assert a._osd_win.title().startswith("StreamSync")
+    print("the volume OSD hides itself")
+
+    # external VLC: the video window is not its player - no menu, no
+    # wheel, and a double-click neither fullscreens the embed nor reaches
+    # out to VLC's own window (a blocking call from here)
+    toggles = []
+    external = a.ctl.external
+    a.ctl.player = object()
+    a.ctl.external = types.SimpleNamespace(
+        fullscreen_toggle=lambda: toggles.append(1))
+    vol = a.embedded.vol
+    click(frame, "<ButtonPress-3>", button=3, rootx=1, rooty=1)
+    click(frame, "<MouseWheel>", delta=120)
+    for _ in range(2):
+        t += 100
+        click(frame, "<ButtonPress-1>", button=1, time=t)
+        click(frame, "<ButtonRelease-1>", button=1, time=t + 20)
+    t += 2000
+    pump(root)
+    assert len(a.popups) == 1 and a.embedded.vol == vol
+    assert toggles == [] and a.fullscreen is False, (toggles, a.fs_calls)
+    a.ctl.player, a.ctl.external = a.embedded, external
+    print("external player: right-click, wheel and double-click leave the "
+          "embed (and VLC) alone")
+
+
+def wheel_windows(root, a):
+    """The wheel on Windows: a notch a step, a touchpad's small deltas
+    adding up to one, clamped to 0-125, never unmuting."""
+    frame = a.video_frame
+    # +/-5 a notch (120) from 100 when libvlc has no volume yet,
     # clamped to 0-125, and never unmutes; the OSD says so
     click(frame, "<MouseWheel>", delta=120)
     pump(root)
@@ -352,35 +478,59 @@ def mouse_controls(root, a):
     click(frame, "<MouseWheel>", delta=-120)
     pump(root)
     assert a.embedded.vol == 0, a.embedded.vol
-    a._flash_osd("bye", ms=50)
-    pump(root, 0.3)
-    assert a._osd_win.state() == "withdrawn", a._osd_win.state()
-    assert a._osd_win.title().startswith("StreamSync")
     print("wheel: volume steps by 5 a notch, small deltas adding up to "
-          "one, clamped to 0-125, stays muted; the OSD shows it and hides "
-          "itself")
+          "one, clamped to 0-125, stays muted; the OSD shows it")
 
-    # external VLC: the video window is not its player - no menu, no
-    # wheel, and a double-click neither fullscreens the embed nor reaches
-    # out to VLC's own window (a blocking call from here)
-    toggles = []
-    external = a.ctl.external
-    a.ctl.player = object()
-    a.ctl.external = types.SimpleNamespace(
-        fullscreen_toggle=lambda: toggles.append(1))
-    click(frame, "<ButtonPress-3>", button=3, rootx=1, rooty=1)
-    click(frame, "<MouseWheel>", delta=120)
-    for _ in range(2):
-        t += 100
-        click(frame, "<ButtonPress-1>", button=1, time=t)
-        click(frame, "<ButtonRelease-1>", button=1, time=t + 20)
-    t += 2000
+
+def wheel_mac(root, a):
+    """The wheel on the Mac: a scroll from rest steps at once (a mouse
+    notch is one event), then a trackpad's small deltas of both signs step
+    once per 60 they add up to; sideways scrolling does nothing; the
+    direction follows the fingers; clamped to 0-125, never unmuting."""
+    frame = a.video_frame
+
+    def rest():
+        time.sleep(a.WHEEL_QUIET + 0.05)
+
+    a._wheel_dir = 1                      # scroll direction: not natural
+    rest()
+    click(frame, "<MouseWheel>", delta=3)
     pump(root)
-    assert len(a.popups) == 1 and a.embedded.vol == 0
-    assert toggles == [] and a.fullscreen is False, (toggles, a.fs_calls)
-    a.ctl.player, a.ctl.external = a.embedded, external
-    print("external player: right-click, wheel and double-click leave the "
-          "embed (and VLC) alone")
+    assert a._wheel.sign == 1, a._wheel.sign
+    assert a.embedded.vol == 105, a.embedded.vol
+    assert a._osd_lbl.cget("text") == "Volume 105% (muted)"
+    assert a.mute_var.get() is True and a.embedded.mute_calls == 0
+    # the rest of the gesture, as a trackpad sends it: 64 in all
+    for d in [8, -2, 8, 8, -2, 8, 8, -2, 8, 8, -2, 8, 8]:
+        click(frame, "<MouseWheel>", delta=d)
+    pump(root)
+    assert a.embedded.vol == 110, a.embedded.vol
+    # sideways (Shift-wheel on Aqua): nothing, however far
+    for _ in range(4):
+        click(frame, "<MouseWheel>", delta=120, state=0x1)
+    pump(root)
+    assert a.embedded.vol == 110, a.embedded.vol
+    rest()
+    a.embedded.vol = 123
+    click(frame, "<MouseWheel>", delta=2)
+    pump(root)
+    assert a.embedded.vol == 125, a.embedded.vol
+    rest()
+    a.embedded.vol = 3
+    click(frame, "<MouseWheel>", delta=-2)
+    pump(root)
+    assert a.embedded.vol == 0, a.embedded.vol
+    # natural scrolling: fingers up sends negative deltas, and is louder
+    rest()
+    a._wheel.sign = -1
+    click(frame, "<MouseWheel>", delta=-2)
+    pump(root)
+    assert a.embedded.vol == 5, a.embedded.vol
+    assert a.mute_var.get() is True and a.embedded.mute_calls == 0
+    rest()
+    print("wheel: from rest a scroll steps 5 at once, then once per 60 of "
+          "mixed-sign deltas; sideways does nothing; fingers up is louder; "
+          "clamped to 0-125, stays muted")
 
 
 LRESULT = ctypes.c_ssize_t
@@ -394,6 +544,10 @@ def fs_bar(root, a):
     win, frame, bar, e = a.video_win, a.video_frame, a.fs_bar, a.embedded
     a.FS_BAR_IDLE = 0.4
     a._pointer_on_fs_bar = lambda: False   # wherever the real pointer is
+    if a.NAME == "mac":
+        # the app has the keyboard, whether or not this test's window
+        # really does (see held_bar_mac)
+        a.root.focus_get = lambda: a.video_win
     win.geometry("960x540+40+40")          # room for the whole bar
     pump(root, 0.3)
     e.t, e.n, e.playing = 754.4, 6750.0, True
@@ -402,7 +556,8 @@ def fs_bar(root, a):
     assert not a._fs_up and bar.state() == "withdrawn"
     a._set_fullscreen(True)
     move(root, a, 12, 10)
-    assert shown(a)
+    assert bar_up(root, a)
+    bar = a.fs_bar                         # the Mac makes it again on entry
     assert a._fs_play.cget("text") == "Pause"
     assert a._fs_time.cget("text") == "12:34", a._fs_time.cget("text")
     assert a._fs_len.cget("text") == "1:52:30", a._fs_len.cget("text")
@@ -499,32 +654,7 @@ def fs_bar(root, a):
     print("resync here / resync (full): the bar holds while one runs, "
           "shows its status, then rests as usual")
 
-    # Another monitor's window keeping the keyboard is the usual case (a
-    # click on the bar leaves it there): the bar holds. Alt+Tab to a
-    # window on the film's monitor mid-resync, though: the topmost bar
-    # must not sit over it until the result is in - it rests as usual.
-    # Back on the film, a move brings it up held again.
-    move(root, a, 52, 30)
-    resync.invoke()
-    pump(root)
-    assert a._fs_hold and shown(a)
-    a.fg["hwnd"] = 1                  # some other application's window...
-    a.fg["monitor"] = (1920, 0, 1920, 1080)      # ...on the other monitor
-    pump(root, 0.8)
-    assert shown(a)
-    del a.fg["monitor"]               # now on the film's
-    pump(root, 0.8)
-    assert not shown(a)
-    a.fg.clear()
-    move(root, a, 53, 30)
-    pump(root, 0.8)
-    assert shown(a)
-    a.ctl.busy = False
-    a._fs_sync_done()
-    pump(root, 0.8)
-    assert not shown(a)
-    print("a held bar holds while another monitor's window is active, and "
-          "rests as usual once one on the film's monitor is")
+    (held_bar_mac if a.NAME == "mac" else held_bar_windows)(root, a)
 
     # a sync started elsewhere (the main window, a hotkey) locks the bar's
     # buttons too, and a click that gets to them anyway starts nothing,
@@ -578,12 +708,72 @@ def fs_bar(root, a):
     # position at most, yet the bar shows and then goes, pointer and all
     a._set_fullscreen(True)
     move(root, a, 44, 30)                        # the same place again
-    assert shown(a)
+    assert bar_up(root, a)
     pump(root, 0.8)
     assert not shown(a) and frame.cget("cursor") == "none"
     a._set_fullscreen(False)
+    if a.NAME == "mac":
+        del a.root.focus_get
     print("fullscreen entered under a resting mouse: the bar shows, then "
           "goes with the pointer")
+
+
+def held_bar_windows(root, a):
+    """Another monitor's window keeping the keyboard is the usual case (a
+    click on the bar leaves it there): the bar holds. Alt+Tab to a window
+    on the film's monitor mid-resync, though: the topmost bar must not sit
+    over it until the result is in - it rests as usual. Back on the film,
+    a move brings it up held again."""
+    resync = a._fs_resync
+    move(root, a, 52, 30)
+    resync.invoke()
+    pump(root)
+    assert a._fs_hold and shown(a)
+    a.fg["hwnd"] = 1                  # some other application's window...
+    a.fg["monitor"] = (1920, 0, 1920, 1080)      # ...on the other monitor
+    pump(root, 0.8)
+    assert shown(a)
+    del a.fg["monitor"]               # now on the film's
+    pump(root, 0.8)
+    assert not shown(a)
+    a.fg.clear()
+    move(root, a, 53, 30)
+    pump(root, 0.8)
+    assert shown(a)
+    a.ctl.busy = False
+    a._fs_sync_done()
+    pump(root, 0.8)
+    assert not shown(a)
+    print("a held bar holds while another monitor's window is active, and "
+          "rests as usual once one on the film's monitor is")
+
+
+def held_bar_mac(root, a):
+    """The Mac: a click on the bar never takes the keyboard, so the app
+    keeps it and the held bar holds. Gone to another app (Command-Tab to
+    the browser) mid-resync, the bar - topmost, on every Space - must not
+    sit over it until the result is in: it rests as usual. Tk reports no
+    focus while another app is active, which is stubbed here."""
+    resync = a._fs_resync
+    move(root, a, 52, 30)
+    resync.invoke()
+    pump(root)
+    assert a._fs_hold and shown(a)
+    pump(root, 0.8)
+    assert shown(a)
+    a.root.focus_get = lambda: None       # another app is active
+    pump(root, 0.8)
+    assert not shown(a)
+    a.root.focus_get = lambda: a.video_win
+    move(root, a, 53, 30)
+    pump(root, 0.8)
+    assert shown(a)
+    a.ctl.busy = False
+    a._fs_sync_done()
+    pump(root, 0.8)
+    assert not shown(a)
+    print("a held bar holds while the app has the keyboard, and rests as "
+          "usual once another app has it")
 
 
 def no_activate(root, a):
@@ -596,7 +786,7 @@ def no_activate(root, a):
     win, bar = a.video_win, a.fs_bar
     a._set_fullscreen(True)
     move(root, a, 60, 30)
-    assert shown(a)
+    assert bar_up(root, a)
     msg = (WM_LBUTTONDOWN << 16) | HTCLIENT
     bh, vh = int(bar.frame(), 16), int(win.frame(), 16)
     assert send(bh, WM_MOUSEACTIVATE, bh, msg) == MA_NOACTIVATE
@@ -659,6 +849,151 @@ def keys(root, a):
     print("real key events over the film: Space pauses, Right seeks")
 
 
+def film_keeps_keys(root, a):
+    """The Mac: showing or hiding the bar (or the OSD) over a fullscreen
+    film can make the main window the key window a moment later; the film
+    takes the keyboard back - once, shortly after, only from the main
+    window, only if the film held it when the overlay changed, and not
+    once the user has clicked in the main window. What macOS does is
+    stubbed: which window has the keyboard, and the film taking it."""
+    win = a.video_win
+    assert win.bind("<FocusOut>"), "the film window does not watch its keyboard"
+    asked = []
+    win.focus_set = lambda: asked.append(1)
+    have = {"w": win}
+    a.root.focus_get = lambda: have["w"]
+
+    def change(action, keys=win, then=None):
+        """`action` changes an overlay while `keys` holds the keyboard,
+        with any earlier change long gone, so only this one can count;
+        `then` runs after it. The main window then takes the keyboard.
+        Returns how many times the film asked for it back (a real
+        FocusOut may come too, which the once-per-change rule absorbs)."""
+        have["w"] = keys
+        a._overlay_at = time.monotonic() - 5
+        n = len(asked)
+        action()
+        if then:
+            then()
+        have["w"] = a.root
+        win.event_generate("<FocusOut>")
+        pump(root, 0.15)
+        return len(asked) - n
+
+    def osd_going():
+        a.video_win.after_cancel(a._osd_after)
+        a._hide_osd()
+
+    try:
+        a._set_fullscreen(True)
+        pump(root, 0.2)
+        assert bar_up(root, a)
+        a._hide_fs_bar()
+        assert change(lambda: move(root, a, 131, 37)) == 1, "bar coming"
+        assert shown(a)
+        assert change(lambda: a._hide_fs_bar(hide_pointer=True)) == 1, \
+            "bar going"
+        assert change(lambda: a._flash_osd("Volume 50%", ms=5000)) == 1, \
+            "OSD coming"
+        # once per change: the main window taking the keyboard again, from
+        # the same change, keeps it
+        n = len(asked)
+        a._keep_film_keys()
+        assert len(asked) == n, asked
+        assert change(osd_going) == 1, "OSD going"
+        # a dialog, or another app, keeps the keyboard
+        n = len(asked)
+        for w in (tk_dialog(root), None):
+            a._overlay_at = time.monotonic()
+            have["w"] = w
+            a._keep_film_keys()
+        assert len(asked) == n, asked
+        # the main window had the keyboard already (the user on another
+        # Space, say) when the bar went: it keeps it
+        move(root, a, 132, 37)
+        assert shown(a)
+        assert change(a._hide_fs_bar, keys=a.root) == 0, "main window's"
+        # the user clicked in the main window after the change (on the
+        # window itself: the test's widgets in it are not mapped, and an
+        # unmapped widget gets no generated click)
+        move(root, a, 133, 37)
+        assert shown(a)
+        assert change(a._hide_fs_bar,
+                      then=lambda: root.event_generate(
+                          "<ButtonPress-1>", x=1, y=1)) == 0, "clicked"
+        # long after the bar went, the main window keeps it too
+        have["w"] = a.root
+        a._overlay_at = time.monotonic() - 2
+        a._keep_film_keys()
+        # and so does it once the film is out of fullscreen (the bar goes
+        # first, while the film still is)
+        a._overlay_at = time.monotonic()
+        a._set_fullscreen(False)
+        a._keep_film_keys()
+        assert len(asked) == n, asked
+        pump(root, 0.1)
+    finally:
+        del win.focus_set, a.root.focus_get
+    print("keys: the bar or the OSD coming or going over the fullscreen "
+          "film hands the keyboard back to it from the main window, once, "
+          "and only then")
+
+
+def left_behind_the_back(root, a):
+    """The Mac: the green button or Ctrl-Cmd-F takes the film out of
+    fullscreen without telling the app. Nothing may go on treating it as
+    fullscreen: no keyboard taken back from the main window, the bar's
+    next look brings self.fullscreen in line, and a pointer hidden with
+    the bar comes back with the next move."""
+    win = a.video_win
+    asked = []
+    win.focus_set = lambda: asked.append(1)
+    have = {"w": win}
+    a.root.focus_get = lambda: have["w"]
+    try:
+        # the bar up: the window leaves, and the OSD flashes over it
+        # before the bar's next tick
+        a._set_fullscreen(True)
+        pump(root, 0.2)
+        assert bar_up(root, a)
+        win.attributes("-fullscreen", 0)
+        assert a.fullscreen
+        a._overlay_at = None
+        a._flash_osd("Volume 50%", ms=10)
+        assert a._overlay_at is None
+        have["w"] = a.root
+        a._overlay_at = time.monotonic()         # as if stamped just before
+        a._keep_film_keys()
+        assert not asked, asked
+        pump(root, 0.4)
+        assert not a.fullscreen and not shown(a)
+        assert win.cget("cursor") == "", win.cget("cursor")
+        # the bar and the pointer resting: the window leaves, and a move
+        # over it brings the pointer back - and the flag in line
+        have["w"] = win
+        a._set_fullscreen(True)
+        pump(root, 0.2)
+        assert bar_up(root, a)
+        a._hide_fs_bar(hide_pointer=True)
+        assert win.cget("cursor") == "none"
+        win.attributes("-fullscreen", 0)
+        move(root, a, 134, 37)
+        assert win.cget("cursor") == "" and a.video_frame.cget("cursor") == ""
+        assert not a.fullscreen and not shown(a)
+        assert not asked, asked
+    finally:
+        del win.focus_set, a.root.focus_get
+    print("fullscreen left behind the app's back: the flag follows the "
+          "window, the keyboard stays put and the pointer comes back")
+
+
+def tk_dialog(root):
+    import tkinter as tk
+    d = tk.Toplevel(root)
+    d.withdraw()
+    return d
+
+
 def frame_steps(root, a):
     """The bar's -1 frame / +1 frame: a nudge of one frame at the film's
     rate, through the shell (so the offset remembers it), and a film's
@@ -667,7 +1002,7 @@ def frame_steps(root, a):
     e.t, e.n, e.playing = 754.4, 6750.0, True
     a._set_fullscreen(True)
     move(root, a, 70, 30)
-    assert shown(a)
+    assert bar_up(root, a)
     a._fs_refresh()
     texts = [b.cget("text") for b in (a._fs_play, a._fs_stop,
                                       a._fs_frame_back, a._fs_frame_fwd,
@@ -691,13 +1026,15 @@ def frame_steps(root, a):
 
 
 def bar_follows_film(root, a):
-    """The bar is placed again when the film moves or changes size - on
-    the Mac it can first show while the film is still growing into
-    fullscreen."""
+    """The bar is placed again when the film moves or changes size, with
+    a <Configure> to say so (Windows) or without one: the Mac's film is
+    full size at once, but sits 28 px down until the fullscreen animation
+    ends, and no <Configure> comes when it moves into place."""
     win, bar = a.video_win, a.fs_bar
     a._set_fullscreen(True)
     move(root, a, 80, 30)
-    assert shown(a)
+    assert bar_up(root, a)
+    bar = a.fs_bar                         # the Mac makes it again on entry
     win.geometry("800x450+60+50")
     move(root, a, 81, 30)                        # and keep it up
     pump(root, 0.2)
@@ -709,34 +1046,57 @@ def bar_follows_film(root, a):
             and bar.winfo_rooty() + bar.winfo_height()
             < win.winfo_rooty() + win.winfo_height()), \
         (bar.winfo_geometry(), win.winfo_geometry())
+    # ...and when it moved 28 px at the same size with no <Configure> to
+    # say so, as the Mac's does at the end of the fullscreen animation:
+    # the bar's next tick sees it. (Down, not up: macOS keeps a window
+    # from moving up under the menu bar.)
+    idle, a.FS_BAR_IDLE = a.FS_BAR_IDLE, 5.0     # up for a tick or two
+    move(root, a, 82, 30)
+    top = win.winfo_rooty()
+    win.unbind("<Configure>")
+    try:
+        win.geometry("800x450+60+78")
+        pump(root, 0.6)
+    finally:
+        win.bind("<Configure>", a._on_film_configure)
+        a.FS_BAR_IDLE = idle
+    assert shown(a)
+    assert win.winfo_rooty() == top + 28, (top, win.winfo_geometry())
+    bottom = bar.winfo_rooty() + bar.winfo_height()
+    want = win.winfo_rooty() + win.winfo_height() - 40
+    assert abs(bottom - want) <= 1, (bottom, want)
     a._set_fullscreen(False)
     win.geometry("960x540+40+40")
     pump(root, 0.3)
-    print("the bar follows the film when it moves or changes size")
+    print("the bar follows the film when it moves or changes size, with "
+          "a <Configure> or without")
 
 
 def external_fullscreen(root, a):
     """Switching to the VLC app while the film is fullscreen leaves
-    fullscreen first, then hides the film window: shown again later, it
-    must not come back covering the screen with nothing playing."""
+    fullscreen first, then hides the film window (the Mac keeps it up):
+    shown again later, it must not come back covering the screen with
+    nothing playing."""
     win = a.video_win
     a._set_fullscreen(True)
     move(root, a, 90, 30)
-    assert shown(a)
+    assert bar_up(root, a)
     hwnd = int(win.frame(), 16)
     a.player_var.set("external")
     a._apply_player_choice()
     pump(root)
     assert a.fs_calls[-1] == ("off", hwnd, "kept"), a.fs_calls[-2:]
     assert not a.fullscreen and not shown(a)
-    assert win.state() == "withdrawn", win.state()
+    want = "withdrawn" if a.WITHDRAW_FILM_FOR_EXTERNAL else "normal"
+    assert win.state() == want, win.state()
     a.player_var.set("embedded")
     a._apply_player_choice()
     pump(root)
     assert a.player is a.embedded and win.state() == "normal", win.state()
     assert not a.fullscreen
     print("the VLC app while fullscreen: fullscreen left, the bar gone and "
-          "the film window hidden; back to the built-in player, it shows")
+          "the film window hidden (kept up on the Mac); back to the built-in "
+          "player, it shows")
 
 
 def sync_args(root):
@@ -893,12 +1253,59 @@ def vout_hits(root, a):
           "a click there still lands on our frame")
 
 
+def overlays_per_fullscreen(root, a):
+    """The Mac makes the bar and the volume overlay again as fullscreen
+    begins: macOS keeps a window on the Space it was first shown on, and
+    a bar made at startup showed on the desktop, behind the fullscreen
+    film. What the app had told the old bar carries over. Windows keeps
+    the one bar."""
+    old_bar = a.fs_bar
+    a._fs_status.config(text="Synced (test)")
+    for b in (a._fs_resync, a._fs_full):
+        b.config(state="disabled")
+    a._fs_hold = True
+    a._flash_osd("Volume 50%", ms=10000)
+    old_osd = a._osd_win
+    try:
+        a._set_fullscreen(True)
+        pump(root, 0.2)
+        assert bar_up(root, a)
+        if a.OVERLAYS_PER_FULLSCREEN:
+            assert a.fs_bar is not old_bar and not old_bar.winfo_exists()
+            assert a._osd_win is None and not old_osd.winfo_exists()
+            assert a._osd_after is None
+        else:
+            assert a.fs_bar is old_bar and a._osd_win is old_osd
+        assert a._fs_status.cget("text") == "Synced (test)", a._fs_status.cget("text")
+        assert [b.cget("state") for b in (a._fs_resync, a._fs_full)] == ["disabled"] * 2
+        assert a._fs_hold
+        a._flash_osd("Volume 55%", ms=10)       # made again where it is needed
+        assert a._osd_win is not None and a._osd_win.winfo_exists()
+    finally:
+        a._fs_hold = False
+        for b in (a._fs_resync, a._fs_full):
+            b.config(state="normal")
+        a._fs_status.config(text="")
+        a._set_fullscreen(False)
+        pump(root, 0.2)
+    print("overlays " + ("made again on each fullscreen, the bar's state carried over"
+                         if a.OVERLAYS_PER_FULLSCREEN else "kept across fullscreen"))
+
+
 def main():
     wheel_steps()
-    if sys.platform != "win32":
-        print(f"SKIPPED: the Windows film window, this is {sys.platform} "
-              "(the film window's Mac controls come in Step 5)")
+    if sys.platform == "win32":
+        from ui import platform_win as platform
+    elif sys.platform == "darwin":
+        from ui import platform_mac as platform
+        # the window's own fullscreen is stubbed (see stub_mac_fullscreen):
+        # no animation to wait out before a request counts as taken
+        platform.FULLSCREEN_RETRY = 0.02
+    else:
+        print(f"SKIPPED: the film window on Windows and the Mac, this is "
+              f"{sys.platform}")
         return
+    windows = sys.platform == "win32"
     import tkinter as tk
 
     root = tk.Tk()
@@ -908,27 +1315,37 @@ def main():
     root.report_callback_exception = (
         lambda *exc: errors.append("".join(traceback.format_exception(*exc))))
     try:
-        a = make_app(root)
+        a = make_app(root, platform)
         mouse_controls(root, a)
         # The bar's checks need a window big enough for the whole bar, over
         # much of the screen - and the real pointer must not rest on it:
         # Windows sends a move at the pointer whenever a window appears or
         # vanishes under it, which would mix with the checks' own moves.
-        pt = wintypes.POINT()
-        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-        ctypes.windll.user32.SetCursorPos(0, 0)     # the window is at +40+40
+        # (A test does not move the Mac's pointer; there the checks put
+        # their moves where the real pointer is not, as on Windows.)
+        if windows:
+            pt = wintypes.POINT()
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+            ctypes.windll.user32.SetCursorPos(0, 0)  # the window is at +40+40
         try:
             fs_bar(root, a)
-            no_activate(root, a)
+            if windows:
+                no_activate(root, a)
             keys(root, a)
+            overlays_per_fullscreen(root, a)
+            if not windows:
+                film_keeps_keys(root, a)
+                left_behind_the_back(root, a)
             frame_steps(root, a)
             bar_follows_film(root, a)
             external_fullscreen(root, a)
         finally:
-            ctypes.windll.user32.SetCursorPos(pt.x, pt.y)
+            if windows:
+                ctypes.windll.user32.SetCursorPos(pt.x, pt.y)
         sync_args(root)
-        monitors(root)
-        vout_hits(root, a)
+        if windows:
+            monitors(root)
+            vout_hits(root, a)
         pump(root, 0.2)
         assert not errors, "\n".join(errors)
     finally:
