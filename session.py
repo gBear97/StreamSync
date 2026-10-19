@@ -27,6 +27,7 @@ import queue
 import threading
 import time
 import traceback
+from urllib.parse import urlsplit
 
 import numpy as np
 
@@ -34,6 +35,7 @@ import audio_capture
 import audio_matcher
 import fingerprint
 import matcher
+import netcerts
 from ntpclock import SharedClock
 
 FP_HOP = fingerprint.FP_HOP
@@ -308,11 +310,7 @@ class Link:
     outlives any one connection so a reconnect keeps the same reader."""
 
     def __init__(self, url, inbox):
-        from websockets.sync.client import connect
-        # Entered by hand because this connection outlives any `with`
-        # block; websockets 17.1 deprecates a bare connect() and older
-        # versions lack its legacy=True alternative.
-        self.ws = connect(url, max_size=None, open_timeout=10).__enter__()
+        self.ws = _open(url)
         self.inbox = inbox
         self.alive = True
         threading.Thread(target=self._pump, daemon=True).start()
@@ -340,6 +338,27 @@ class Link:
             self.ws.close()
         except Exception:
             pass
+
+
+def _open(url):
+    """The relay's websocket, verified against netcerts' roots for wss://.
+
+    Left to itself, websockets verifies a wss:// relay with Python's
+    default context, and in the shipped Mac app that context has no CA
+    roots at all: every TLS relay, a Cloudflare tunnel's included, failed
+    with CERTIFICATE_VERIFY_FAILED. ws:// gets no context, as before -
+    websockets refuses one there.
+    """
+    from websockets.sync.client import connect
+
+    # Entered by hand because this connection outlives any `with` block;
+    # websockets 17.1 deprecates a bare connect() and older versions lack
+    # its legacy=True alternative.
+    if urlsplit(url).scheme != "wss":
+        return connect(url, max_size=None, open_timeout=10).__enter__()
+    return netcerts.verified(
+        lambda ctx: connect(url, max_size=None, open_timeout=10,
+                            ssl=ctx).__enter__())
 
 
 def _connect(url, inbox, hello, ok_types, stop, deadline):

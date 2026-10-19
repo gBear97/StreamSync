@@ -1078,6 +1078,41 @@ def watch_party(env, root, app):
     pump(root, 0.9)
     check("a session that ended shows the idle view again", d.idle.winfo_ismapped(), 1)
     app.ctl.session = None
+
+    # A relay at a wss:// address - a tunnel's - goes to the session as
+    # typed and is the relay saved for next time.
+    import session as engine
+    joined = []
+
+    class Viewer(SimpleNamespace):
+        def __init__(self, relay_url, code, *a, **kw):
+            super().__init__(code=code, stop_flag=threading.Event())
+            joined.append(relay_url)
+
+        def start(self):
+            pass
+
+    real_viewer = engine.ViewerSession
+    engine.ViewerSession = Viewer
+    try:
+        tunnel = "wss://example-words-here.trycloudflare.com"
+        d.relay_field.entry.delete(0, "end")
+        d.relay_field.entry.insert(0, f" {tunnel} ")
+        d.join_code.set("ABCD-EFGH")
+        d._join()
+        pump(root, 0.1)
+        check("Join hands the wss:// relay to the session", joined, [tunnel])
+        check("the controller keeps it", app.ctl.relay_url, tunnel)
+        check("it is saved as relay_url",
+              json.loads(env.config.read_text()).get("relay_url"), tunnel)
+        check("the field shows it while the session runs",
+              (d.relay_var.get().strip(), d.relay_field.entry.cget("state")),
+              (tunnel, "readonly"))
+        app.ctl.session.stop_flag.set()
+        pump(root, 0.9)
+    finally:
+        engine.ViewerSession = real_viewer
+        app.ctl.session = None
     d.close()
     pump(root, 0.1)
     check("Close unregisters Watch party", app._party, None)
