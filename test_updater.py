@@ -1,12 +1,12 @@
 """Checks the update logic that can be exercised without a Mac.
 
 Covers version comparison, picking each platform's build, the checksum
-lookup, the release signature (against RFC 8032's own test vectors, then
-a whole download served from memory and refused every way it should be),
-and where a Windows install may update itself from - the parts that
-decide whether an update happens at all. Mounting and swapping a bundle
-needs real macOS, and running the installer real Windows, so neither is
-done here.
+lookup, the release signature (against RFC 8032's own test vectors and
+every malformed key, R and length it must refuse, then a whole download
+served from memory and refused every way it should be), and where a
+Windows install may update itself from - the parts that decide whether
+an update happens at all. Mounting and swapping a bundle needs real
+macOS, and running the installer real Windows, so neither is done here.
 
     python3 test_updater.py
 """
@@ -239,11 +239,18 @@ def _keypair(seed):
     a = int.from_bytes(h[:32], "little") & ((1 << 254) - 8) | (1 << 254)
     pub = _compress(sigcheck._mul(a, sigcheck.G))
 
-    def sign(msg):
-        r = int.from_bytes(hashlib.sha512(h[32:] + msg).digest(),
-                           "little") % sigcheck.L
-        big_r = _compress(sigcheck._mul(r, sigcheck.G))
-        k = int.from_bytes(hashlib.sha512(big_r + pub + msg).digest(),
+    def sign(msg, as_key=None, big_r=None):
+        """`as_key` hashes other bytes in the public key's place, and
+        `big_r` puts in a given R with no nonce behind it (r = 0): both
+        only to make signatures the verifier has to turn away."""
+        key = pub if as_key is None else as_key
+        if big_r is None:
+            r = int.from_bytes(hashlib.sha512(h[32:] + msg).digest(),
+                               "little") % sigcheck.L
+            big_r = _compress(sigcheck._mul(r, sigcheck.G))
+        else:
+            r = 0
+        k = int.from_bytes(hashlib.sha512(big_r + key + msg).digest(),
                            "little") % sigcheck.L
         return big_r + ((r + k * a) % sigcheck.L).to_bytes(32, "little")
     return pub, sign
@@ -254,6 +261,169 @@ _pub2, _sign2 = _keypair(bytes.fromhex(
     "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"))
 check("test signer matches RFC", (_pub2.hex(), _sign2(b"\x72").hex()),
       (RFC[1][0], RFC[1][2]))
+
+# --- how a key or an R is decoded (RFC 8032 5.1.3) ----------------------
+# 32 bytes: y, with the low bit of x in the top bit. Each refusal below is
+# shown first to matter - the bytes would name a point, or let a forgery
+# through, if that one rule were gone.
+IDENTITY = (0, 1, 1, 0)
+
+
+def _encode(y, sign=0):
+    return (y | sign << 255).to_bytes(32, "little")
+
+
+def _on_curve(point):
+    zi = sigcheck._inv(point[2])
+    x, y = point[0] * zi % sigcheck.P, point[1] * zi % sigcheck.P
+    return (y * y - x * x - 1 - sigcheck.D * x * x * y * y) % sigcheck.P == 0
+
+
+def _verify(*args):
+    """sigcheck.verify, with anything it raises reported, not raised: it
+    promises never to raise on bad input."""
+    try:
+        return sigcheck.verify(*args)
+    except Exception as e:
+        return f"raised {type(e).__name__}"
+
+
+def _needs_sqrt_m1(enc):
+    """Whether x^2's (P+3)/8-th power, the first root tried, is not one
+    and the decoder has to multiply it by sqrt(-1)."""
+    y = int.from_bytes(enc, "little") & ((1 << 255) - 1)
+    x2 = (y * y - 1) * sigcheck._inv(sigcheck.D * y * y + 1) % sigcheck.P
+    x = pow(x2, (sigcheck.P + 3) // 8, sigcheck.P)
+    return (x * x - x2) % sigcheck.P != 0
+
+
+# Every RFC key and R decodes to a point on the curve that encodes back to
+# the same bytes: the right root, with the right sign. Keys 1 and 3 take
+# the sqrt(-1) step, key 2 does not.
+for i, (pk, _, sig) in enumerate(RFC, 1):
+    for what, enc in (("key", pk), ("R", sig[:64])):
+        point = sigcheck._decompress(bytes.fromhex(enc))
+        check(f"RFC test {i} {what} decodes onto the curve",
+              point is not None and _on_curve(point)
+              and _compress(point).hex(), enc)
+check("RFC keys that need sqrt(-1)",
+      [i for i, (pk, _, _) in enumerate(RFC, 1)
+       if _needs_sqrt_m1(bytes.fromhex(pk))], [1, 3])
+
+# The eight points of small order, the curve's cofactor: the identity,
+# (0, -1), (+-sqrt(-1), 0) - which take the sqrt(-1) step - and four of
+# order 8. Each is a proper encoding and decodes to just that point.
+SMALL_ORDER = {
+    "0100000000000000000000000000000000000000000000000000000000000000": 1,
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f": 2,
+    "0000000000000000000000000000000000000000000000000000000000000000": 4,
+    "0000000000000000000000000000000000000000000000000000000000000080": 4,
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a": 8,
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa": 8,
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05": 8,
+    "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85": 8,
+}
+orders = []
+for enc, order in SMALL_ORDER.items():
+    t = sigcheck._decompress(bytes.fromhex(enc))
+    ok = t is not None and _on_curve(t) and _compress(t).hex() == enc
+    check(f"order-{order} point {enc[:4]}..{enc[-2:]} decodes", ok, True)
+    orders.append(ok and next((k for k in (1, 2, 4, 8) if sigcheck._equal(
+        sigcheck._mul(k, t), IDENTITY)), None))
+check("small-order points' orders", orders, list(SMALL_ORDER.values()))
+check("(+-sqrt(-1), 0) needs sqrt(-1)", _needs_sqrt_m1(bytes(32)), True)
+
+# The release key is of order L - in the prime-order group, and not the
+# identity - so it is no small-order key. RFC 8032 does not refuse those
+# (with the identity as A, [k]A vanishes and (B, 1) verifies for any
+# message), and neither does this verifier: the one key it checks
+# against is fixed in the app, so no weak key can be slipped in.
+release_a = sigcheck._decompress(updater.RELEASE_KEY)
+check("release key has order L", release_a is not None
+      and (sigcheck._equal(sigcheck._mul(sigcheck.L, release_a), IDENTITY),
+           sigcheck._equal(release_a, IDENTITY)), (True, False))
+
+# x = 0 has no sign to give: the identity or (0, -1) with the top bit set
+# names nothing. A decoder that let "-0" by would give the identity two
+# spellings, and the second lets that (B, 1) forgery through.
+b_one = _compress(sigcheck.G) + (1).to_bytes(32, "little")
+for enc in ("01" + "00" * 30 + "80", "ec" + "ff" * 31):
+    check(f"x = 0 with the sign bit set ({enc[:4]}..{enc[-2:]})",
+          sigcheck._decompress(bytes.fromhex(enc)), None)
+check("identity key as -0, forgery refused",
+      _verify(_encode(1, 1), b"any", b_one), False)
+
+# y >= P: the 19 values from P to 2^255 - 1, either sign. 23 of those 38
+# name a point once reduced (y = P + 1 is the identity), so only the
+# y < P rule keeps each point to one encoding, and keeps the identity
+# spelt y = P + 1 from passing as a key.
+non_canonical = [(y - sigcheck.P, sign) for y in range(sigcheck.P, 2 ** 255)
+                 for sign in (0, 1)]
+check("non-canonical encodings that name a point once reduced",
+      sum(sigcheck._decompress(_encode(k, sign)) is not None
+          for k, sign in non_canonical), 23)
+check("non-canonical encodings decoded (as (y - P, sign))",
+      [(k, sign) for k, sign in non_canonical
+       if sigcheck._decompress(_encode(sigcheck.P + k, sign)) is not None],
+      [])
+check("identity key as y = P + 1, forgery refused",
+      _verify(_encode(sigcheck.P + 1), b"any", b_one), False)
+
+# Not on the curve: for y = 2, x^2 = (y^2 - 1) / (d y^2 + 1) is no square
+# mod P (Euler's criterion), so neither root the decoder tries fits.
+x2 = 3 * sigcheck._inv(4 * sigcheck.D + 1) % sigcheck.P
+check("y = 2 has no x", pow(x2, (sigcheck.P - 1) // 2, sigcheck.P),
+      sigcheck.P - 1)
+for sign in (0, 1):
+    check(f"off-curve y = 2, sign {sign}",
+          sigcheck._decompress(_encode(2, sign)), None)
+check("off-curve key", _verify(_encode(2), b"", sig1), False)
+check("off-curve R", _verify(pk1, b"", _encode(2) + sig1[32:]), False)
+
+# A small-order R with s = k*a: [s]B = [k]A misses R + [k]A by that small
+# point alone. The cofactored check RFC 8032 also allows, [8][s]B = [8]R
+# + [8][k]A, passes every one; this verifier checks the equation itself,
+# so must turn every one away.
+a2 = sigcheck._decompress(_pub2)
+for enc, order in SMALL_ORDER.items():
+    if order == 1:
+        continue
+    sig = _sign2(b"\x72", big_r=bytes.fromhex(enc))
+    s = int.from_bytes(sig[32:], "little")
+    k = int.from_bytes(hashlib.sha512(sig[:32] + _pub2 + b"\x72").digest(),
+                       "little") % sigcheck.L
+    t = sigcheck._decompress(sig[:32])
+    if t is not None:     # (a failure to decode is reported above)
+        check(f"order-{order} R {enc[:4]}..{enc[-2:]} passes the cofactored"
+              " check", sigcheck._equal(
+                  sigcheck._mul(8, sigcheck._mul(s, sigcheck.G)),
+                  sigcheck._mul(8, sigcheck._add(t, sigcheck._mul(k, a2)))),
+              True)
+    check(f"order-{order} R {enc[:4]}..{enc[-2:]} refused",
+          _verify(_pub2, b"\x72", sig), False)
+
+# Lengths, each built so that only the length check stands in the way:
+# RFC test 2's signature ends in a zero byte, so its first 63 bytes carry
+# the same s, as does RFC test 1's with a zero byte added; and a key that
+# ends in a zero byte (the first seed 0, 1, 2, ... to give one is 74) is
+# the same point in 31 bytes or, zero added, 33 - signed over those bytes.
+pk2, sig2 = bytes.fromhex(RFC[1][0]), bytes.fromhex(RFC[1][2])
+check("RFC test 2's signature ends in a zero byte", sig2[63], 0)
+check("signature one byte short", _verify(pk2, b"\x72", sig2[:63]), False)
+check("signature one byte long", _verify(pk1, b"", sig1 + b"\x00"), False)
+pub74, sign74 = _keypair((74).to_bytes(32, "little"))
+check("seed 74's key ends in a zero byte", pub74[31], 0)
+for label, key in (("key one byte short", pub74[:31]),
+                   ("key one byte long", pub74 + b"\x00")):
+    check(label, _verify(key, b"m", sign74(b"m", as_key=key)), False)
+
+# The right length but not bytes: a list of the same ints would get
+# through int.from_bytes and bytes() alike. A bytearray is fine.
+check("key as a list", _verify(list(pk1), b"", sig1), False)
+check("signature as a list", _verify(pk1, b"", list(sig1)), False)
+check("signature as text", _verify(pk1, b"", "x" * 64), False)
+check("bytearray key and signature",
+      _verify(bytearray(pk1), b"", bytearray(sig1)), True)
 
 # --- a whole verified download, served from memory ----------------------
 PUB, SIGN = _keypair(b"\x01" * 32)
