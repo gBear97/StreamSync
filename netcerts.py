@@ -9,7 +9,8 @@ trust anchors at all and every HTTPS call failed with
     [SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer certificate
 
 which is why the updater could never reach GitHub, and why the one-click
-BlackHole install would have failed the same way.
+BlackHole install would have failed the same way. So did a watch party
+whose relay address was wss://, until session.py took its roots from here.
 
 Roots are taken from the first of these that yields any:
 
@@ -180,6 +181,23 @@ def urlopen(req, timeout=30):
         if not _widen():
             raise
         return urllib.request.urlopen(req, timeout=timeout, context=context())
+
+
+def verified(open_with):
+    """open_with(context) with the shared roots, widened and tried once
+    more if the server's certificate fails to verify - urlopen's retry,
+    for a connection urlopen does not make: the watch party's websocket
+    to a wss:// relay.
+
+    open_with must be safe to repeat. Opening a websocket is: nothing has
+    been sent when the handshake fails.
+    """
+    try:
+        return open_with(context())
+    except ssl.SSLError:
+        if not _widen():
+            raise
+        return open_with(context())
 
 
 def describe():

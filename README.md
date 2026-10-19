@@ -359,10 +359,42 @@ only to that host.
 
 A watch party runs through a relay: a small program the host and every
 viewer connect to, which passes the session's messages along. The apps
-do not include one, so someone runs it on a machine both sides can
-reach - a $5 VPS or small AWS instance serves thousands of viewers
-(traffic is a few tiny messages per second per room, and a slow viewer
-never holds up the others). On that machine:
+do not include one, so someone runs it where both sides can reach it.
+There are two ways.
+
+**No server needed.** The host runs the relay on their own computer and
+a free [Cloudflare quick tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+makes it reachable from anywhere. No account, nothing to rent, nothing
+to open in a router or firewall.
+
+1. Set up and start the relay as in steps 1 to 3 below, on the host's
+   computer.
+2. Install `cloudflared` - on a Mac, `brew install cloudflared`; on
+   Windows, the MSI from Cloudflare's
+   [downloads page](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/) -
+   and, in a second window, run
+
+   ```
+   cloudflared tunnel --url http://localhost:8765
+   ```
+
+   After a few seconds it prints an address like
+   `https://some-random-words.trycloudflare.com`.
+3. Everyone, host included, sets **Relay server** to that address with
+   `wss://` in place of `https://`:
+   `wss://some-random-words.trycloudflare.com`.
+
+Keep both windows open while the party lasts. The address changes every
+time `cloudflared` starts, so share the new one each time. This suits a
+group of friends rather than a large audience: the relay is only up
+while the host's computer is, and a quick tunnel is a free service
+Cloudflare offers for testing, with a cap on how much it carries at
+once.
+
+**On a server.** For a relay that is always there, run it on a machine
+both sides can reach - a $5 VPS or small AWS instance serves thousands
+of viewers (traffic is a few tiny messages per second per room, and a
+slow viewer never holds up the others). On that machine:
 
 1. Install Python 3 (on Debian or Ubuntu, `python3-venv` as well).
 2. Download `relay_server.py` from this repository and install the one
@@ -381,6 +413,7 @@ never holds up the others). On that machine:
    relay-env/bin/python relay_server.py --port 8765
    ```
 
+   (On Windows, `relay-env\Scripts\python relay_server.py --port 8765`.)
    It prints `StreamSync relay listening on :8765`. `--host-grace N`
    sets how long a dropped host's room waits for it (default 60 s).
 4. Let inbound TCP port 8765 through that machine's firewall - on a VPS
@@ -560,9 +593,9 @@ python test_ui.py             # every screen under real Tk
 The Tests workflow runs the full set on Windows, macOS and Linux for
 each pull request: `test_audio_capture`, `test_players`,
 `test_controller`, `test_audio_matcher`, `test_fingerprint`,
-`test_relay`, `test_session`, `test_updater`, `test_netcerts`,
-`test_diagnostics`, `test_macswap`, `test_windowctl`, `test_videomouse`,
-`test_widgets`, `test_updateflow` and `test_ui`. Tests that drive real
+`test_relay`, `test_relay_tls`, `test_session`, `test_updater`,
+`test_netcerts`, `test_diagnostics`, `test_macswap`, `test_windowctl`,
+`test_videomouse`, `test_widgets`, `test_updateflow` and `test_ui`. Tests that drive real
 windows skip themselves where they cannot run. Set `STREAMSYNC_SHOTS` to
 a folder and `test_ui` saves each screen there as a PNG. Those tests
 guard against regressions; for how well the audio matcher does on real

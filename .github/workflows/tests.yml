@@ -75,8 +75,8 @@ jobs:
           set -e
           for t in test_audio_capture test_players test_controller \
                    test_audio_matcher test_fingerprint test_relay \
-                   test_session test_updater test_netcerts test_diagnostics \
-                   test_macswap test_windowctl test_videomouse \
+                   test_relay_tls test_session test_updater test_netcerts \
+                   test_diagnostics test_macswap test_windowctl test_videomouse \
                    test_widgets test_updateflow test_ui; do
             echo "=== $t"
             if [ "$t" = test_ui ] && [ "$RUNNER_OS" = Linux ] && [ -z "$DISPLAY" ]; then
