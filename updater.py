@@ -322,6 +322,60 @@ def verify_signature(app_path, team_id=TEAM_ID):
     return True
 
 
+def _tool_said(e):
+    """The last line a failed tool printed, or how it failed to start."""
+    if isinstance(e, subprocess.CalledProcessError):
+        lines = (e.stderr or e.stdout or "").strip().splitlines()
+        if lines:
+            return lines[-1]
+        return f"{e.cmd[0]} exited with status {e.returncode}"
+    return str(e)
+
+
+def _attach(dmg_path, mount):
+    """Mount the disk image read-only at `mount`, hidden from Finder.
+
+    hdiutil first, then `diskutil image attach`. macOS 27 marks the
+    hdiutil attach and detach forms used here as deprecated in favour of
+    diskutil image, which older macOS does not have. If Apple removes
+    them, every Mac update would otherwise stop at this step - and an app
+    that cannot update cannot be updated out of it.
+    """
+    try:
+        subprocess.run(["hdiutil", "attach", dmg_path, "-mountpoint", mount,
+                        "-nobrowse", "-readonly"],
+                       check=True, capture_output=True, text=True)
+        return
+    except (OSError, subprocess.CalledProcessError) as e:
+        first = e
+    try:
+        subprocess.run(["diskutil", "image", "attach", "--readOnly",
+                        "--mountOptions", "nobrowse", "--mountPoint", mount,
+                        dmg_path],
+                       check=True, capture_output=True, text=True)
+    except (OSError, subprocess.CalledProcessError) as e:
+        # hdiutil's reason, unless hdiutil is not there at all
+        why = _tool_said(e if isinstance(first, OSError) else first)
+        raise UpdateError(
+            f"The disk image could not be opened.\n\n{why}") from e
+
+
+def _detach(mount):
+    """Unmount the disk image, by whichever tool still works, and remove
+    the mount folder - only once it is empty, so never a mounted one."""
+    for cmd in (["hdiutil", "detach", mount], ["diskutil", "eject", mount]):
+        try:
+            if subprocess.run(cmd, capture_output=True,
+                              text=True).returncode == 0:
+                break
+        except OSError:
+            pass
+    try:
+        os.rmdir(mount)
+    except OSError:
+        pass
+
+
 def stage(dmg_path, app_path, log=print):
     """Copy the new bundle out of the disk image, beside the installed one.
 
@@ -330,9 +384,11 @@ def stage(dmg_path, app_path, log=print):
     """
     mount = tempfile.mkdtemp(prefix="streamsync-update-")
     log("Mounting the disk image...")
-    subprocess.run(["hdiutil", "attach", dmg_path, "-mountpoint", mount,
-                    "-nobrowse", "-readonly"],
-                   check=True, capture_output=True, text=True)
+    try:
+        _attach(dmg_path, mount)
+    except UpdateError:
+        _detach(mount)       # in case it half-attached; removes the folder
+        raise
     staged = app_path + ".new"
     try:
         src = os.path.join(mount, "StreamSync.app")
@@ -343,8 +399,7 @@ def stage(dmg_path, app_path, log=print):
         subprocess.run(["ditto", src, staged], check=True,
                        capture_output=True, text=True)
     finally:
-        subprocess.run(["hdiutil", "detach", mount], check=False,
-                       capture_output=True, text=True)
+        _detach(mount)
 
     if not os.path.isdir(staged):
         subprocess.run(["rm", "-rf", staged], check=False)
