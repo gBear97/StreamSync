@@ -6,7 +6,9 @@ every malformed key, R and length it must refuse, then a whole download
 served from memory and refused every way it should be), and where a
 Windows install may update itself from - the parts that decide whether
 an update happens at all. Mounting and swapping a bundle needs real
-macOS, and running the installer real Windows, so neither is done here.
+macOS, and running the installer real Windows, so neither is done here -
+but which tools the Mac's staging step mounts the disk image with, and
+what it does when hdiutil fails or is gone, is checked over fakes.
 
     python3 test_updater.py
 """
@@ -512,6 +514,113 @@ _expect_refused("swapped build", *_release(SUMS_OK, SIGN(SUMS_OK),
 partial = b"aaaa1111  StreamSync-2.0.0-arm64-abc1234.dmg\n"
 _expect_refused("build missing from sums", *_release(partial, SIGN(partial)),
                 "no SHA256SUMS entry")
+
+# --- staging a Mac update: mounting the disk image ---------------------
+# macOS 27 deprecates the hdiutil attach/detach forms stage() uses, so
+# it falls back to `diskutil image attach` / `diskutil eject`. Every tool
+# is faked (this runs on Windows and Linux too); the fake attach puts a
+# StreamSync.app in the mount folder, and ditto "copies" it.
+import shutil
+
+
+def _stage_with(hdiutil="ok", diskutil="ok", detach="ok"):
+    """Run stage() over fake tools. Each is "ok", "fails" (non-zero
+    exit) or "missing" (not installed); `detach` is hdiutil's detach on
+    its own. Returns (result, commands, mount folder, whether stage()
+    left that folder behind)."""
+    calls, mounts = [], []
+
+    def run(cmd, *a, **kw):
+        calls.append(cmd)
+        tool = cmd[0]
+        unmount = cmd[1] in ("detach", "eject")
+        for flag in ("-mountpoint", "--mountPoint"):
+            if flag in cmd and cmd[cmd.index(flag) + 1] not in mounts:
+                mounts.append(cmd[cmd.index(flag) + 1])
+        how = {"hdiutil": detach if unmount else hdiutil,
+               "diskutil": diskutil}.get(tool, "ok")
+        if how == "missing":
+            raise FileNotFoundError(2, "No such file or directory", tool)
+        if how == "fails":
+            if kw.get("check"):
+                raise _sp.CalledProcessError(
+                    1, cmd, "", f"{tool}: attach failed: oops")
+            return _Result(1, "", f"{tool}: failed")
+        if tool in ("hdiutil", "diskutil") and not unmount:
+            flag = "-mountpoint" if tool == "hdiutil" else "--mountPoint"
+            os.makedirs(os.path.join(cmd[cmd.index(flag) + 1],
+                                     "StreamSync.app"))
+        elif tool == "ditto":
+            os.makedirs(cmd[2])
+        elif tool == "rm":
+            shutil.rmtree(cmd[-1], ignore_errors=True)
+        return _Result(0, "", "")
+
+    home = tempfile.mkdtemp()
+    real_verify = updater.verify_signature
+    _sp.run = run
+    updater.verify_signature = lambda path: True
+    try:
+        result = os.path.basename(updater.stage(
+            "/tmp/StreamSync.dmg", os.path.join(home, "StreamSync.app"),
+            log=lambda t: None))
+    except updater.UpdateError as e:
+        result = e
+    finally:
+        left = any(os.path.exists(m) for m in mounts)
+        _sp.run = _real_run
+        updater.verify_signature = real_verify
+        for folder in [home] + mounts:
+            shutil.rmtree(folder, ignore_errors=True)
+    return result, calls, (mounts or [None])[0], left
+
+
+def _tools(calls):
+    """Each command as its tool and verb: "hdiutil attach", "ditto"."""
+    return [" ".join(c[:3] if c[:2] == ["diskutil", "image"] else
+                     c[:2] if c[0] in ("hdiutil", "diskutil") else c[:1])
+            for c in calls]
+
+
+got, calls, mount, left = _stage_with()
+check("hdiutil works: staged", got, "StreamSync.app.new")
+check("hdiutil works: diskutil never asked", _tools(calls),
+      ["hdiutil attach", "rm", "ditto", "hdiutil detach"])
+
+got, calls, mount, left = _stage_with(hdiutil="fails")
+check("hdiutil refuses: staged through diskutil", got, "StreamSync.app.new")
+check("hdiutil refuses: diskutil's attach", calls[1],
+      ["diskutil", "image", "attach", "--readOnly", "--mountOptions",
+       "nobrowse", "--mountPoint", mount, "/tmp/StreamSync.dmg"])
+check("hdiutil refuses: still detached by hdiutil", calls[-1],
+      ["hdiutil", "detach", mount])
+
+got, calls, mount, left = _stage_with(hdiutil="missing", detach="missing")
+check("hdiutil gone: staged through diskutil", got, "StreamSync.app.new")
+check("hdiutil gone: the tools", _tools(calls),
+      ["hdiutil attach", "diskutil image attach", "rm", "ditto",
+       "hdiutil detach", "diskutil eject"])
+check("hdiutil gone: ejected by diskutil", calls[-1],
+      ["diskutil", "eject", mount])
+
+got, calls, mount, left = _stage_with(detach="fails")
+check("detach refused: diskutil ejects instead", calls[-2:],
+      [["hdiutil", "detach", mount], ["diskutil", "eject", mount]])
+
+got, calls, mount, left = _stage_with(hdiutil="fails", diskutil="fails")
+check("both refuse: an UpdateError", type(got), updater.UpdateError)
+check("both refuse: hdiutil's reason given",
+      "hdiutil: attach failed: oops" in str(got), True)
+check("both refuse: nothing copied", "ditto" in _tools(calls), False)
+check("both refuse: the mount folder removed", left, False)
+
+got, calls, mount, left = _stage_with(hdiutil="missing", diskutil="fails")
+check("hdiutil gone, diskutil refuses: diskutil's reason given",
+      "diskutil: attach failed: oops" in str(got), True)
+
+got, calls, mount, left = _stage_with(hdiutil="missing", diskutil="missing")
+check("neither tool: an UpdateError", type(got), updater.UpdateError)
+check("neither tool: the mount folder removed", left, False)
 
 # --- where a Windows install updates itself from -------------------------
 LOCAL = os.path.join("C:\\", "Users", "someone", "AppData", "Local")
