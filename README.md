@@ -682,7 +682,8 @@ it from that tag, attaches the installer, replaces the Windows line in
 
 Six, under **Settings > Secrets and variables > Actions**. Two of them
 are files stored as base64 text, which the workflow decodes; the release
-key is not:
+key is not. Export and keep every one of these files outside the
+repository, and delete the exports once the secrets are saved:
 
 - `MACOS_CERT_P12` - the Developer ID Application certificate with its
   private key, exported from Keychain Access as a `.p12`, as base64:
@@ -721,21 +722,25 @@ Check the PEM before saving the secret. The workflow only checks at the
 start that the secret is *there*; whether it is the *right* key is
 checked by `ci/sign_sums.sh` in the last job, after both Macs have been
 built and notarized, so a wrong key costs a whole release run. Save the
-PEM to `release-key.pem` and print its public half, with OpenSSL 3
-(macOS's own `openssl` is LibreSSL and cannot handle Ed25519 keys;
-Homebrew's `openssl@3` or Git for Windows' OpenSSL can):
+PEM **outside the repository**, as `~/release-key.pem` - never inside the
+checkout, where one `git add -A` would commit it (`.gitignore` refuses
+`*.pem`, `*.p12`, `*.p8`, `*.key`, `*.pfx` and `.env*` too, but only as a
+backstop). Then print its public half with OpenSSL 3 (macOS's own
+`openssl` is LibreSSL and cannot handle Ed25519 keys; Homebrew's
+`openssl@3` or Git for Windows' OpenSSL can):
 
 ```
-openssl pkey -in release-key.pem -pubout -outform DER | tail -c 32 | xxd -p -c 32
+openssl pkey -in ~/release-key.pem -pubout -outform DER | tail -c 32 | xxd -p -c 32
 ```
 
 The output must equal the hex in `updater.py`. Or run the release's own
-check from the repository root, with OpenSSL 3 first on the `PATH` (on
-Windows, run it in Git Bash with `PYTHON=python` in front of `bash`):
+check from the repository root - the key stays where it is, outside it -
+with OpenSSL 3 first on the `PATH` (on Windows, run it in Git Bash with
+`PYTHON=python` in front of `bash`):
 
 ```
 f=$(mktemp) && echo test > "$f"
-RELEASE_SIGNING_KEY="$(cat release-key.pem)" bash ci/sign_sums.sh "$f"
+RELEASE_SIGNING_KEY="$(cat ~/release-key.pem)" bash ci/sign_sums.sh "$f"
 ```
 
 The right key ends with `signed; the app's verifier accepts it`; any
@@ -755,7 +760,7 @@ It also runs on pull requests that touch `version.py`, `updater.py`,
 
 The private key **never goes in the repository**: it lives in the
 maintainer's password manager and in the repository secret, nowhere
-else; delete the `.pem` file once the secret is saved. At release time
+else; delete `~/release-key.pem` once the secret is saved. At release time
 `ci/sign_sums.sh` checks, before anything is uploaded, that the
 secret's public half is `updater.RELEASE_KEY` and that the app's own
 verifier (`sigcheck.py`) accepts the signature, so a wrong key fails
@@ -766,7 +771,7 @@ key it was built with. Only if the private key is lost, make a new
 pair:
 
 ```
-openssl genpkey -algorithm ed25519 -out release-key.pem
+openssl genpkey -algorithm ed25519 -out ~/release-key.pem
 ```
 
 Print its public half with the command above, replace the hex in
