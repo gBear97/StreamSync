@@ -7,7 +7,8 @@
 - The fullscreen bar and the volume OSD are hooked so a click on them
   leaves the film the active window (windowctl.no_activate_on_click).
 - The stream-pause swap restores the stream's browser window and
-  minimizes it again, through windowctl.
+  minimizes it again, and puts the film's window back exactly where it
+  was, through windowctl.
 - An update runs the downloaded installer, which takes over once the app
   has quit.
 
@@ -60,6 +61,7 @@ class Adapter(adapter.PlatformAdapter):
         self._win_map = {}
         self._ext_hwnd = None
         self._fs_saved = None        # frame style + rect fullscreen replaced
+        self._film_placement = None  # where the swap hid the film window from
 
     def _init_root(self):
         pass                         # no app menu or application hooks here
@@ -215,10 +217,7 @@ class Adapter(adapter.PlatformAdapter):
                     return
                 self.stream_hwnd = hwnd
                 if self.player is self.embedded:
-                    self._was_fullscreen = self.fullscreen
-                    # resuming puts it back fullscreen, on the same monitor
-                    self._set_fullscreen(False, show=False)
-                    self.video_win.withdraw()
+                    self._swap_hide_film()
                 elif self.external is not None and self.external.proc:
                     self._ext_hwnd = windowctl.find_by_pid(self.external.proc.pid)
                     if self._ext_hwnd:
@@ -228,16 +227,43 @@ class Adapter(adapter.PlatformAdapter):
             else:
                 if self.stream_hwnd and windowctl.is_valid(self.stream_hwnd):
                     windowctl.minimize(self.stream_hwnd)
+                saved, self._film_placement = self._film_placement, None
                 if self.player is self.embedded:
-                    if self._was_fullscreen:
-                        self._set_fullscreen(True)
-                    else:
-                        self.video_win.deiconify()
+                    self._swap_show_film(saved)
                 elif self._ext_hwnd and windowctl.is_valid(self._ext_hwnd):
                     windowctl.restore(self._ext_hwnd)
                 self._swapped = False
         except Exception as e:
             self._set_status(f"Window swap failed: {e}")
+
+    def _swap_hide_film(self):
+        # Only a film window that is up is hidden: one the user closed or
+        # minimized stays that way through the pause and after it.
+        shown = self.video_win.state() in ("normal", "zoomed")
+        # resuming puts it back fullscreen, on the same monitor
+        self._was_fullscreen = self.fullscreen and shown
+        # Leaving fullscreen puts back the frame and rectangle it had
+        # before; a film not fullscreen is not touched (no show, no
+        # change). Its placement is read after that, from the window as
+        # it was before fullscreen.
+        self._set_fullscreen(False, show=False)
+        if shown:
+            self._film_placement = windowctl.placement(int(self.video_win.frame(), 16))
+            self.video_win.withdraw()
+
+    def _swap_show_film(self, saved):
+        # deiconify alone does not bring it back where it was: a window
+        # snapped to half a monitor comes back at its size from before the
+        # snap (see windowctl.placement). Tk's own geometry work is done
+        # first, so none of it runs after the placement is put back. A
+        # film the user brought back during the pause is left where it is.
+        if saved is not None and self.video_win.state() == "withdrawn":
+            self.video_win.deiconify()
+            self.video_win.update_idletasks()
+            windowctl.put_placement(int(self.video_win.frame(), 16), saved)
+        if self._was_fullscreen:
+            self._was_fullscreen = False
+            self._set_fullscreen(True)
 
     # --- seam 4: installing an update (worker thread) ---------------------------------
 
