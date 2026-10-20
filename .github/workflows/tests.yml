@@ -28,9 +28,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -88,7 +88,7 @@ jobs:
 
       # Small PNGs kept for a week, failed runs included: a broken screen
       # is when they are wanted most.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ui-shots-${{ matrix.os }}
@@ -101,9 +101,9 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -132,7 +132,7 @@ jobs:
       # account's artifact storage is finite (it once filled up and failed
       # an otherwise green run), and a 1,100-file build per PR push is
       # the quickest way to fill it.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: github.event_name != 'pull_request'
         with:
           name: StreamSync-windows-${{ github.sha }}
