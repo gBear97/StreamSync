@@ -14,6 +14,10 @@ ui.platform_win and ui.platform_mac.
     python streamsync.py --diagnose   the diagnostics report, printed
     python streamsync.py --netcheck   can this build make a verified HTTPS
                                       request?
+
+Only one copy of the app runs at a time: a second launch brings the one
+running forward and exits (singleinstance). The three checks above run
+whether or not it is.
 """
 
 import os
@@ -68,6 +72,15 @@ def main():
     # Before anything else can fail: a windowed build has no console, so
     # without this an uncaught exception leaves nothing behind at all.
     diagnostics.install_excepthook()
+
+    # One StreamSync at a time: a second one had its own film window,
+    # player and settings saves. --selftest runs beside the user's (CI and
+    # the release workflow run it, with a throwaway config), and must
+    # never hand off to theirs.
+    if "--selftest" not in sys.argv:
+        import singleinstance
+        if not singleinstance.claim():
+            raise SystemExit(0)
     diagnostics.log_session_start()
 
     # An unattended run must never sit on the gate's dialog, waiting for a

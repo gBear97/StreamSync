@@ -51,6 +51,12 @@ def hide_app(name):
 
 def activate_self():
     """Bring our own process (and its libvlc video window) to the front."""
+    activate_pid(os.getpid())
+
+
+def activate_pid(pid):
+    """Bring a process to the front by its id: a second launch hands off
+    to the StreamSync already running this way."""
     _osascript(
         'tell application "System Events" to set frontmost of '
-        f"(first application process whose unix id is {os.getpid()}) to true")
+        f"(first application process whose unix id is {int(pid)}) to true")

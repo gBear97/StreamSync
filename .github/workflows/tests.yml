@@ -56,7 +56,9 @@ jobs:
       # Engine, capture timing, controller decisions, fingerprints, the
       # relay, a whole watch party, the shell over a fake Tk (test_macswap)
       # and the update flow over a fake updater - none needs a sound card,
-      # a display or VLC. test_widgets and test_ui draw the real controls
+      # a display or VLC. test_singleinstance holds locks of its own and
+      # runs streamsync.py beside them; its --selftest tours the real app
+      # where VLC is installed (Windows) and stops at the gate elsewhere. test_widgets and test_ui draw the real controls
       # and screens: they skip where there is no display, and test_ui runs
       # under a virtual one on Linux. (test_windowctl / test_macwindowctl /
       # test_videomouse drive real windows and skip themselves off their
@@ -76,7 +78,8 @@ jobs:
           for t in test_audio_capture test_players test_controller \
                    test_audio_matcher test_fingerprint test_relay \
                    test_relay_tls test_session test_updater test_netcerts \
-                   test_diagnostics test_macswap test_windowctl test_videomouse \
+                   test_diagnostics test_singleinstance test_macswap \
+                   test_windowctl test_videomouse \
                    test_widgets test_updateflow test_ui; do
             echo "=== $t"
             if [ "$t" = test_ui ] && [ "$RUNNER_OS" = Linux ] && [ -z "$DISPLAY" ]; then
