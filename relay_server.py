@@ -33,7 +33,10 @@ MAX_ROOMS = 10000
 MAX_FP_CHUNKS = 256           # 256 x 16384 words is a 290-hour film
 HOST_GRACE = 60.0
 CODE_ALPHABET = string.ascii_uppercase + "23456789"  # no 0/O/1/I
-_CHUNK_KEY = re.compile(r"fp_chunk_(\d+)$")
+# ASCII digits only, at most three of them: \d would also take Unicode
+# digits, and an unbounded run lets leading zeros spell one chunk number
+# endlessly many ways.
+_CHUNK_KEY = re.compile(r"fp_chunk_([0-9]{1,3})")
 
 rooms = {}  # code -> Room
 closing = set()  # close handshakes of displaced host sockets, in flight
@@ -74,13 +77,20 @@ def broadcast(room, text):
 
 def cache_key(msg, t):
     """Which late-joiner cache slot a host message fills, or None. Only a
-    fixed set of keys, so a host cannot grow the relay's memory at will."""
+    fixed set of keys, so a host cannot grow the relay's memory at will:
+    state, fp_meta and fp_chunk_0 to fp_chunk_{MAX_FP_CHUNKS - 1}.
+
+    A chunk's key is rebuilt from its number rather than kept as sent.
+    Kept as sent, "fp_chunk_01", "fp_chunk_001" and so on - and the same
+    in Unicode digits - each took a slot of their own, so one connection
+    could fill the relay's memory however far it liked. The client sends
+    f"fp_chunk_{i}" (session.py), which comes out unchanged."""
     if t in ("state", "fp_meta"):
         return t
     if t == "fp_chunk":
-        m = _CHUNK_KEY.match(str(msg.get("ck", "")))
+        m = _CHUNK_KEY.fullmatch(str(msg.get("ck", "")))
         if m and int(m.group(1)) < MAX_FP_CHUNKS:
-            return m.group(0)
+            return f"fp_chunk_{int(m.group(1))}"
     return None
 
 
