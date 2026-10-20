@@ -8,6 +8,10 @@ There are two ways in. Most people take **A**, the released app. **B**
 runs StreamSync from source, for testing a change; it is steps 0 to 2.
 Both meet again at step 3.
 
+The app needs **macOS 14 (Sonoma) or later**. On anything older, macOS
+says it needs a newer version of macOS and won't open it. **Apple menu >
+About This Mac** shows your version.
+
 ## A. Install the released app
 
 Download the `.dmg` for your Mac from the

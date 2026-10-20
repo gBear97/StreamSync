@@ -45,7 +45,8 @@ on both.
 
 ## Requirements
 
-- Windows (64-bit), or macOS on Apple Silicon or Intel
+- Windows (64-bit), or macOS 14 (Sonoma) or later on Apple Silicon or
+  Intel
 - VLC installed (64-bit on Windows). The first-run check offers to
   install it.
 - On the Mac: the free BlackHole audio driver - see
@@ -65,13 +66,13 @@ may show SmartScreen's "Windows protected your PC": **More info > Run
 anyway**. To uninstall, use Windows' **Settings > Apps** like any other
 program.
 
-**macOS**: download the `.dmg` for your Mac - `arm64` for Apple Silicon,
-`x86_64` for Intel (**Apple menu > About This Mac** says which) - open it,
-and drag StreamSync.app into your Applications folder. Releases are
-signed and notarized, so the app just opens. On the first launch the
-first-run check offers to install VLC if it is missing (and BlackHole
-with it), you install BlackHole if you don't have it yet, and you set up
-the audio routing once in Audio MIDI Setup;
+**macOS** (14 Sonoma or later): download the `.dmg` for your Mac - `arm64`
+for Apple Silicon, `x86_64` for Intel (**Apple menu > About This Mac**
+says which) - open it, and drag StreamSync.app into your Applications
+folder. Releases are signed and notarized, so the app just opens. On the
+first launch the first-run check offers to install VLC if it is missing
+(and BlackHole with it), you install BlackHole if you don't have it yet,
+and you set up the audio routing once in Audio MIDI Setup;
 [MAC_FIRST_RUN.md](MAC_FIRST_RUN.md) walks through it step by step.
 
 ### First-run check

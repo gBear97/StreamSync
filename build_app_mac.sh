@@ -12,6 +12,14 @@
 set -e
 PY="${PYTHON:-python3}"
 
+# The oldest macOS the app runs on. It is the newest that anything bundled
+# was built for: numpy's wheels need 14.0 (_multiarray_umath carries minos
+# 14.0), so an older Mac crashed on launch with nothing said. Stamped into
+# Info.plist below, so macOS refuses it plainly instead, and checked
+# against every binary in the bundle. README.md and MAC_FIRST_RUN.md say
+# "macOS 14 (Sonoma) or later": change them with it.
+MIN_MACOS=14.0
+
 # Refuse the wrong Python here, rather than ship a bundle that dies on
 # launch. Apple's Python is the one built as Python3.framework (a venv
 # made from it keeps it as its base).
@@ -66,6 +74,10 @@ plist_set() {
 plist_set CFBundleShortVersionString "$VERSION"
 plist_set CFBundleVersion "$VERSION"
 
+# On anything older, macOS says the app needs a newer macOS rather than
+# letting it start and crash.
+plist_set LSMinimumSystemVersion "$MIN_MACOS"
+
 # macOS terminates an app that touches the microphone or drives another
 # app without a usage string here - the prompt has nothing to display, so
 # TCC kills the process rather than asking. These are the strings the
@@ -79,7 +91,7 @@ plist_set NSAppleEventsUsageDescription \
 # a usage string does not misbehave until macOS terminates the app the
 # first time it touches the microphone - by which point it is a user's
 # crash, not a build error.
-for key in CFBundleShortVersionString CFBundleVersion \
+for key in CFBundleShortVersionString CFBundleVersion LSMinimumSystemVersion \
            NSMicrophoneUsageDescription NSAppleEventsUsageDescription; do
     value=$(plutil -extract "$key" raw -o - "$PLIST" 2>/dev/null || true)
     if [ -z "$value" ]; then
@@ -89,5 +101,66 @@ for key in CFBundleShortVersionString CFBundleVersion \
     fi
     echo "  $key = $value"
 done
+
+# LSMinimumSystemVersion is only true if nothing inside needs more. A
+# dependency update can raise the floor without a word - numpy did - so
+# read what every Mach-O file in the bundle was built for (otool, per
+# architecture) and stop the build if any of it needs a newer macOS.
+"$PY" - dist/StreamSync.app "$MIN_MACOS" <<'PYFLOOR'
+import os, subprocess, sys
+
+app, floor = sys.argv[1], sys.argv[2]
+MACHO = {b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe",   # 64- and 32-bit
+         b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"}   # universal
+
+
+def ver(text):
+    return tuple(int(p) for p in text.split("."))
+
+
+def needs(path):
+    """The newest macOS any architecture in this file was built for."""
+    out = subprocess.run(["otool", "-arch", "all", "-l", path],
+                         capture_output=True, text=True).stdout
+    found, cmd = [], None
+    for line in out.splitlines():
+        words = line.split()
+        if words[:1] == ["cmd"]:
+            cmd = words[1]
+        elif cmd == "LC_BUILD_VERSION" and words[:1] == ["minos"]:
+            found.append(words[1])
+        elif cmd == "LC_VERSION_MIN_MACOSX" and words[:1] == ["version"]:
+            found.append(words[1])
+    return max(found, key=ver, default=None)
+
+
+newest, too_new, files = None, [], 0
+for root, _, names in os.walk(app):
+    for name in names:
+        path = os.path.join(root, name)
+        if os.path.islink(path):
+            continue
+        with open(path, "rb") as f:
+            if f.read(4) not in MACHO:
+                continue
+        files += 1
+        v = needs(path)
+        if v is None:
+            continue
+        rel = os.path.relpath(path, app)
+        if newest is None or ver(v) > ver(newest[0]):
+            newest = (v, rel)
+        if ver(v) > ver(floor):
+            too_new.append(f"  {v}  {rel}")
+
+print(f"  {files} Mach-O files; the newest macOS any needs is "
+      f"{newest[0]} ({newest[1]})" if newest else f"  {files} Mach-O files")
+if too_new:
+    sys.exit(f"These need a macOS newer than {floor}, the floor "
+             "LSMinimumSystemVersion promises:\n" + "\n".join(too_new) +
+             "\nRaise MIN_MACOS in build_app_mac.sh, and the macOS version "
+             "README.md and MAC_FIRST_RUN.md state with it - or pin the "
+             "dependency that raised it.")
+PYFLOOR
 
 echo "Built: dist/StreamSync.app (version $VERSION)"
