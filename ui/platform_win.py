@@ -121,16 +121,28 @@ class Adapter(adapter.PlatformAdapter):
         return EmbeddedPlayer(self.video_frame.winfo_id())
 
     def _show_video_window(self):
-        self.video_win.deiconify()
+        self._raise_film()
         self.video_win.lift()
         # its title bar too; a window's frame only exists once it has shown
         self._style_window(self.video_win)
+
+    def _raise_film(self):
+        # Tk's deiconify shows even a window that is up (SW_SHOWNOACTIVATE),
+        # and that un-snaps it: a film snapped to half a monitor jumps back
+        # to its size from before the snap (test_windowctl measures it). A
+        # film window that is up is raised and given the keyboard instead,
+        # as deiconify would; a hidden or minimized one is deiconified.
+        if self.video_win.state() in ("normal", "zoomed"):
+            self.video_win.lift()
+            self.video_win.focus_force()
+        else:
+            self.video_win.deiconify()
 
     # --- seam 2: fullscreen ---------------------------------------------------
 
     def _set_fullscreen(self, flag, show=True):
         if show:
-            self.video_win.deiconify()
+            self._raise_film()
         if flag == self.fullscreen:
             return
         # Tk's -fullscreen always picks the primary monitor; cover the one

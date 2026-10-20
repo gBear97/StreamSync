@@ -16,6 +16,9 @@ back at its size from before the snap. What is tested:
 - a fullscreen film leaves fullscreen before its placement is read, so the
   placement is the window's own, and comes back fullscreen over a window
   put back first: leaving fullscreen later returns it to the snap;
+- a snapped film that is up keeps its snap when it goes fullscreen (F,
+  a double-click) and when it is shown again (Open film...): Tk's
+  deiconify would un-snap it, so a window that is up is only raised;
 - a film that is not fullscreen is not touched by the fullscreen step on
   the way out: not shown, not moved;
 - a film window the user closed or minimized stays that way through the
@@ -43,11 +46,11 @@ class Win(mac.Window):
     two rectangles Windows keeps for a window - where it is, and where it
     restores to. Snapped, the two differ; maximized, it is at MAXIMIZED.
 
-    deiconify() shows a hidden window the way Tk's SW_SHOWNOACTIVATE
-    does: a snapped one comes back at its rectangle from before the snap,
-    and a maximized one may come back maximized (Tk remembers) or not;
-    `tk_keeps_zoom` picks which. A window already shown is left as it is
-    (test_windowctl measures what real Tk does to one)."""
+    deiconify() shows the window the way Tk's SW_SHOWNOACTIVATE does, as
+    test_windowctl measured it on CI's Windows: a snapped one, hidden or
+    up, goes back to its rectangle from before the snap. A hidden
+    maximized one may come back maximized (Tk remembers) or not;
+    `tk_keeps_zoom` picks which."""
     count = 0
 
     def __init__(self, *a, **kw):
@@ -77,6 +80,8 @@ class Win(mac.Window):
 
     def deiconify(self):
         if self.shown:
+            if self.snapped:
+                self.rect, self.snapped = self.normal, False
             return
         super().deiconify()
         self.shows += 1
@@ -291,6 +296,22 @@ def test_fullscreen_film_round_trip():
           "and goes fullscreen again over its own window")
 
 
+def test_snapped_film_up_keeps_its_snap():
+    app, film = make()
+    film.move(BEFORE_SNAP)
+    film.snap()
+    app._toggle_fullscreen()            # F, or a double-click
+    assert app.fullscreen and wc.calls == [("fullscreen", SNAPPED)], wc.calls
+    app._leave_fullscreen_key()         # Esc
+    assert film.rect == SNAPPED and film.snapped, film.rect
+    focused = film.focused
+    app._show_video_window()            # Open film... with it up
+    assert film.rect == SNAPPED and film.snapped, film.rect
+    assert film.focused == focused + 1, "the film was not given the keyboard"
+    print("a snapped film that is up keeps its snap through fullscreen and "
+          "being shown again")
+
+
 def test_windowed_film_is_not_touched_on_the_way_out():
     app, film = make()
     film.move((400, 300, 974, 578))
@@ -347,6 +368,7 @@ def main():
     test_snapped_film_comes_back_snapped()
     test_maximized_film_comes_back_maximized()
     test_fullscreen_film_round_trip()
+    test_snapped_film_up_keeps_its_snap()
     test_windowed_film_is_not_touched_on_the_way_out()
     test_closed_or_minimized_film_stays_so()
     test_film_brought_back_by_hand_is_left_there()

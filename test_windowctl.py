@@ -58,8 +58,11 @@ def film_placement(windowctl):
     withdraw and puts it back after its deiconify: the window must be
     where it was - moved and sized by Windows (a drag, not Tk), maximized,
     and snapped to the right half of its monitor, where this desktop lets
-    a test press Win+Right (the snap is skipped otherwise). What Tk alone
-    does to a snapped window is printed, not asserted."""
+    a test press Win+Right (the snap is skipped otherwise). A snapped
+    window that is up keeps its snap when lifted and given the keyboard,
+    as the film is raised instead of deiconified. What Tk's deiconify
+    does to a snapped window is printed, not asserted: on CI's Windows
+    it lost the snap, up or hidden."""
     import tkinter as tk
     from ctypes import wintypes
 
@@ -119,7 +122,15 @@ def film_placement(windowctl):
             print("SKIPPED snapped placement: this desktop would not let the "
                   "test snap a window (no keyboard focus, or no snap)")
             return
-        root.deiconify()                       # as entering fullscreen does
+        # what the film's _raise_film does to a window that is up, in
+        # place of deiconify: it must keep the snap
+        root.lift()
+        root.focus_force()
+        settle()
+        assert windowctl.window_rect(hwnd) == snapped, \
+            ("lift and focus_force moved a snapped window",
+             windowctl.window_rect(hwnd), snapped)
+        root.deiconify()                       # on a window that is up
         settle()
         shown_kept = windowctl.window_rect(hwnd) == snapped
         hide_and_show(False)
