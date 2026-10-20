@@ -289,6 +289,29 @@ jobs:
           fi
           echo "All Mach-O files carry a valid signature."
 
+      # A missing entitlement fails nowhere in this job. Every release up
+      # to 2.0.2 shipped without the Apple Events one, and the only sign
+      # was a line in tccd's log on a user's Mac: the stream swap simply
+      # never worked. So read back what the signature actually carries
+      # and compare it with entitlements.plist, key for key.
+      - name: Check the app carries every entitlement
+        run: |
+          codesign -d --entitlements - --xml dist/StreamSync.app \
+            > "$RUNNER_TEMP/signed-entitlements.plist"
+          python3 - "$RUNNER_TEMP/signed-entitlements.plist" entitlements.plist <<'PY'
+          import plistlib, sys
+          with open(sys.argv[1], "rb") as f:
+              got = plistlib.load(f)
+          with open(sys.argv[2], "rb") as f:
+              want = plistlib.load(f)
+          for key in sorted(want):
+              print(("  ok       " if got.get(key) == want[key] else
+                     "  MISSING  ") + key)
+          if any(got.get(k) != v for k, v in want.items()):
+              sys.exit("The signed app lacks entitlements that "
+                       "entitlements.plist asks for.")
+          PY
+
       # A release whose updater cannot reach GitHub cannot be updated away
       # from, so prove the signed bundle completes a verified HTTPS request
       # before spending a notarization on it. Runs after signing because

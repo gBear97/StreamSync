@@ -3,7 +3,10 @@
 Used for the facecam swap: when the streamer pauses the film, the
 browser app comes forward so the facecam is visible; when the film
 resumes, the browser hides again. macOS prompts once for Automation
-permission (System Events) the first time this runs.
+permission (System Events) the first time this runs - in a signed build
+only because entitlements.plist carries
+com.apple.security.automation.apple-events: without it the hardened
+runtime refuses every call here and never asks.
 """
 
 import os
