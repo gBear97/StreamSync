@@ -244,6 +244,31 @@ def minimize(hwnd):
     user32.ShowWindow(wintypes.HWND(hwnd), SW_MINIMIZE)
 
 
+def bring_forward(hwnd):
+    """Un-minimize a window if it is minimized (left as it is otherwise:
+    SW_RESTORE would also un-maximize it) and give it the keyboard. A
+    process just started by the one in front - a second launch - may."""
+    h = wintypes.HWND(hwnd)
+    if user32.IsIconic(h):
+        user32.ShowWindow(h, SW_RESTORE)
+    user32.BringWindowToTop(h)
+    user32.SetForegroundWindow(h)
+
+
+def window_pid(hwnd):
+    """The process id a window belongs to (0 if it is gone)."""
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
+    return pid.value
+
+
+def window_class(hwnd):
+    """A window's class name: "TkTopLevel" for a Tk toplevel's frame."""
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(wintypes.HWND(hwnd), buf, len(buf))
+    return buf.value
+
+
 def find_by_pid(pid):
     """Best top-level window belonging to a process id."""
     best = None

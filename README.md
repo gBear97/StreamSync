@@ -561,7 +561,14 @@ python -m ui.shell            # the app without the first-run check
 
 `python streamsync.py --selftest` opens the app, tours every dialog and
 closes it again, with a throwaway settings file; it exits 0 when it
-worked. On a Mac use a python.org Python: Apple's own `/usr/bin/python3`
+worked.
+
+One StreamSync runs at a time. Starting it again while it runs brings the
+running one forward instead (a named mutex on Windows, a lock on
+`~/.streamsync.lock` on the Mac), whether it was started from the Start
+menu, a shortcut, `open -n`, the app's binary or a source checkout.
+`--selftest`, `--diagnose` and `--netcheck` run either way.
+`python -m ui.shell` skips this along with the first-run check. On a Mac use a python.org Python: Apple's own `/usr/bin/python3`
 has Tk 8.5, which cannot run the UI.
 
 ### Build it yourself
@@ -608,8 +615,9 @@ The Tests workflow runs the full set on Windows, macOS and Linux for
 each pull request: `test_audio_capture`, `test_players`,
 `test_controller`, `test_audio_matcher`, `test_fingerprint`,
 `test_relay`, `test_relay_tls`, `test_session`, `test_updater`,
-`test_netcerts`, `test_diagnostics`, `test_macswap`, `test_winswap`,
-`test_windowctl`, `test_videomouse`, `test_widgets`, `test_updateflow` and `test_ui`. Tests that drive real
+`test_netcerts`, `test_diagnostics`, `test_singleinstance`,
+`test_macswap`, `test_winswap`, `test_windowctl`,
+`test_videomouse`, `test_widgets`, `test_updateflow` and `test_ui`. Tests that drive real
 windows skip themselves where they cannot run. Set `STREAMSYNC_SHOTS` to
 a folder and `test_ui` saves each screen there as a PNG. Those tests
 guard against regressions; for how well the audio matcher does on real
