@@ -1,7 +1,10 @@
 """Live check of windowctl: spawn a real window, find, minimize, restore,
 and read the program it belongs to. Before that, find_stream_window over
-a made-up list of windows: what Automatic picks."""
+a made-up list of windows: what Automatic picks; and placement() and
+put_placement() on a real Tk window hidden and shown again, as the stream
+swap hides and shows the film."""
 
+import ctypes
 import os
 import subprocess
 import sys
@@ -50,6 +53,142 @@ def stream_window_fallback(windowctl):
         windowctl.list_windows, windowctl.window_exe, windowctl.is_valid = saved
 
 
+def film_placement(windowctl):
+    """The stream swap reads the film window's placement before Tk's
+    withdraw and puts it back after its deiconify: the window must be
+    where it was - moved and sized by Windows (a drag, not Tk), maximized,
+    and snapped to the right half of its monitor, where this desktop lets
+    a test press Win+Right (the snap is skipped otherwise). A snapped
+    window that is up keeps its snap when lifted and given the keyboard,
+    as the film is raised instead of deiconified. What Tk's deiconify
+    does to a snapped window is printed, not asserted: on CI's Windows
+    it lost the snap, up or hidden."""
+    import tkinter as tk
+    from ctypes import wintypes
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)   # as the app runs
+    except Exception:
+        pass
+    u32 = ctypes.windll.user32
+    root = tk.Tk()
+    root.title("PlacementTest-9271")
+    try:
+        root.geometry("480x270+120+120")
+        root.update()
+        hwnd = int(root.frame(), 16)
+        hw = wintypes.HWND(hwnd)
+
+        def settle():
+            for _ in range(5):
+                root.update()
+                time.sleep(0.05)
+
+        def hide_and_show(put):
+            saved = windowctl.placement(hwnd)
+            root.withdraw()
+            settle()
+            root.deiconify()
+            root.update_idletasks()
+            if put:
+                windowctl.put_placement(hwnd, saved)
+            settle()
+
+        u32.SetWindowPos(hw, None, 200, 150, 640, 360,
+                         windowctl.SWP_NOZORDER | windowctl.SWP_NOACTIVATE)
+        settle()
+        want = windowctl.window_rect(hwnd)
+        assert want[2:] == (640, 360), want
+        hide_and_show(True)
+        assert windowctl.window_rect(hwnd) == want, (windowctl.window_rect(hwnd), want)
+
+        u32.ShowWindow(hw, 3)                  # SW_MAXIMIZE
+        settle()
+        assert u32.IsZoomed(hw)
+        want = windowctl.window_rect(hwnd)
+        hide_and_show(True)
+        assert u32.IsZoomed(hw), "came back not maximized"
+        assert windowctl.window_rect(hwnd) == want, (windowctl.window_rect(hwnd), want)
+        u32.ShowWindow(hw, windowctl.SW_RESTORE)
+        settle()
+        assert windowctl.window_rect(hwnd) == (200, 150, 640, 360), \
+            windowctl.window_rect(hwnd)
+        print("placement: a window moved by Windows, and one maximized, come "
+              "back where they were from withdraw and deiconify")
+
+        before = windowctl.window_rect(hwnd)
+        snapped = snap_right(windowctl, root, hwnd)
+        if snapped is None:
+            print("SKIPPED snapped placement: this desktop would not let the "
+                  "test snap a window (no keyboard focus, or no snap)")
+            return
+        # what the film's _raise_film does to a window that is up, in
+        # place of deiconify: it must keep the snap
+        root.lift()
+        root.focus_force()
+        settle()
+        assert windowctl.window_rect(hwnd) == snapped, \
+            ("lift and focus_force moved a snapped window",
+             windowctl.window_rect(hwnd), snapped)
+        root.deiconify()                       # on a window that is up
+        settle()
+        shown_kept = windowctl.window_rect(hwnd) == snapped
+        hide_and_show(False)
+        tk_kept = windowctl.window_rect(hwnd) == snapped
+        print(f"snapped {before} to {snapped}; Tk's deiconify of the window "
+              f"shown: {'kept the snap' if shown_kept else 'lost it'}; "
+              f"withdraw and deiconify alone: "
+              f"{'kept it' if tk_kept else f'lost it, back at {windowctl.window_rect(hwnd)}'}")
+        if not shown_kept or not tk_kept:
+            snapped = snap_right(windowctl, root, hwnd)
+            assert snapped is not None, "the window would not snap a second time"
+        hide_and_show(True)
+        assert windowctl.window_rect(hwnd) == snapped, \
+            (windowctl.window_rect(hwnd), snapped)
+        print("placement: a snapped window comes back at its snapped rectangle")
+    finally:
+        root.destroy()
+
+
+def snap_right(windowctl, root, hwnd):
+    """Win+Right on the window, if it has the keyboard (a key sent to
+    another window would snap that one instead). Its rectangle once
+    snapped, or None if it never got the keyboard or never snapped: its
+    placement's normal rectangle (where it restores to) stays apart from
+    the rectangle it is at."""
+    u32 = ctypes.windll.user32
+    u32.SetForegroundWindow(hwnd)
+    for _ in range(10):
+        root.update()
+        time.sleep(0.05)
+    if windowctl.foreground() != hwnd:
+        return None
+
+    def apart():
+        wp, rect = windowctl.placement(hwnd)
+        r = wp.rcNormalPosition
+        return (r.left, r.top, r.right - r.left, r.bottom - r.top) != rect
+
+    VK_LWIN, VK_RIGHT, KEYEVENTF_KEYUP = 0x5B, 0x27, 0x0002
+    try:
+        u32.keybd_event(VK_LWIN, 0, 0, 0)
+        u32.keybd_event(VK_RIGHT, 0, 0, 0)
+        u32.keybd_event(VK_RIGHT, 0, KEYEVENTF_KEYUP, 0)
+    finally:
+        u32.keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0)
+    deadline = time.time() + 3
+    while time.time() < deadline and not apart():
+        root.update()
+        time.sleep(0.05)
+    # the snap animates: wait for the rectangle to stop changing
+    last = None
+    while time.time() < deadline and windowctl.window_rect(hwnd) != last:
+        last = windowctl.window_rect(hwnd)
+        root.update()
+        time.sleep(0.15)
+    return windowctl.window_rect(hwnd) if apart() else None
+
+
 def main():
     if sys.platform != "win32":
         print(f"SKIPPED: windowctl is Windows-only, this is {sys.platform} "
@@ -58,6 +197,7 @@ def main():
     import windowctl  # touches ctypes.windll, so only after the guard
 
     stream_window_fallback(windowctl)
+    film_placement(windowctl)
 
     # The window's process says when its window is up: it creates `shown`
     # once update() has mapped it. On a CI runner the part that varies is
