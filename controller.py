@@ -13,7 +13,8 @@ It talks to the shell only through the event queue, with
 
     ("status", text)     one line for the status bar
     ("session", text)    watch-party status
-    ("swap", show)       bring the stream window forward (True) or back
+    ("swap", show, why)  bring the stream window forward (True) or back;
+                         why is the reason, for the swap's line in the log
     ("busy_off",)        a manual sync finished; re-enable its buttons
     ("auto_off", text)   auto mode gave up and switched itself off; untick
                          it as a manual uncheck would, and show `text`
@@ -331,7 +332,7 @@ class SyncController:
                 self._say("Seeking...")
                 player.sync_seek(match_t, t0, offset)
                 player.set_mute(mute)
-                self.q.put(("swap", False))
+                self.q.put(("swap", False, "a sync moved the film"))
             msg = (f"Matched stream audio at {fmt_time(match_t)} "
                    f"(score {score:.1f}, peak z {z:.0f}).")
             if ok:
@@ -447,7 +448,7 @@ class SyncController:
                              pause_point=state.get("miss_point", here),
                              paused_at=self._now(),
                              film=(self.video_path, player))
-                self.q.put(("swap", True))
+                self.q.put(("swap", True, "auto mode: no film audio on the stream"))
                 self._say("Auto: film audio not found on the stream - "
                           "assuming pause. Watching for resume...")
                 return 8
@@ -481,7 +482,7 @@ class SyncController:
             self._log("resume", "audio", lo, hi, t, score, z, AUTO_RECORD_SECONDS,
                       offset=self.offset, applied=True)
             player.sync_seek(t, t0, self.offset)
-            self.q.put(("swap", False))
+            self.q.put(("swap", False, "auto mode: the stream resumed"))
             self._say("Auto: stream resumed - resynced.")
             self.q.put(("synced", {"match": t, "at": t0, "trusted": True,
                                    "applied": True, "source": "resume"}))

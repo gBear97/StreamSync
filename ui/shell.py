@@ -331,7 +331,7 @@ class Shell(adapter.PlatformAdapter):
             was_playing = False
         self.player.toggle_pause()
         # pausing brings the streamer's window up; resuming brings the film back
-        self._stream_swap(was_playing)
+        self._stream_swap(was_playing, "Space or a play button")
 
     def _toggle_mute(self):
         self.mute_var.set(not self.mute_var.get())

@@ -11,7 +11,9 @@
 - The stream-pause swap brings the stream's browser forward and hides it
   again through System Events (macwindowctl, osascript). Each round trip
   can block for seconds, so they run on a worker thread (_swap_worker),
-  and the result comes back through the queue as "swapdone".
+  and the result comes back through the queue as "swapdone". Each step is
+  a "swap: ..." line in the log, the worker's written from its own thread
+  (diagnostics.log takes a lock).
 - The film window's mouse controls and fullscreen bar are Windows' own
   (ui/video.py). The bar only shows over a window that really is
   fullscreen (_bar_allowed), and goes before the window leaves
@@ -361,7 +363,7 @@ class Adapter(adapter.PlatformAdapter):
         self._swap_app = ""          # resolve again against the new choice
         self._save_config()
 
-    def _stream_swap(self, show):
+    def _stream_swap(self, show, why=""):
         """Ask for the stream app to be shown (paused) or hidden (playing).
 
         Only the Tk half runs here. Each swap is 1-3 osascript round trips
@@ -375,6 +377,8 @@ class Adapter(adapter.PlatformAdapter):
             return
         self._swap_target = show
         self._swap_seq += 1
+        diagnostics.log(f"swap: {'pause' if show else 'resume'}"
+                        + (f" ({why})" if why else ""))
         embedded = self.player is self.embedded
         if show and embedded:
             if self.fullscreen:
@@ -387,6 +391,7 @@ class Adapter(adapter.PlatformAdapter):
                 # run, and the debt would be forgotten.
                 self._was_fullscreen = True
                 self._set_fullscreen(False)
+                diagnostics.log("swap: fullscreen left")
             if self._fs_until is not None and self._window_fullscreen():
                 # macOS has not taken a request to leave: this pause's,
                 # made while the film was still on its way into fullscreen
@@ -401,6 +406,8 @@ class Adapter(adapter.PlatformAdapter):
                 # instant ago this can read fullscreen when it is not,
                 # and the pause then waits one FULLSCREEN_RETRY for
                 # _settle_fullscreen to look.
+                diagnostics.log("swap: the stream app waits for the film to "
+                                "leave fullscreen")
                 self._left_fullscreen.clear()
         elif not show and not self._left_fullscreen.is_set():
             # This resume has overtaken a pause that is still waiting for
@@ -408,6 +415,8 @@ class Adapter(adapter.PlatformAdapter):
             # would drop out of fullscreen for a pause that is over - and
             # let the worker go: it sees that its pause was overtaken and
             # raises nothing.
+            diagnostics.log("swap: the pause still waiting on fullscreen is "
+                            "called off")
             self._repay_fullscreen()
             self._left_fullscreen.set()
         self._swap_q.put((self._swap_seq, show, embedded))
@@ -449,6 +458,9 @@ class Adapter(adapter.PlatformAdapter):
                     else:
                         self.q.put(("status", "Pick the stream's browser in "
                                               "Settings > Stream app first."))
+                diagnostics.log("swap: no stream app to "
+                                + ("show" if show else "hide")
+                                + (f": {why}" if why is not None else ""))
                 # nothing was raised, and nothing we can reach is up
                 self.q.put(("swapdone", seq, show, False, False))
                 continue
@@ -467,9 +479,12 @@ class Adapter(adapter.PlatformAdapter):
                         # the app closing: the browser would come up over
                         # a film that is playing again. Whatever overtook
                         # it settles the screen.
+                        diagnostics.log("swap: pause overtaken; stream app "
+                                        "not shown")
                         continue
                     macwindowctl.activate_app(app_name)
                     shown = True
+                    diagnostics.log(f"swap: stream app {app_name!r} brought forward")
                 else:
                     macwindowctl.hide_app(app_name)
                     shown = False
@@ -477,7 +492,12 @@ class Adapter(adapter.PlatformAdapter):
                         macwindowctl.activate_self()
                     else:
                         macwindowctl.activate_app("VLC")
+                    diagnostics.log(f"swap: stream app {app_name!r} hidden, "
+                                    + ("StreamSync" if embedded else "VLC")
+                                    + " brought forward")
             except Exception as e:
+                diagnostics.log(f"swap: {'showing' if show else 'hiding'} "
+                                f"{app_name!r} failed: {e}")
                 self._swap_app = ""  # that app may have quit - look again
                 self.q.put(("status", f"App swap failed: {e}"
                                       f"{AUTOMATION_HINT}"))
@@ -518,6 +538,7 @@ class Adapter(adapter.PlatformAdapter):
         if self._was_fullscreen and self.player is self.embedded:
             self._was_fullscreen = False   # debt paid
             self._set_fullscreen(True)
+            diagnostics.log("swap: fullscreen given back")
 
     # --- seam 4: installing an update (worker thread) ---------------------------
 

@@ -793,7 +793,7 @@ class Env:
         ctl.set_auto = set_auto
         # The stream-pause swap would raise or hide real windows and apps.
         self.swaps = []
-        app._stream_swap = lambda show: self.swaps.append(show)
+        app._stream_swap = lambda show, why="": self.swaps.append(show)
         app._present_root()
         root.geometry("+40+40")
         pump(root, 0.4)

@@ -8,7 +8,7 @@
   leaves the film the active window (windowctl.no_activate_on_click).
 - The stream-pause swap restores the stream's browser window and
   minimizes it again, and puts the film's window back exactly where it
-  was, through windowctl.
+  was, through windowctl. Each step is a "swap: ..." line in the log.
 - An update runs the downloaded installer, which takes over once the app
   has quit.
 
@@ -17,10 +17,22 @@ so only Windows imports this module (ui.shell.default_platform, and the
 Windows-only tests); elsewhere it is read with ast.
 """
 
+import traceback
+
+import diagnostics
 import windowctl
 import updater
 from players import EmbeddedPlayer
 from ui import adapter
+
+# the film window's Tk state, in the log's words
+FILM_STATES = {"normal": "up", "zoomed": "maximized", "iconic": "minimized",
+               "withdrawn": "closed"}
+
+
+def _named(hwnd):
+    """A window as the log names it: its handle, and its title now."""
+    return f"{hwnd:#x} {windowctl.window_title(hwnd)!r}"
 
 
 class Adapter(adapter.PlatformAdapter):
@@ -215,15 +227,21 @@ class Adapter(adapter.PlatformAdapter):
         self.stream_window = title
         self._save_config()
 
-    def _stream_swap(self, show):
+    def _stream_swap(self, show, why=""):
         """Show the stream's browser window during pauses; hide it again after."""
         if not self.swap_var.get() or show == self._swapped or not self.ctl.video_path:
             return
+        # A line for each step: on the PC, the browser was minimized during
+        # a pause, and with nothing in the log nobody could tell whether a
+        # swap had done it.
+        diagnostics.log(f"swap: {'pause' if show else 'resume'}"
+                        + (f" ({why})" if why else ""))
         try:
             if show:
                 hwnd = windowctl.find_stream_window(self.stream_hwnd,
                                                     self.stream_window)
                 if hwnd is None:
+                    diagnostics.log("swap: no stream window found")
                     self._set_status("Couldn't find the stream window - pick it in "
                                      "Settings > Stream window (Refresh lists what's open).")
                     return
@@ -234,34 +252,54 @@ class Adapter(adapter.PlatformAdapter):
                     self._ext_hwnd = windowctl.find_by_pid(self.external.proc.pid)
                     if self._ext_hwnd:
                         windowctl.minimize(self._ext_hwnd)
+                        diagnostics.log(f"swap: VLC window {_named(self._ext_hwnd)} "
+                                        "minimized")
+                    else:
+                        diagnostics.log("swap: no VLC window found to minimize")
                 windowctl.restore(hwnd)
+                diagnostics.log(f"swap: stream window {_named(hwnd)} restored")
                 self._swapped = True
             else:
                 if self.stream_hwnd and windowctl.is_valid(self.stream_hwnd):
                     windowctl.minimize(self.stream_hwnd)
+                    diagnostics.log(f"swap: stream window {_named(self.stream_hwnd)} "
+                                    "minimized")
+                else:
+                    diagnostics.log("swap: the stream window has gone; nothing to minimize")
                 saved, self._film_placement = self._film_placement, None
                 if self.player is self.embedded:
                     self._swap_show_film(saved)
                 elif self._ext_hwnd and windowctl.is_valid(self._ext_hwnd):
                     windowctl.restore(self._ext_hwnd)
+                    diagnostics.log(f"swap: VLC window {_named(self._ext_hwnd)} restored")
                 self._swapped = False
         except Exception as e:
+            diagnostics.log_block("swap failed:", traceback.format_exc())
             self._set_status(f"Window swap failed: {e}")
 
     def _swap_hide_film(self):
         # Only a film window that is up is hidden: one the user closed or
         # minimized stays that way through the pause and after it.
-        shown = self.video_win.state() in ("normal", "zoomed")
+        state = self.video_win.state()
+        shown = state in ("normal", "zoomed")
+        how = FILM_STATES.get(state, state)
         # resuming puts it back fullscreen, on the same monitor
         self._was_fullscreen = self.fullscreen and shown
         # Leaving fullscreen puts back the frame and rectangle it had
         # before; a film not fullscreen is not touched (no show, no
         # change). Its placement is read after that, from the window as
         # it was before fullscreen.
-        self._set_fullscreen(False, show=False)
+        if self.fullscreen:
+            self._set_fullscreen(False, show=False)
+            diagnostics.log("swap: fullscreen left")
         if shown:
             self._film_placement = windowctl.placement(int(self.video_win.frame(), 16))
             self.video_win.withdraw()
+            # placement() is (WINDOWPLACEMENT, the rectangle it was at)
+            diagnostics.log(f"swap: film window hidden, was {how} "
+                            f"at {self._film_placement[1]}")
+        else:
+            diagnostics.log(f"swap: film window left as it is ({how})")
 
     def _swap_show_film(self, saved):
         # deiconify alone does not bring it back where it was: a window
@@ -269,13 +307,19 @@ class Adapter(adapter.PlatformAdapter):
         # snap (see windowctl.placement). Tk's own geometry work is done
         # first, so none of it runs after the placement is put back. A
         # film the user brought back during the pause is left where it is.
-        if saved is not None and self.video_win.state() == "withdrawn":
+        state = self.video_win.state()
+        if saved is not None and state == "withdrawn":
             self.video_win.deiconify()
             self.video_win.update_idletasks()
             windowctl.put_placement(int(self.video_win.frame(), 16), saved)
+            diagnostics.log(f"swap: film window shown again at {saved[1]}")
+        else:
+            diagnostics.log("swap: film window left as it is "
+                            f"({FILM_STATES.get(state, state)})")
         if self._was_fullscreen:
             self._was_fullscreen = False
             self._set_fullscreen(True)
+            diagnostics.log("swap: fullscreen given back")
 
     # --- seam 4: installing an update (worker thread) ---------------------------------
 
