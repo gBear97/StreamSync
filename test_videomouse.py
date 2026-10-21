@@ -311,14 +311,24 @@ def shown(a):
 
 
 def bar_up(root, a, timeout=2.0):
-    """shown(a), for a check made just after asking for fullscreen: the
-    event loop runs until the bar is up, or the timeout says it is not
-    coming. The Mac only shows it once _settle_fullscreen has seen the
-    window fullscreen (_bar_allowed) - no sooner than FULLSCREEN_RETRY
-    after asking, and on a later pass of the loop than the request - and
-    makes it again first. That took 60-95 ms of move()'s 0.1 s on a Mac
-    here, so one late pass on a loaded runner (GitHub's macos-latest) left
-    the bar not up yet when it was checked."""
+    """shown(a), for a check made just after something that asks for the
+    bar - entering fullscreen, a move over the film, the film coming
+    back: the event loop runs until the bar is up, or the timeout says
+    it is not coming.
+
+    Showing the bar maps a window, which the event loop finishes later,
+    so a check right after move()'s 0.1 s pump can find it not yet
+    viewable on a loaded runner: GitHub's macos-latest failed that way
+    in film_keeps_keys and bar_follows_film. Entering fullscreen is
+    slower still on the Mac, which only shows the bar once
+    _settle_fullscreen has seen the window fullscreen (_bar_allowed) -
+    no sooner than FULLSCREEN_RETRY after asking, and on a later pass of
+    the loop than the request - and makes it again first. That took
+    60-95 ms of move()'s 0.1 s on a Mac here.
+
+    Only a check that the bar comes uses this. One that it does not come,
+    or that it stays up, still asserts at once: waiting would only make
+    it weaker."""
     end = time.monotonic() + timeout
     while not shown(a) and time.monotonic() < end:
         root.update()
@@ -584,7 +594,7 @@ def fs_bar(root, a):
     move(root, a, 12, 10)     # what Windows sends as the bar vanishes
     assert not shown(a) and frame.cget("cursor") == "none"
     move(root, a, 40, 30)
-    assert shown(a) and frame.cget("cursor") == ""
+    assert bar_up(root, a) and frame.cget("cursor") == ""
     print("a resting mouse hides the bar and the pointer; a repeated "
           "position does not bring them back, a real move does")
 
@@ -630,7 +640,7 @@ def fs_bar(root, a):
     for btn, want in ((resync, ("resync", "1:05:00")), (full, ("sync", ""))):
         label = btn.cget("text")
         move(root, a, 50 + len(a.syncs), 30)
-        assert shown(a)
+        assert bar_up(root, a)
         btn.invoke()
         pump(root)
         assert a.syncs[-1] == want, a.syncs
@@ -685,7 +695,7 @@ def fs_bar(root, a):
     assert not shown(a)
     win.deiconify()
     move(root, a, 42, 30)
-    assert shown(a)
+    assert bar_up(root, a)
     a._set_fullscreen(False)
     assert not shown(a) and frame.cget("cursor") == ""
     move(root, a, 43, 30)
@@ -728,7 +738,7 @@ def held_bar_windows(root, a):
     move(root, a, 52, 30)
     resync.invoke()
     pump(root)
-    assert a._fs_hold and shown(a)
+    assert a._fs_hold and bar_up(root, a)
     a.fg["hwnd"] = 1                  # some other application's window...
     a.fg["monitor"] = (1920, 0, 1920, 1080)      # ...on the other monitor
     pump(root, 0.8)
@@ -758,7 +768,7 @@ def held_bar_mac(root, a):
     move(root, a, 52, 30)
     resync.invoke()
     pump(root)
-    assert a._fs_hold and shown(a)
+    assert a._fs_hold and bar_up(root, a)
     pump(root, 0.8)
     assert shown(a)
     a.root.focus_get = lambda: None       # another app is active
@@ -890,7 +900,7 @@ def film_keeps_keys(root, a):
         assert bar_up(root, a)
         a._hide_fs_bar()
         assert change(lambda: move(root, a, 131, 37)) == 1, "bar coming"
-        assert shown(a)
+        assert bar_up(root, a)
         assert change(lambda: a._hide_fs_bar(hide_pointer=True)) == 1, \
             "bar going"
         assert change(lambda: a._flash_osd("Volume 50%", ms=5000)) == 1, \
@@ -911,13 +921,13 @@ def film_keeps_keys(root, a):
         # the main window had the keyboard already (the user on another
         # Space, say) when the bar went: it keeps it
         move(root, a, 132, 37)
-        assert shown(a)
+        assert bar_up(root, a)
         assert change(a._hide_fs_bar, keys=a.root) == 0, "main window's"
         # the user clicked in the main window after the change (on the
         # window itself: the test's widgets in it are not mapped, and an
         # unmapped widget gets no generated click)
         move(root, a, 133, 37)
-        assert shown(a)
+        assert bar_up(root, a)
         assert change(a._hide_fs_bar,
                       then=lambda: root.event_generate(
                           "<ButtonPress-1>", x=1, y=1)) == 0, "clicked"
@@ -1038,7 +1048,7 @@ def bar_follows_film(root, a):
     win.geometry("800x450+60+50")
     move(root, a, 81, 30)                        # and keep it up
     pump(root, 0.2)
-    assert shown(a)
+    assert bar_up(root, a)
     mid = bar.winfo_rootx() + bar.winfo_width() // 2
     want = win.winfo_rootx() + win.winfo_width() // 2
     assert abs(mid - want) <= 1, (mid, want)
