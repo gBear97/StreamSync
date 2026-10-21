@@ -2,7 +2,8 @@
 put our own video window fullscreen on the right monitor.
 
 Used to bring the stream's browser window into view while the streamer
-has the film paused, then tuck it away again when the film resumes.
+has the film paused, then tuck it away again when the film resumes - and
+to put the film's window back exactly where it was when it comes back.
 """
 
 import ctypes
@@ -12,6 +13,8 @@ from ctypes import wintypes
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
+SW_SHOWMAXIMIZED = 3
+SW_SHOWNOACTIVATE = 4
 SW_MINIMIZE = 6
 SW_RESTORE = 9
 
@@ -20,6 +23,7 @@ GWLP_WNDPROC = -4
 WS_OVERLAPPEDWINDOW = 0x00CF0000
 WS_POPUP = 0x80000000
 SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
 MONITOR_DEFAULTTONEAREST = 2
 WM_MOUSEACTIVATE = 0x0021
@@ -38,6 +42,14 @@ BROWSER_EXES = frozenset((
 class MONITORINFO(ctypes.Structure):
     _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
                 ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [("length", wintypes.UINT), ("flags", wintypes.UINT),
+                ("showCmd", wintypes.UINT),
+                ("ptMinPosition", wintypes.POINT),
+                ("ptMaxPosition", wintypes.POINT),
+                ("rcNormalPosition", wintypes.RECT)]
 
 
 LRESULT = ctypes.c_ssize_t
@@ -62,6 +74,10 @@ _SetWindowLongW = _proto("SetWindowLongW", wintypes.DWORD,
                          wintypes.HWND, ctypes.c_int, wintypes.DWORD)
 _SetWindowLongPtrW = _proto("SetWindowLongPtrW", ctypes.c_void_p,
                             wintypes.HWND, ctypes.c_int, ctypes.c_void_p)
+_GetWindowPlacement = _proto("GetWindowPlacement", wintypes.BOOL,
+                             wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT))
+_SetWindowPlacement = _proto("SetWindowPlacement", wintypes.BOOL,
+                             wintypes.HWND, ctypes.POINTER(WINDOWPLACEMENT))
 _GetForegroundWindow = _proto("GetForegroundWindow", wintypes.HWND)
 _CallWindowProcW = _proto("CallWindowProcW", LRESULT, ctypes.c_void_p,
                           wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
@@ -116,6 +132,49 @@ def unfullscreen(hwnd, saved):
     _SetWindowLongW(hwnd, GWL_STYLE, style)
     user32.SetWindowPos(wintypes.HWND(hwnd), None, x, y, w, h,
                         SWP_FRAMECHANGED | SWP_NOZORDER)
+
+
+def placement(hwnd):
+    """Where a window is, for put_placement() to put it back: its
+    WINDOWPLACEMENT (normal, maximized or minimized, and the rectangle it
+    restores to) and the rectangle it is at.
+
+    The two rectangles differ for a window snapped to a side or a corner
+    of a monitor (Win+Left/Right, or dragged to the edge): the placement's
+    is where it was before the snap, and that is where Windows puts it
+    when it is shown again normally, as Tk's deiconify shows it. On the
+    PC, a film snapped to the right half of a monitor came back from the
+    stream swap at the smaller size it had before, and stayed there.
+    """
+    wp = WINDOWPLACEMENT(length=ctypes.sizeof(WINDOWPLACEMENT))
+    _GetWindowPlacement(hwnd, ctypes.byref(wp))
+    return wp, window_rect(hwnd)
+
+
+def put_placement(hwnd, saved):
+    """Put a window back where placement() found it, without activating it.
+
+    A snapped window comes back at its snapped rectangle, but as a window
+    that is merely there - no call snaps one - so a drag no longer gives
+    it its size from before the snap. A maximized one is maximized again
+    on the monitor it was on.
+    """
+    wp, rect = saved
+    hw = wintypes.HWND(hwnd)
+    zoomed = wp.showCmd == SW_SHOWMAXIMIZED
+    if user32.IsIconic(hw) or (user32.IsZoomed(hw)
+                               and (not zoomed or window_rect(hwnd) != rect)):
+        # Normal first: a placement set on a window still maximized does
+        # not move it, measured in #26 (a browser maximized on one monitor
+        # stayed on the other).
+        user32.ShowWindow(hw, SW_SHOWNOACTIVATE)
+    back = WINDOWPLACEMENT.from_buffer_copy(wp)
+    back.showCmd = SW_SHOWMAXIMIZED if zoomed else SW_SHOWNOACTIVATE
+    _SetWindowPlacement(hwnd, ctypes.byref(back))
+    if not zoomed:
+        x, y, w, h = rect
+        user32.SetWindowPos(hw, None, x, y, w, h,
+                            SWP_NOZORDER | SWP_NOACTIVATE)
 
 
 def no_activate_on_click(hwnd):

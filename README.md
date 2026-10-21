@@ -246,8 +246,9 @@ With **Settings > Show the stream while the film is paused** on, a
 detected pause (auto mode, or you pausing yourself) brings the stream's
 browser forward so you see the facecam while the streamer talks, and
 tucks your film window out of the way. When the film starts again, the
-browser goes back and the film comes back (fullscreen restored if it was
-fullscreen).
+browser goes back and the film comes back where it was: the same place
+and size, maximized if it was, and fullscreen restored if it was
+fullscreen. A film window you closed or minimized stays that way.
 
 - **Windows**: pick the browser window under **Stream window** (Refresh
   lists open windows; *Automatic* picks a Twitch or Kick window, or the
@@ -615,7 +616,7 @@ each pull request: `test_audio_capture`, `test_players`,
 `test_controller`, `test_audio_matcher`, `test_fingerprint`,
 `test_relay`, `test_relay_tls`, `test_session`, `test_updater`,
 `test_netcerts`, `test_diagnostics`, `test_singleinstance`,
-`test_macswap`, `test_windowctl`,
+`test_macswap`, `test_winswap`, `test_windowctl`,
 `test_videomouse`, `test_widgets`, `test_updateflow` and `test_ui`. Tests that drive real
 windows skip themselves where they cannot run. Set `STREAMSYNC_SHOTS` to
 a folder and `test_ui` saves each screen there as a PNG. Those tests
