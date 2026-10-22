@@ -83,6 +83,19 @@ def main():
             raise SystemExit(0)
     diagnostics.log_session_start()
 
+    # Clear away the downloads earlier updates left in the temp folder:
+    # when an update has just started this version, its own installer
+    # too, once that has finished. On a thread of its own, which keeps
+    # trying for a minute and holds up nothing. Only by the one
+    # StreamSync: --selftest runs beside the user's, whose update may be
+    # downloading.
+    if "--selftest" not in sys.argv:
+        try:
+            import updater
+            updater.start_sweep(diagnostics.log)
+        except Exception as e:
+            diagnostics.log(f"could not clear old update downloads: {e!r}")
+
     # An unattended run must never sit on the gate's dialog, waiting for a
     # click nobody will make: what it would have asked about is printed
     # instead, and the run fails.
