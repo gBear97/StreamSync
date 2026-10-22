@@ -166,7 +166,9 @@ class FakeMP:
 FAKE_VLC = types.SimpleNamespace(
     EventType=types.SimpleNamespace(MediaPlayerTimeChanged=1),
     State=types.SimpleNamespace(Ended="ended", Stopped="stopped",
-                                NothingSpecial="none"))
+                                NothingSpecial="none", Error="error",
+                                Opening="opening", Buffering="buffering",
+                                Playing="playing", Paused="paused"))
 
 
 def make(stall=0.3, seed=1):
@@ -442,6 +444,120 @@ class AnchorInstance:
         return ("media", path)
 
 
+def slow_start():
+    """A first play whose file open is held up - macOS asking whether
+    StreamSync may open the film's folder held one for 58 s, a drive can
+    spin up, a share can be slow - is waited out and reported, where a
+    fixed 6 s once failed the sync and the film then started anyway from
+    0:00. A film that will not play still ends the wait at once, and an
+    ended film is stopped before it plays again (libvlc 3 ignores play()
+    on an ended player)."""
+    S = FAKE_VLC.State
+
+    class SlowMP:
+        def __init__(self, opens_after=None, fails=False, state=S.NothingSpecial):
+            self.opens_after, self.fails = opens_after, fails
+            self.state, self.began, self.calls = state, None, []
+
+        def play(self):
+            self.calls.append("play")
+            if self.state == S.Ended:
+                return                   # what libvlc 3 does: nothing
+            self.state, self.began = S.Opening, time.perf_counter()
+
+        def stop(self):
+            self.calls.append("stop")
+            self.state, self.began = S.Stopped, None
+
+        def _tick(self):
+            if self.state == S.Opening:
+                waited = time.perf_counter() - self.began
+                if self.fails and waited > 0.05:
+                    self.state = S.Ended      # a gone film: Ended, not Error
+                elif self.opens_after is not None and waited >= self.opens_after:
+                    self.state = S.Playing
+
+        def get_state(self):
+            self._tick()
+            return self.state
+
+        def is_playing(self):
+            self._tick()
+            return self.state == S.Playing
+
+        def get_time(self):
+            return 0 if self.is_playing() else -1
+
+        def event_manager(self):
+            return types.SimpleNamespace(event_attach=lambda *a: None)
+
+    def player(mp):
+        p = players.EmbeddedPlayer._around(None, mp)
+        p.has_media = True
+        return p
+
+    saved = players.vlc, players.SLOW_START
+    players.vlc, players.SLOW_START = FAKE_VLC, 0.3
+    try:
+        # held up 1.2 s: waited out, reported once, past SLOW_START
+        told = []
+        began = time.perf_counter()
+        player(SlowMP(opens_after=1.2)).ensure_playing(
+            timeout=5.0, waiting=lambda: told.append(time.perf_counter() - began))
+        took = time.perf_counter() - began
+        assert 1.2 <= took < 1.6, took
+        assert len(told) == 1 and 0.3 <= told[0] < 0.6, told
+
+        # never opens: gives up at the timeout, saying where to look
+        began = time.perf_counter()
+        try:
+            player(SlowMP()).ensure_playing(timeout=0.8)
+            raise AssertionError("a film that never opened was waited on forever")
+        except players.VLCError as e:
+            assert 0.8 <= time.perf_counter() - began < 1.2
+            assert "still opening" in str(e) and "folder" in str(e), e
+
+        # will not play (gone): fails at once, not after the timeout
+        began = time.perf_counter()
+        try:
+            player(SlowMP(fails=True)).ensure_playing(timeout=30.0)
+            raise AssertionError("a film that will not play was waited on")
+        except players.VLCError as e:
+            assert time.perf_counter() - began < 1.5, time.perf_counter() - began
+            assert "could not play" in str(e), e
+
+        # stopped while it waits (the Stop button): said so, not "gone"
+        mp = SlowMP()
+        p = player(mp)
+        threading.Timer(0.3, mp.stop).start()
+        try:
+            p.ensure_playing(timeout=5.0)
+            raise AssertionError("a start stopped midway kept waiting")
+        except players.VLCError as e:
+            assert "stopped before" in str(e), e
+
+        # ended: stopped first, then played - and it plays
+        mp = SlowMP(opens_after=0.0, state=S.Ended)
+        player(mp).ensure_playing(timeout=2.0)
+        assert mp.calls == ["stop", "play"], mp.calls
+        mp = SlowMP(opens_after=0.0, state=S.Ended)
+        player(mp).toggle_pause()
+        assert mp.calls == ["stop", "play"], mp.calls
+
+        # a sync hands its waiting() on to the start
+        p = player(SlowMP(opens_after=0.0))
+        seen = []
+        p.ensure_playing = lambda waiting=None: seen.append(waiting)
+        p.goto = lambda *a: None
+        cb = lambda: None
+        p.sync_seek(10.0, time.perf_counter(), 0.0, waiting=cb)
+        assert seen == [cb], seen
+    finally:
+        players.vlc, players.SLOW_START = saved
+    print("slow first start: waited out and reported; a dead film fails at "
+          "once; an ended film restarts")
+
+
 def embedded_anchor():
     """Every load hands libvlc our drawable again and turns its own
     fullscreen off - a guard only, as real libvlc keeps both across loads
@@ -693,6 +809,9 @@ def main():
     assert mp._rate() == 1.0, mp._rate()
     print("pause during a trim: correction cancelled, rate back to 1x")
     mp.stop()
+
+    # 4b. a slow first start is waited out, a dead film is not
+    slow_start()
 
     # 5. external VLC: a second film, a fresh spawn, a Tk path
     external_load()

@@ -637,7 +637,7 @@ class FakePlayer:
     def ensure_playing(self, timeout=6.0):
         self.playing = True
 
-    def sync_seek(self, match_t, t0_perf, offset):
+    def sync_seek(self, match_t, t0_perf, offset, waiting=None):
         self.seeks.append(match_t + offset)
 
     def goto(self, target, at):
