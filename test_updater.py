@@ -657,6 +657,7 @@ check("installer detached", kw.get("creationflags", 0) & 0x8, 0x8)
 # temp folder, so the user's own downloads are never touched. Where a try
 # has to fail, the remover and the wait are fakes: nothing waits the real
 # minute.
+import atexit
 import sys
 import threading
 
@@ -671,6 +672,14 @@ BESIDE = ["streamsync-update-d4/StreamSync.app",      # a disk image, maybe moun
           "otherapp-dl-g7/data",
           "otherapp/streamsync-dl-h8/setup.exe"]      # not directly in the temp folder
 _roots = []
+
+
+# Removed however the script ends: a sweep that raises stops it part way,
+# and its folders would otherwise stay in the real temp folder for good.
+@atexit.register
+def _remove_roots():
+    for folder in _roots:
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def _write(path, size):
@@ -744,6 +753,11 @@ check("retry: two waits of SWEEP_EVERY", waits, [updater.SWEEP_EVERY] * 2)
 check("retry: only the refused one tried again", sorted(tried),
       ["streamsync-dl-a1"] * 3 + ["streamsync-dl-b2", "streamsync-dl-c3"])
 check("retry: the bytes counted once", size, sum(DOWNLOADS.values()))
+# Long enough for the installer to finish and let go of setup.exe, which
+# a window of a few seconds is not, and a try every few seconds within it.
+check("retry: for about a minute",
+      (50 <= updater.SWEEP_EVERY * (updater.SWEEP_TRIES - 1) <= 70,
+       1 <= updater.SWEEP_EVERY <= 5), (True, True))
 
 # one that never goes is given up on after the last try, without raising
 root = _sweep_root()
@@ -812,7 +826,6 @@ for kind, link in _links:
     keep = os.path.join(outside, "keep.txt")
     _write(keep, 100)
     os.makedirs(os.path.join(root, "streamsync-dl-real"))
-    _write(os.path.join(root, "streamsync-dl-turns", "setup.exe"), 10)
     try:
         link(outside, os.path.join(root, "streamsync-dl-link"))
         link(outside, os.path.join(root, "streamsync-dl-real", "inside"))
@@ -820,8 +833,18 @@ for kind, link in _links:
         print(f"  {kind} checks SKIPPED: {e}")
         continue
     check(f"{kind}: not listed as a download", _names(updater.old_downloads(root)),
-          ["streamsync-dl-real", "streamsync-dl-turns"])
+          ["streamsync-dl-real"])
 
+    # With the remover a launch's sweep uses: the download goes, and the
+    # link inside it is not followed out of it.
+    removed, size, left = updater.sweep_downloads(root, sleep=lambda s: None)
+    check(f"{kind}: the real download removed, its link inside not counted",
+          (_names(removed), size, left), (["streamsync-dl-real"], 0, []))
+    check(f"{kind}: what the link inside it pointed at untouched",
+          os.listdir(outside), ["keep.txt"])
+
+    # A download refused once, and a link in its place by the next try.
+    _write(os.path.join(root, "streamsync-dl-turns", "setup.exe"), 10)
     turned = []
 
     def _turn_into_link(seconds):
@@ -835,10 +858,8 @@ for kind, link in _links:
     remove, tried = _remover(lambda name, n: name == "streamsync-dl-turns")
     removed, size, left = updater.sweep_downloads(root, remove=remove,
                                                   sleep=_turn_into_link)
-    check(f"{kind}: the real download removed, its link inside not counted",
-          (_names(removed), size), (["streamsync-dl-real"], 0))
     check(f"{kind}: one that became a link is left alone, not reported",
-          (left, tried.count("streamsync-dl-turns")), ([], 1))
+          (removed, left, tried.count("streamsync-dl-turns")), ([], [], 1))
     check(f"{kind}: the links themselves still there",
           _there(root, ["streamsync-dl-link", "streamsync-dl-turns"]),
           ["streamsync-dl-link", "streamsync-dl-turns"])
@@ -904,9 +925,6 @@ check("log: start_sweep returns while its sweep is waiting",
 go.set()
 thread.join(10)
 check("log: and the sweep finishes after", thread.is_alive(), False)
-
-for folder in _roots:
-    shutil.rmtree(folder, ignore_errors=True)
 
 if fails:
     print("UPDATER TEST FAILED")

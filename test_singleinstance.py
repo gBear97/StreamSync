@@ -12,6 +12,10 @@ beside it and writes nothing of theirs. On every OS:
 - `python streamsync.py` with one running exits at once, with 0, without
   starting the app; --diagnose and --selftest still run with one
   running - CI and the release workflow call them.
+- only the StreamSync that holds the lock clears away old update
+  downloads: not a launch that hands off, nor --selftest, either of which
+  could take the running one's download from under it. Each launch here
+  gets a temp folder of the test's own, so the user's are never touched.
 
 On Windows the holder shows a Tk window titled StreamSync, and a second
 launch finds it by the lock file's process id. A holder with no window
@@ -21,6 +25,7 @@ here), not waited on for ever.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -168,22 +173,72 @@ def test_windows_waits_for_the_running_one():
           "one that quits during it hands the lock over")
 
 
-def launch(*args):
+def launch(*args, temp=None, code=None):
+    """streamsync.py (or `code` in its place) with these args, and `temp`
+    as its temp folder: tempfile reads TMPDIR before TEMP and TMP, on
+    every OS."""
+    env = dict(os.environ, TMPDIR=temp) if temp else None
+    script = ["-c", code] if code else ["streamsync.py"]
     t0 = time.monotonic()
-    r = subprocess.run([sys.executable, "streamsync.py", *args], cwd=HERE,
+    r = subprocess.run([sys.executable, *script, *args], cwd=HERE, env=env,
                        capture_output=True, text=True, timeout=180)
     return r, time.monotonic() - t0
 
 
+def old_download():
+    """A temp folder of the test's own, holding a download such as an
+    update leaves behind: (the temp folder, the download)."""
+    temp = tempfile.mkdtemp(prefix="streamsync-instance-temp-")
+    download = os.path.join(temp, "streamsync-dl-left")
+    os.makedirs(download)
+    with open(os.path.join(download, "setup.exe"), "wb") as f:
+        f.write(b"x" * 1000)
+    return temp, download
+
+
+# The app as far as the window, which never opens: the gate says no once
+# the sweep, if this launch started one, has finished.
+FIRST = """
+import threading
+import depcheck, streamsync
+
+def not_ready():
+    for t in threading.enumerate():
+        if t.name == "update-sweep":
+            t.join(30)
+    return False
+
+depcheck.ensure_ready = not_ready
+streamsync.main()
+"""
+
+
+def test_streamsync_py_clears_old_downloads():
+    temp, download = old_download()
+    try:
+        r, _ = launch(temp=temp, code=FIRST)
+        assert r.returncode == 0, (r.returncode, r.stderr[-2000:])
+        assert not os.path.exists(download), \
+            "the StreamSync that holds the lock left an old download"
+        assert "removed 1 old update download" in r.stderr, r.stderr[-2000:]
+    finally:
+        shutil.rmtree(temp, ignore_errors=True)
+    print("the StreamSync that holds the lock clears away old update downloads")
+
+
 def test_streamsync_py_with_one_running():
+    temp, download = old_download()
     proc = hold(window=WINDOWS)
     try:
-        r, took = launch()
+        r, took = launch(temp=temp)
         assert r.returncode == 0, (r.returncode, r.stderr[-2000:])
         assert HANDOFF in r.stderr, r.stderr[-2000:]
         assert " starting (" not in r.stderr, "the second launch went on to start"
         assert took < 30, took
-        print(f"a second `streamsync.py` hands off and exits 0 ({took:.1f} s)")
+        assert os.path.isdir(download), \
+            "a launch that handed off cleared away the running one's download"
+        print(f"a second `streamsync.py` hands off and exits 0 ({took:.1f} s), "
+              "and leaves the downloads alone")
 
         r, _ = launch("--diagnose")
         assert r.returncode == 0 and "StreamSync diagnostics" in r.stdout, \
@@ -191,15 +246,18 @@ def test_streamsync_py_with_one_running():
         assert HANDOFF not in r.stderr
         print("--diagnose runs with one running")
 
-        r, took = launch("--selftest")
+        r, took = launch("--selftest", temp=temp)
         assert HANDOFF not in r.stderr, "--selftest handed off"
         # 0 is a whole tour (where VLC is installed); 2 or 3 is the gate
         # or the player saying VLC is missing - past the guard either way
         ran = (r.returncode == 0 and "SELFTEST OK" in r.stdout) or r.returncode in (2, 3)
         assert ran, (r.returncode, r.stdout[-500:], r.stderr[-2000:])
-        print(f"--selftest runs with one running (exit {r.returncode}, {took:.1f} s)")
+        assert os.path.isdir(download), "--selftest cleared away the user's download"
+        print(f"--selftest runs with one running (exit {r.returncode}, {took:.1f} s), "
+              "and leaves the downloads alone")
     finally:
         stop(proc)
+        shutil.rmtree(temp, ignore_errors=True)
 
 
 def main():
@@ -207,6 +265,7 @@ def main():
     test_first_claim_is_streamsync()
     test_second_claim_hands_off()
     test_windows_waits_for_the_running_one()
+    test_streamsync_py_clears_old_downloads()
     test_streamsync_py_with_one_running()
     print("SINGLE INSTANCE TEST PASSED")
 
