@@ -139,7 +139,9 @@ class UpdateFlow:
                 self.q.put(("update_failed", why))
 
         # On success tmp stays: Windows' installer runs from it after we
-        # quit, and the Mac's install removes its own disk image.
+        # quit, and the Mac's install removes its own disk image. The new
+        # version clears what is left as it starts (updater.sweep_downloads,
+        # from streamsync.py), once the installer has let go of it.
         threading.Thread(target=work, daemon=True).start()
 
     def _download_update(self, asset, rel, dest, progress):

@@ -19,6 +19,9 @@ with, so each step is checked rather than trusted:
   helper that restores the old one if the move fails; on Windows the
   installer replaces the app's folder once the app has closed.
 
+Each launch also clears away the downloads earlier updates left in the
+temp folder (sweep_downloads), the installer that just ran included.
+
 Stdlib only, so it stays importable from the dependency gate's context.
 """
 
@@ -26,12 +29,16 @@ import hashlib
 import json
 import os
 import platform
+import shutil
 import ssl
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import netcerts
 import sigcheck
@@ -446,3 +453,126 @@ def install_and_relaunch_windows(setup_path):
     subprocess.Popen([setup_path] + SETUP_ARGS, creationflags=detached,
                      close_fds=True, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL)
+
+
+# ------------------------------------------------------------ old downloads
+
+# Each update downloads into a folder of its own in the temp folder
+# (ui/update.py). Windows' installer runs from that folder after the app
+# has quit, so the app cannot remove it then, and nothing else ever did:
+# every update on the PC left its 44 MB installer behind. The Mac removes
+# its disk image as it installs, but leaves the folder of an update that
+# never got that far. So each launch clears them all away.
+DOWNLOAD_PREFIX = "streamsync-dl-"
+# A launch that an update started begins while that update's installer
+# is still running - it starts the new version, then finishes - and
+# Windows will not delete a program while it runs. So a folder that will
+# not go is tried again every SWEEP_EVERY seconds, SWEEP_TRIES times in
+# all (about a minute), and after that is left for the next launch.
+SWEEP_EVERY = 2.0
+SWEEP_TRIES = 30
+
+
+def _is_link(path):
+    """A symlink, or on Windows a junction: never followed into and never
+    removed, wherever it points. Path.is_junction is Python 3.12's; before
+    it, shutil.rmtree already refuses a junction as it does a symlink."""
+    if os.path.islink(path):
+        return True
+    is_junction = getattr(Path(path), "is_junction", None)
+    return bool(is_junction and is_junction())
+
+
+def _folder_bytes(path):
+    """How many bytes the files in a folder hold, links not followed."""
+    total, folders = 0, [path]
+    while folders:
+        try:
+            with os.scandir(folders.pop()) as entries:
+                for entry in entries:
+                    if _is_link(entry.path):
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        folders.append(entry.path)
+                    else:
+                        total += entry.stat(follow_symlinks=False).st_size
+        except OSError:
+            pass               # only for the log line: a guess will do
+    return total
+
+
+def old_downloads(root=None):
+    """The update download folders directly in the temp folder (or in
+    `root`) right now: real folders named streamsync-dl-*, and nothing
+    else - not the Mac's streamsync-update-* mount folders, one of which
+    may be in use, nor any other file, folder or link there."""
+    found = []
+    with os.scandir(root or tempfile.gettempdir()) as entries:
+        for entry in entries:
+            if (entry.name.startswith(DOWNLOAD_PREFIX)
+                    and not _is_link(entry.path)
+                    and entry.is_dir(follow_symlinks=False)):
+                found.append(entry.path)
+    return sorted(found)
+
+
+def sweep_downloads(root=None, tries=SWEEP_TRIES, every=SWEEP_EVERY,
+                    remove=shutil.rmtree, sleep=time.sleep):
+    """Remove the update downloads in the temp folder (or in `root`).
+
+    Only the folders that are there as it starts are ever removed. An
+    update this same launch downloads while it is still trying again gets
+    a folder of its own, made later, and that one is never touched.
+    Returns (removed, size, left): the folders removed, how many bytes
+    they held, and those still there after the last try.
+    """
+    # Fixed here, once: a folder that appears after this is never looked at.
+    pending = {path: _folder_bytes(path) for path in old_downloads(root)}
+    removed, size = [], 0
+    for attempt in range(tries):
+        if attempt:
+            sleep(every)
+        for path in list(pending):
+            # Looked at again on every try: one that has become a link
+            # since is left alone, and one that has gone is not ours to count.
+            if _is_link(path) or not os.path.isdir(path):
+                del pending[path]
+                continue
+            try:
+                remove(path)
+            except OSError:
+                pass           # Windows: its installer is still running
+            if not os.path.lexists(path):
+                removed.append(path)
+                size += pending.pop(path)
+        if not pending:
+            break
+    return removed, size, sorted(pending)
+
+
+def _downloads(n):
+    return f"{n} old update download{'' if n == 1 else 's'}"
+
+
+def start_sweep(log, **kw):
+    """sweep_downloads(**kw) on a daemon thread, which says what it did
+    through `log`: one line if it removed anything, one if some would not
+    go, and nothing when there was nothing to do. It never holds up
+    startup, the window or quitting - a quit just ends it, and the next
+    launch tries again - and whatever it raises is logged, not raised."""
+    def work():
+        try:
+            removed, size, left = sweep_downloads(**kw)
+        except Exception as e:
+            log(f"could not clear old update downloads: {e!r}")
+            return
+        if removed:
+            log(f"removed {_downloads(len(removed))} "
+                f"({size / (1 << 20):.0f} MB)")
+        if left:
+            log(f"could not remove {_downloads(len(left))}; the next launch "
+                "tries again")
+
+    thread = threading.Thread(target=work, name="update-sweep", daemon=True)
+    thread.start()
+    return thread
