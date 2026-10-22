@@ -353,7 +353,8 @@ class SyncController:
     @staticmethod
     def _weak_hint():
         if IS_MAC:
-            return "Check BlackHole routing, or try a louder scene."
+            return ("Check the stream is playing on this Mac with its sound "
+                    "on, or try a louder scene.")
         return ("The commentary may be drowning the film audio; try a "
                 "louder scene.")
 

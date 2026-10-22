@@ -49,8 +49,9 @@ on both.
   Intel
 - VLC installed (64-bit on Windows). The first-run check offers to
   install it.
-- On the Mac: the free BlackHole audio driver - see
-  [macOS setup](#macos-setup)
+- Nothing else. On the Mac, StreamSync hears the stream through macOS's
+  own audio tap (macOS 14.2 or later; on 14.0-14.1, BlackHole - see
+  [macOS setup](#macos-setup))
 
 ## Install
 
@@ -70,16 +71,16 @@ program.
 for Apple Silicon, `x86_64` for Intel (**Apple menu > About This Mac**
 says which) - open it, and drag StreamSync.app into your Applications
 folder. Releases are signed and notarized, so the app just opens. On the
-first launch the first-run check offers to install VLC if it is missing
-(and BlackHole with it), you install BlackHole if you don't have it yet,
-and you set up the audio routing once in Audio MIDI Setup;
+first launch the first-run check offers to install VLC if it is missing,
+and on the first sync macOS asks once whether StreamSync may record this
+computer's audio - nothing else to install or route;
 [MAC_FIRST_RUN.md](MAC_FIRST_RUN.md) walks through it step by step.
 
 ### First-run check
 
 On startup StreamSync verifies its dependencies: VLC (64-bit), the
-bundled ffmpeg, BlackHole on the Mac, and - when running from source -
-the Python packages. If everything is present the check is invisible. If
+bundled ffmpeg, that the Mac can record its own sound (macOS 14.2+), and
+- when running from source - the Python packages. If everything is present the check is invisible. If
 something is missing, a fix-it dialog appears with one-click installs:
 
 - **VLC** on Windows - installs through **winget**, Windows' built-in
@@ -91,15 +92,13 @@ something is missing, a fix-it dialog appears with one-click installs:
   it.
 - **VLC** on the Mac - through Homebrew if you have it, otherwise the
   videolan.org button.
-- **BlackHole** on the Mac - one click; see [macOS setup](#macos-setup).
 - **Python packages** (source only) - runs pip for you and re-checks.
 
 Each fix shows its progress in the dialog and confirms when done; the
 **Start StreamSync** button unlocks once VLC, ffmpeg and the packages
-pass. BlackHole does not hold it back, and a missing BlackHole alone
-does not open the check: without it StreamSync starts, but it hears the
-Mac's microphone instead of the stream. See
-[macOS setup](#macos-setup) for installing it.
+pass. On the Mac the check also says whether StreamSync can hear the
+Mac's own sound; that never holds it back, and on macOS older than 14.2
+it points to BlackHole (see [macOS setup](#macos-setup)).
 
 ## Updating
 
@@ -442,29 +441,31 @@ running on the same computer.
 
 1. **VLC** - the first-run check installs it via Homebrew or points you at
    videolan.org.
-2. **BlackHole 2ch** (needed for audio sync) - macOS has no built-in way
-   to record "what's playing", so audio is captured through this free,
-   signed virtual audio driver. Install it with
-   `brew install blackhole-2ch`, or get the BlackHole 2ch installer from
-   [existential.audio/blackhole](https://existential.audio/blackhole/).
-   When the first-run check opens for something else (VLC, say), it also
-   offers BlackHole in **one click**: it downloads the developer's
-   ~100 KB signed installer from their official URL, verifies the sha256
-   against Homebrew's independently published checksum, and hands it to
-   Apple's own installer (which also verifies the signature/notarization)
-   - you just enter your password. A missing BlackHole on its own does not
-   open the check.
+2. **This Mac's sound** - nothing to install. StreamSync records what the
+   Mac is playing through macOS's own audio tap (macOS 14.2 or later):
+   every app except StreamSync itself, so the film's own sound never
+   counts, and your volume keys keep working. On the first sync macOS asks
+   whether StreamSync may record this computer's audio - allow it. Said
+   no? Turn it on in **System Settings > Privacy & Security > Screen &
+   System Audio Recording > System Audio Recording Only**.
 
-   Then the one manual step: hit **Open Audio MIDI Setup** in the check
-   (or open Audio MIDI Setup from **Applications > Utilities**), click
-   **+ > Create Multi-Output Device**, tick your speakers *and*
-   BlackHole 2ch, and set it as the sound output. StreamSync listens to
-   BlackHole automatically; **Settings > Listen to** shows it. If the
-   automatic choice there names a microphone instead, BlackHole is not
-   installed.
-3. **Permissions** - macOS will prompt as features are first used:
-   *Microphone* (recording from BlackHole) and *Automation/System Events*
-   (only for showing the stream while the film is paused).
+   StreamSync follows the stream *this Mac* plays. To follow one playing
+   on another device (a TV, another computer), pick a microphone under
+   **Settings > Listen to** instead - less precise: a mic hears the whole
+   room, a moment late.
+
+   macOS 14.0 and 14.1 have no audio taps, so there StreamSync uses
+   BlackHole: install it (`brew install blackhole-2ch`, or from
+   [existential.audio/blackhole](https://existential.audio/blackhole/)),
+   create a **Multi-Output Device** in Audio MIDI Setup with your speakers
+   and BlackHole 2ch, and set it as the sound output; StreamSync picks
+   BlackHole by itself. On newer macOS it stays available under
+   **Settings > Listen to** for anyone who prefers it.
+3. **Permissions** - macOS asks as features are first used: *System Audio
+   Recording* (this Mac's sound), *Microphone* (only when BlackHole or a
+   microphone is picked under Listen to, and for a watch-party host's
+   voice), and *Automation/System Events* (only for showing the stream
+   while the film is paused).
 
 Step by step, with a first sync test: [MAC_FIRST_RUN.md](MAC_FIRST_RUN.md).
 
@@ -488,7 +489,10 @@ Step by step, with a first sync test: [MAC_FIRST_RUN.md](MAC_FIRST_RUN.md).
   dated by its position in the recording, not by when a recording was
   asked for - so the matched moment is corrected by exactly how long ago
   it was heard (the stream kept playing meanwhile), plus your fine-tune
-  offset. VLC's own position only updates every 250-500 ms, so
+  offset. On the Mac every block arrives with the moment macOS captured
+  it, and StreamSync adds the output device's own reported delay - a few
+  ms on built-in speakers, a good deal more on Bluetooth headphones - so
+  the film lines up with what you hear. VLC's own position only updates every 250-500 ms, so
   StreamSync dates each update as it arrives (within ~1 ms of the frame
   on screen). A seek stalls playback for an amount that depends on the
   file and the CPU (75 ms to over half a second), so after every seek
@@ -816,10 +820,9 @@ GitHub. You can run the same command against your own copy.
 ## Credits
 
 StreamSync stands on excellent open software: [VLC / libvlc](https://www.videolan.org)
-(VideoLAN) for playback, [BlackHole](https://existential.audio/blackhole/)
-by Existential Audio (GPL-3.0) as the macOS audio capture backbone,
-ffmpeg (via imageio-ffmpeg) for decoding, the soundcard, numpy and
-websockets Python libraries, and [Inno Setup](https://jrsoftware.org/isinfo.php)
-for the Windows installer. StreamSync downloads BlackHole's installer
-from its developer's official server at setup time and never
-redistributes it.
+(VideoLAN) for playback, ffmpeg (via imageio-ffmpeg) for decoding, the
+soundcard, numpy and websockets Python libraries, and
+[Inno Setup](https://jrsoftware.org/isinfo.php) for the Windows installer.
+On macOS 14.0-14.1 it can listen through
+[BlackHole](https://existential.audio/blackhole/) by Existential Audio
+(GPL-3.0), which it never installs or redistributes.

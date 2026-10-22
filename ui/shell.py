@@ -1,8 +1,9 @@
 """StreamSync - sync your own copy of a film to a live stream.
 
 It records a few seconds of the stream's sound (WASAPI loopback on
-Windows, BlackHole on macOS) and finds the matching moment in the film's
-own audio track, so it works with the stream minimized.
+Windows, a Core Audio tap of this Mac's sound on macOS) and finds the
+matching moment in the film's own audio track, so it works with the
+stream minimized.
 
 Playback goes to the built-in player (libvlc drawing into our own window,
 millisecond seeks) or to the real VLC app driven over its HTTP interface.

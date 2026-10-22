@@ -58,6 +58,11 @@ VERSION=$("$PY" -c 'from version import __version__; print(__version__)')
 
 PLIST=dist/StreamSync.app/Contents/Info.plist
 
+# "This Mac's sound" is recorded by sstap, a small Swift helper
+# (mac/sstap.swift), built for the same floor as everything else here and
+# put beside StreamSync's own executable, where audio_capture finds it.
+MIN_MACOS="$MIN_MACOS" sh mac/build_sstap.sh dist/StreamSync.app/Contents/MacOS/sstap
+
 # PyInstaller's CLI cannot set these, so stamp them in afterwards.
 #
 # plutil, not PlistBuddy: PlistBuddy re-parses its -c argument with a
@@ -86,13 +91,18 @@ plist_set NSMicrophoneUsageDescription \
     "StreamSync listens to a few seconds of the stream's audio to find that exact moment in your local copy of the film."
 plist_set NSAppleEventsUsageDescription \
     "StreamSync brings the stream's browser window forward while the film is paused, and hides it again when playback resumes."
+# The tap that records "This Mac's sound" (sstap). sstap is StreamSync's
+# child, so macOS asks in StreamSync's name and shows this string.
+plist_set NSAudioCaptureUsageDescription \
+    "StreamSync listens to a few seconds of what this Mac is playing - the stream's sound - to find that exact moment in your copy of the film."
 
 # Read them back. The failure above was silent, and an Info.plist missing
 # a usage string does not misbehave until macOS terminates the app the
 # first time it touches the microphone - by which point it is a user's
 # crash, not a build error.
 for key in CFBundleShortVersionString CFBundleVersion LSMinimumSystemVersion \
-           NSMicrophoneUsageDescription NSAppleEventsUsageDescription; do
+           NSMicrophoneUsageDescription NSAppleEventsUsageDescription \
+           NSAudioCaptureUsageDescription; do
     value=$(plutil -extract "$key" raw -o - "$PLIST" 2>/dev/null || true)
     if [ -z "$value" ]; then
         echo "Info.plist is missing $key - the app would be terminated by"
@@ -162,5 +172,12 @@ if too_new:
              "README.md and MAC_FIRST_RUN.md state with it - or pin the "
              "dependency that raised it.")
 PYFLOOR
+
+# Adding sstap after PyInstaller broke the bundle's ad-hoc seal, if it
+# made one: re-seal it, so a local build still verifies and launches. A
+# release signs everything again with the real identity (release.yml).
+if [ -d dist/StreamSync.app/Contents/_CodeSignature ]; then
+    codesign --force --sign - dist/StreamSync.app
+fi
 
 echo "Built: dist/StreamSync.app (version $VERSION)"

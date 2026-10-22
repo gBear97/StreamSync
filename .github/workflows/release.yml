@@ -272,6 +272,18 @@ jobs:
           done < <(find "$APP" -depth -type f -print0)
           echo "Signed $count Mach-O file(s) inside the bundle."
 
+          # sstap records this Mac's sound through a Core Audio tap, which
+          # the hardened runtime counts as audio input. The app's
+          # entitlements cover only the app's process, so the helper gets
+          # its own (mac/sstap.entitlements) - signed again, after the loop
+          # above signed it plain, and before the bundle seals it.
+          codesign --force --timestamp --options runtime \
+            --entitlements mac/sstap.entitlements \
+            --keychain "$KEYCHAIN" --sign "$IDENTITY" "$APP/Contents/MacOS/sstap"
+          codesign -d --entitlements - --xml "$APP/Contents/MacOS/sstap" 2>/dev/null \
+            | grep -q "com.apple.security.device.audio-input" \
+            || { echo "sstap lacks the audio-input entitlement"; exit 1; }
+
           codesign --force --timestamp --options runtime \
             --entitlements entitlements.plist \
             --keychain "$KEYCHAIN" --sign "$IDENTITY" "$APP"
