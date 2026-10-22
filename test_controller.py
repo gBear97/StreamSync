@@ -93,6 +93,7 @@ class Player:
         self.playing = False
         self.seeks = []
         self.nudges = []
+        self.slow_start = False      # sync_seek reports a slow start
 
     def pos(self):
         if self.anchor is None:
@@ -120,7 +121,9 @@ class Player:
         self.path = path          # another film: stopped, nowhere yet
         self.anchor, self.playing = None, False
 
-    def sync_seek(self, match_t, t0, offset):
+    def sync_seek(self, match_t, t0, offset, waiting=None):
+        if waiting is not None and self.slow_start:
+            waiting()
         target = match_t + (self.now() - t0) + offset
         self.seeks.append(target)
         self.anchor = (target, self.now())
@@ -346,6 +349,19 @@ def test_weak_resync_not_applied():
     run_sync(ctl, ctl.sync, "")
     assert len(player.seeks) == 1, "first sync should still use its best guess"
     print("weak match: Resync leaves the film alone; first sync still guesses")
+
+
+def test_slow_film_start_says_why():
+    """A film slow to start on a sync (macOS asking about its folder, a
+    drive spinning up) gets a status saying what it is waiting for, and
+    the sync still lands."""
+    ctl, stream, player, clock, q = make()
+    player.slow_start = True
+    run_sync(ctl, ctl.sync, "")
+    msgs = statuses(q)
+    assert any(s.startswith("Opening the film...") for s in msgs), msgs
+    assert abs(player.pos() - stream.pos()) < 1e-6, "the slow start lost the sync"
+    print("slow film start: says why it waits, and still lands")
 
 
 def test_weak_first_look_listens_longer():
@@ -864,10 +880,10 @@ class FilmPlayer(Player):
     def seek(self, t):
         self.anchor = (t, self.now())
 
-    def sync_seek(self, match_t, t0, offset):
+    def sync_seek(self, match_t, t0, offset, waiting=None):
         if not self.films:
             raise controller.VLCError("No video file loaded.")
-        super().sync_seek(match_t, t0, offset)
+        super().sync_seek(match_t, t0, offset, waiting)
 
 
 def switchable():
@@ -1042,6 +1058,7 @@ def main():
     test_drift_corrected()
     test_weak_resync_not_applied()
     test_weak_first_look_listens_longer()
+    test_slow_film_start_says_why()
     test_false_pause_recovers()
     test_real_pause_and_resume()
     test_auto_passes_timed_from_their_start()

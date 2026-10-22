@@ -102,7 +102,7 @@ class Player:
     def is_playing(self):
         return self.playing
 
-    def sync_seek(self, match_t, t0, offset):
+    def sync_seek(self, match_t, t0, offset, waiting=None):
         now = time.perf_counter()
         with self.lock:
             self.anchor = (match_t + (now - t0) + offset, now)

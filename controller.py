@@ -330,7 +330,8 @@ class SyncController:
             apply = ok or first
             if apply:
                 self._say("Seeking...")
-                player.sync_seek(match_t, t0, offset)
+                player.sync_seek(match_t, t0, offset,
+                                 waiting=lambda: self._say(self._opening_hint()))
                 player.set_mute(mute)
                 self.q.put(("swap", False, "a sync moved the film"))
             msg = (f"Matched stream audio at {fmt_time(match_t)} "
@@ -349,6 +350,17 @@ class SyncController:
             self._say(f"Sync failed: {e}")
         finally:
             self._release()
+
+    @staticmethod
+    def _opening_hint():
+        """Said when the film is slow to start on a sync. A first play
+        waits on its file's open, and on a Mac that can be macOS asking
+        whether StreamSync may use the film's folder - a prompt that held
+        one sync 58 s."""
+        if IS_MAC:
+            return ("Opening the film... If macOS is asking whether StreamSync "
+                    "may open the film's folder, allow it.")
+        return "Opening the film... (is its drive awake and connected?)"
 
     @staticmethod
     def _weak_hint():

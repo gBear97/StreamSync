@@ -48,6 +48,13 @@ EMBED_STALL_GUESS = 0.10    # first guess at a seek's stall; learned after
 EXT_CMD_LEAD = 0.12         # fire external seeks this early (http + exec time)
 EXT_STALL_GUESS = 0.10
 EXT_STATUS_STALE = 2.0      # VLC unheard this long: closed, hung or swamped
+# A first play can sit opening its file for a long time with nothing wrong:
+# macOS holding the open while it asks whether StreamSync may use the
+# film's folder (Downloads, Desktop, Documents, an external drive), a disk
+# spinning up, a network share. A sync waits that out, up to START_TIMEOUT,
+# and tells its caller after SLOW_START so the status can say why.
+START_TIMEOUT = 60.0
+SLOW_START = 3.0
 TRIM_RATE = 0.05            # trims run at 1 +- this
 TRIM_MAX = 0.6              # errors up to this are trimmed; beyond, re-seeked
 SETTLE_TOL = 0.02           # close enough - leave it
@@ -455,23 +462,75 @@ class EmbeddedPlayer(_ClosedLoop):
         self._paused_at = None      # a new film: no paused step to go on from
         self.has_media = True
 
-    def ensure_playing(self, timeout=6.0):
+    def ensure_playing(self, timeout=START_TIMEOUT, waiting=None):
+        """Start playback if it is not running, and wait until it runs.
+
+        It waits while libvlc is still opening the film, not a fixed few
+        seconds. A first play once sat 58 s in Opening while macOS asked
+        whether StreamSync could open the film's Downloads folder; the old
+        6 s limit failed that sync, and the film then started anyway, from
+        0:00 and out of sync. A film that will not play ends the wait at
+        once. waiting() is called once the wait passes SLOW_START, so the
+        caller can say what it is waiting for.
+        """
         if not self.has_media:
             raise VLCError("No video file loaded.")
         if not self.mp.is_playing():
             self._clk.reset()
+            self._restartable()
             self.mp.play()
-        deadline = time.perf_counter() + timeout
-        while time.perf_counter() < deadline:
+        began = time.perf_counter()
+        told = moved = False
+        while True:
             if self.mp.is_playing() and self.mp.get_time() >= 0:
                 return
+            waited = time.perf_counter() - began
+            if vlc is not None:
+                # A film that cannot be played - gone, or not a film - ends
+                # within a few hundredths of a second, as Ended rather than
+                # Error. But a film that had played to its end reads Ended
+                # for a moment after play() too: a stop only counts once
+                # the player has moved since, or once it has lasted.
+                # Stopped, by contrast, can read for a while after the
+                # stop-then-play of _restartable while the open is held: it
+                # counts only once the player has moved (someone stopped it).
+                state = self.mp.get_state()
+                if state in (vlc.State.Opening, vlc.State.Buffering,
+                             vlc.State.Playing, vlc.State.Paused):
+                    moved = True
+                elif state in (vlc.State.Ended, vlc.State.Error) and \
+                        (moved or waited > 1.0):
+                    raise VLCError("VLC could not play the film - is it "
+                                   "still where it was? Open it again to "
+                                   "check.")
+                elif state == vlc.State.Stopped and moved:
+                    raise VLCError("Playback was stopped before the film "
+                                   "started.")
+            if waiting is not None and not told and waited >= SLOW_START:
+                told = True
+                waiting()
+            if waited >= timeout:
+                raise VLCError(
+                    f"VLC was still opening the film after {timeout:.0f} s. "
+                    "If macOS is asking whether StreamSync may open the "
+                    "film's folder, allow it; if the film is on an external "
+                    "or network drive, check it is connected. Then sync again.")
             time.sleep(0.05)
-        raise VLCError("VLC did not start playback in time.")
 
-    def sync_seek(self, match_t, t0_perf, offset):
+    def _restartable(self):
+        """libvlc 3 ignores play() on a player that has ended (or failed):
+        it stays Ended. Stopped, it plays again - measured on 3.0.23,
+        playing 0.02 s after play()."""
+        if vlc is not None and self.mp.get_state() in (vlc.State.Ended,
+                                                       vlc.State.Error):
+            self.mp.stop()
+
+    def sync_seek(self, match_t, t0_perf, offset, waiting=None):
         """Line playback up with a stream moment captured at t0_perf: the
-        film belongs at match_t + offset then, and 1x from there."""
-        self.ensure_playing()
+        film belongs at match_t + offset then, and 1x from there. However
+        long playback took to start, the line is drawn from t0_perf, so a
+        slow start costs no accuracy."""
+        self.ensure_playing(waiting=waiting)
         self.goto(match_t + offset, t0_perf)
 
     def nudge(self, delta):
@@ -501,7 +560,9 @@ class EmbeddedPlayer(_ClosedLoop):
         self._cancel()
         self._clk.reset()
         state = self.mp.get_state()
-        if state in (vlc.State.Ended, vlc.State.Stopped, vlc.State.NothingSpecial):
+        if state in (vlc.State.Ended, vlc.State.Error, vlc.State.Stopped,
+                     vlc.State.NothingSpecial):
+            self._restartable()
             self.mp.play()
         else:
             self.mp.pause()
@@ -773,11 +834,15 @@ class ExternalPlayer(_ClosedLoop):
             return None
         return st
 
-    def ensure_playing(self, timeout=8.0):
+    def ensure_playing(self, timeout=8.0, waiting=None):
         if not self.has_media:
             raise VLCError("No video file loaded in external VLC.")
         deadline = time.perf_counter() + timeout
+        slow = time.perf_counter() + SLOW_START
         while time.perf_counter() < deadline:
+            if waiting is not None and time.perf_counter() >= slow:
+                waiting()
+                waiting = None
             st = self._status()
             if st and st.get("state") == "playing":
                 return
@@ -792,8 +857,8 @@ class ExternalPlayer(_ClosedLoop):
             time.sleep(0.2)
         raise VLCError("External VLC did not start playing in time.")
 
-    def sync_seek(self, match_t, t0_perf, offset):
-        self.ensure_playing()
+    def sync_seek(self, match_t, t0_perf, offset, waiting=None):
+        self.ensure_playing(waiting=waiting)
         self.goto(match_t + offset, t0_perf)
 
     def _seek_line(self, guess):
