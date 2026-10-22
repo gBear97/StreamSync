@@ -15,4 +15,9 @@ arch="${ARCH:-$(uname -m)}"
 mkdir -p "$(dirname "$out")"
 swiftc -O -swift-version 5 -target "$arch-apple-macos${MIN_MACOS:-14.0}" \
     "$here/sstap.swift" -o "$out"
+# Ad-hoc sign it. The linker does that by itself only for arm64: an
+# x86_64 build comes out unsigned, and codesign then refuses to seal the
+# app around it ("code object is not signed at all"). A release signs it
+# again with the real identity (release.yml).
+codesign --force --sign - "$out"
 echo "Built $out ($arch, macOS ${MIN_MACOS:-14.0}+)"
