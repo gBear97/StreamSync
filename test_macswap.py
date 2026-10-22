@@ -64,7 +64,11 @@ Events round trip ran on. It runs on Windows and Linux too. What is tested:
 - once closed, the queue loop dispatches and settles nothing;
 - Command-Q and Settings... reach the app's own close and Settings;
 - a failed attach says so at once, and the diagnostics report it writes
-  (Spotlight and codesign, seconds) runs off the Tk thread.
+  (Spotlight and codesign, seconds) runs off the Tk thread;
+- every pause and resume leaves a few "swap: ..." lines in the log - what
+  asked for it, the stream app shown or hidden, fullscreen left and given
+  back, a failure - and nothing else does: not the resume every sync
+  sends with nothing up, not the queue loop going round.
 """
 
 import threading
@@ -253,6 +257,28 @@ class Quiet:
         return lambda *a, **kw: None
 
 
+class Log(Quiet):
+    """diagnostics, keeping the lines logged instead of writing the real
+    log. The swap worker logs from its own thread, as it may: the real
+    log() takes a lock, and a list's append needs none."""
+    def __init__(self, **given):
+        super().__init__(**given)
+        self.lines = []
+
+    def log(self, message, echo=True):
+        self.lines.append(message)
+
+    def log_block(self, title, text):
+        self.lines.append(f"{title}\n{text}")
+
+    def swaps(self):
+        """The swap's lines, each taken once: a check reads what came
+        after the one before it."""
+        out = [ln for ln in self.lines if ln.startswith("swap")]
+        self.lines.clear()
+        return out
+
+
 # ------------------------------------------------------ fake engine and Mac
 
 class Player:
@@ -409,8 +435,10 @@ def make(film=True, attach=True, **osa):
     def log_report(*a, **kw):
         reports.append(threading.get_ident())
         return "the log"
-    patch("diagnostics", Quiet(log_report=log_report))
+    log = Log(log_report=log_report)
+    patch("diagnostics", log)
     app = shell.create_app(Root(), platform=platform_mac)
+    app.log = log
     app.embedded.attach_ok = attach
     settle = app._swap_done
     app.results = []                    # each swap result the Tk side settled
@@ -1351,6 +1379,60 @@ def test_failed_attach_reports_off_the_tk_thread():
     print("attach failure: said at once, the report written off the Tk thread")
 
 
+def test_swap_leaves_a_trace_in_the_log():
+    # On the PC, the browser was minimized during a pause and the log said
+    # nothing of the swap. Each step is a line now, from the worker's thread
+    # too - and a few of them a pause, not one every pass of the queue loop
+    app, mac = make()
+    app._toggle_fullscreen()
+    assert quiet_fullscreen(app)
+    app.embedded.playing = True
+    app.log.swaps()
+    app._toggle_pause()                 # Space
+    assert pump(app, lambda: app._swapped), mac.names()
+    assert app.log.swaps() == [
+        "swap: pause (Space or a play button)",
+        "swap: fullscreen left",
+        "swap: stream app 'Safari' brought forward"]
+    idle(app)
+    assert app.log.swaps() == [], "the queue loop logged the swap again"
+    app.q.put(("swap", False, "auto mode: the stream resumed"))
+    assert pump(app, lambda: not app._swapped and app.fullscreen), mac.names()
+    assert app.log.swaps() == [
+        "swap: resume (auto mode: the stream resumed)",
+        "swap: stream app 'Safari' hidden, StreamSync brought forward",
+        "swap: fullscreen given back"]
+    # the resume every applied sync sends, with nothing up: nothing to say
+    sync_applied(app)
+    idle(app)
+    assert app.log.swaps() == []
+
+    # a refused swap says what it tried
+    mac.fail = {"activate_app"}
+    app._stream_swap(True, "auto mode: no film audio on the stream")
+    assert settled(app, 3), app.results
+    assert app.log.swaps() == [
+        "swap: pause (auto mode: no film audio on the stream)",
+        "swap: fullscreen left",
+        "swap: showing 'Safari' failed: Not authorized to send Apple events",
+        "swap: fullscreen given back"]
+
+    # the VLC app: the film window is not the one brought back
+    app, mac = make(apps=("Finder", "Safari", "VLC"))
+    switch(app, "external")
+    app.log.swaps()
+    app._stream_swap(True)
+    assert pump(app, lambda: app._swapped), mac.names()
+    app._stream_swap(False)
+    assert pump(app, lambda: not app._swapped), mac.names()
+    assert app.log.swaps() == [
+        "swap: pause",
+        "swap: stream app 'Safari' brought forward",
+        "swap: resume",
+        "swap: stream app 'Safari' hidden, VLC brought forward"]
+    print("swap: each pause and resume leaves a few lines in the log, and only they do")
+
+
 def main():
     test_fullscreen_goes_through_the_film_window()
     test_failed_swap_gives_fullscreen_back()
@@ -1378,6 +1460,7 @@ def main():
     test_nothing_runs_once_closed()
     test_app_menu_reaches_the_app()
     test_failed_attach_reports_off_the_tk_thread()
+    test_swap_leaves_a_trace_in_the_log()
     print("MAC SWAP TEST PASSED")
 
 

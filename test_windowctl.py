@@ -235,10 +235,14 @@ def main():
         assert exe == os.path.basename(sys.executable).lower(), exe
         assert windowctl.window_exe(0) == "", "a window that isn't there has a program"
         print(f"the spawned window's program read: {exe}")
+        # the swap's log names a window by its title: another process's
+        assert windowctl.window_title(hwnd) == TITLE, windowctl.window_title(hwnd)
+        assert windowctl.window_title(0) == "", "a window that isn't there has a title"
 
         windowctl.minimize(hwnd)
         time.sleep(0.4)
         assert windowctl.is_minimized(hwnd), "window did not minimize"
+        assert windowctl.window_title(hwnd) == TITLE, "a minimized window lost its title"
         windowctl.restore(hwnd)
         time.sleep(0.4)
         assert not windowctl.is_minimized(hwnd), "window did not restore"

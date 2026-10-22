@@ -25,20 +25,27 @@ back at its size from before the snap. What is tested:
   pause and after it, fullscreen or not;
 - a film brought back by hand during the pause is left where it is;
 - the browser is raised on the pause and minimized on the resume, as
-  before.
+  before;
+- every pause and resume leaves a few "swap: ..." lines in the log - what
+  asked for it, the browser window restored or minimized and its title,
+  the film window hidden, left alone or shown again and where, fullscreen
+  left and given back, the VLC app's window, a failure - and the resume
+  every sync sends with nothing up leaves none.
 """
 
 import sys
 import types
 
 import test_macswap as mac
-from test_macswap import Ctl, Dialogs, FakeTk, Player, Quiet, Var, Widget, Widgets
+from test_macswap import Ctl, Dialogs, FakeTk, Log, Player, Quiet, Var, Widget, Widgets
 
 DELL = (0, 0, 2560, 1440)              # the film's monitor
 SNAPPED = (1273, 0, 1294, 1400)        # Win+Right on it
 BEFORE_SNAP = (1797, 541, 974, 578)    # where the PC's film came back to
 MAXIMIZED = (-8, -8, 2576, 1400)
 BROWSER = 0xB0
+VLC = 0xC0                             # the VLC app's window
+TITLES = {BROWSER: "xQc - Twitch - Brave", VLC: "film.mkv - VLC media player"}
 
 
 class Win(mac.Window):
@@ -117,22 +124,24 @@ class Windowctl(types.ModuleType):
         self.windows = {}
         self.calls = []
         self.fs_rect = None
+        self.vlc = None              # the VLC app's window, once it has one
+        self.fail = None             # an exception restore() raises
 
     def win(self, hwnd):
         return self.windows[hwnd]
 
     # the film window
     def placement(self, hwnd):
+        # windowctl's shape: (the WINDOWPLACEMENT, the rectangle it is at)
         w = self.win(hwnd)
         self.calls.append(("placement", w.rect))
-        return {"zoomed": w.tkstate == "zoomed", "normal": w.normal,
-                "rect": w.rect}
+        return {"zoomed": w.tkstate == "zoomed", "normal": w.normal}, w.rect
 
     def put_placement(self, hwnd, saved):
-        w = self.win(hwnd)
-        self.calls.append(("put_placement", saved["rect"]))
-        w.normal, w.rect, w.snapped = saved["normal"], saved["rect"], False
-        w.tkstate = "zoomed" if saved["zoomed"] else "normal"
+        (wp, rect), w = saved, self.win(hwnd)
+        self.calls.append(("put_placement", rect))
+        w.normal, w.rect, w.snapped = wp["normal"], rect, False
+        w.tkstate = "zoomed" if wp["zoomed"] else "normal"
 
     def borderless_fullscreen(self, hwnd):
         w = self.win(hwnd)
@@ -152,6 +161,8 @@ class Windowctl(types.ModuleType):
         return BROWSER
 
     def restore(self, hwnd):
+        if self.fail is not None:
+            raise self.fail
         self.calls.append(("restore", hwnd))
 
     def minimize(self, hwnd):
@@ -164,7 +175,10 @@ class Windowctl(types.ModuleType):
         return []
 
     def find_by_pid(self, pid):
-        return None
+        return self.vlc
+
+    def window_title(self, hwnd):
+        return TITLES.get(hwnd, "")
 
     def foreground(self):
         return 0
@@ -216,11 +230,15 @@ def make():
     patch("audio_capture", Quiet(list_speakers=lambda: [], list_microphones=lambda: [],
                                  default_speaker_name=lambda: ""))
     patch("matcher", Quiet(probe=lambda p: (6750.0, 0.0)))
-    patch("diagnostics", Quiet(log_report=lambda *a, **kw: "the log"))
+    log = Log(log_report=lambda *a, **kw: "the log")
+    patch("diagnostics", log)
     app = shell.create_app(mac.Root(), platform=platform_win)
+    app.log = log
     app._choose_file()
     app.embedded.playing = True
     wc.calls.clear()
+    wc.vlc = wc.fail = None
+    log.lines.clear()
     return app, app.video_win
 
 
@@ -364,6 +382,83 @@ def test_film_brought_back_by_hand_is_left_there():
     print("a film shown again during the pause is left where it was put")
 
 
+def test_swap_leaves_a_trace_in_the_log():
+    # On the PC, the browser was minimized during a pause and the log said
+    # nothing of the swap. Each step is a line now, and a few of them a pause
+    app, film = make()
+    film.move(BEFORE_SNAP)
+    film.snap()
+    app._set_fullscreen(True)
+    pause(app)                          # Space
+    assert app.log.swaps() == [
+        "swap: pause (Space or a play button)",
+        "swap: fullscreen left",
+        f"swap: film window hidden, was up at {SNAPPED}",
+        "swap: stream window 0xb0 'xQc - Twitch - Brave' restored"]
+    app.q.put(("swap", False, "auto mode: the stream resumed"))
+    app._poll_queue()
+    assert not app._swapped
+    app.embedded.playing = True         # auto mode's seek played it
+    assert app.log.swaps() == [
+        "swap: resume (auto mode: the stream resumed)",
+        "swap: stream window 0xb0 'xQc - Twitch - Brave' minimized",
+        f"swap: film window shown again at {SNAPPED}",
+        "swap: fullscreen given back"]
+    # the resume every applied sync sends, with nothing up: nothing to say
+    app.q.put(("swap", False, "a sync moved the film"))
+    app._poll_queue()
+    assert app.log.swaps() == []
+
+    # maximized, then closed, then shown again by hand during the pause
+    app._set_fullscreen(False)
+    film.maximize()
+    pause(app)
+    assert f"swap: film window hidden, was maximized at {MAXIMIZED}" \
+        in app.log.swaps()
+    play(app)
+    app.log.swaps()
+    film.withdraw()                     # the close button
+    pause(app)
+    play(app)
+    assert app.log.swaps() == [
+        "swap: pause (Space or a play button)",
+        "swap: film window left as it is (closed)",
+        "swap: stream window 0xb0 'xQc - Twitch - Brave' restored",
+        "swap: resume (Space or a play button)",
+        "swap: stream window 0xb0 'xQc - Twitch - Brave' minimized",
+        "swap: film window left as it is (closed)"]
+    film.deiconify()
+    pause(app)
+    app._show_video_window()
+    play(app)
+    assert "swap: film window left as it is (up)" in app.log.swaps()
+
+    # the VLC app: its window is minimized and restored, not the film's
+    app, film = make()
+    app.ctl.external = types.SimpleNamespace(proc=types.SimpleNamespace(pid=4242))
+    app.ctl.player = app.ctl.external
+    wc.vlc = VLC
+    app._stream_swap(True)
+    app._stream_swap(False)
+    assert app.log.swaps() == [
+        "swap: pause",
+        "swap: VLC window 0xc0 'film.mkv - VLC media player' minimized",
+        "swap: stream window 0xb0 'xQc - Twitch - Brave' restored",
+        "swap: resume",
+        "swap: stream window 0xb0 'xQc - Twitch - Brave' minimized",
+        "swap: VLC window 0xc0 'film.mkv - VLC media player' restored"]
+
+    # a failure is logged too, with where it came from
+    app, film = make()
+    wc.fail = OSError("access denied")
+    app._toggle_pause()
+    lines = app.log.swaps()
+    assert lines[0] == "swap: pause (Space or a play button)", lines
+    assert lines[-1].startswith("swap failed:\n") and "access denied" in lines[-1], lines
+    assert "Window swap failed: access denied" in app.status_lbl.opts.get("text", "")
+    print("swap: each pause and resume leaves a few lines in the log, and only they do")
+
+
 def main():
     test_snapped_film_comes_back_snapped()
     test_maximized_film_comes_back_maximized()
@@ -372,6 +467,7 @@ def main():
     test_windowed_film_is_not_touched_on_the_way_out()
     test_closed_or_minimized_film_stays_so()
     test_film_brought_back_by_hand_is_left_there()
+    test_swap_leaves_a_trace_in_the_log()
     print("WINDOWS SWAP TEST PASSED")
 
 

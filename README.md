@@ -507,6 +507,10 @@ StreamSync keeps a log:
 - Windows: `%USERPROFILE%\.streamsync\streamsync.log`
 - macOS: `~/Library/Logs/StreamSync/streamsync.log`
 
+Each stream-pause swap leaves a few `swap:` lines there: pause or
+resume and what asked for it, which browser window (or app) was raised
+or hidden, and what happened to the film window and its fullscreen.
+
 A crash at startup is also written to `.streamsync-error.log` in your
 home folder. On the Mac (or from source) the app can describe its own
 environment:

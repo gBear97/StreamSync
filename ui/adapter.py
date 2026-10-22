@@ -185,11 +185,14 @@ class PlatformAdapter:
         self.stream_window ("" is Automatic)."""
         raise NotImplementedError("_on_stream_pick")
 
-    def _stream_swap(self, show):
+    def _stream_swap(self, show, why=""):
         """Bring the stream forward while the film is paused (show true),
         and the film back when it plays again. Synchronous on the Tk side;
         anything that can block for long (the Mac's osascript round trips)
-        runs on a worker thread and reports back through the queue."""
+        runs on a worker thread and reports back through the queue.
+
+        Each step it takes is a "swap: ..." line in the log, the first
+        naming `why` - what asked for it ("" when nothing said)."""
         raise NotImplementedError("_stream_swap")
 
     # --- seam 4: installing an update (worker thread) ---------------------

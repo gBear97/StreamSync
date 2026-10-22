@@ -213,15 +213,26 @@ def list_windows():
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def cb(hwnd, _lparam):
         if user32.IsWindowVisible(hwnd):
-            n = user32.GetWindowTextLengthW(hwnd)
-            if n > 0:
-                buf = ctypes.create_unicode_buffer(n + 1)
-                user32.GetWindowTextW(hwnd, buf, n + 1)
-                out.append((int(hwnd), buf.value))
+            title = window_title(hwnd)
+            if title:
+                out.append((int(hwnd), title))
         return True
 
     user32.EnumWindows(cb, 0)
     return out
+
+
+def window_title(hwnd):
+    """A window's title; "" for one with none, or one that has gone. Never
+    waits on the window's program: another process's title is read from
+    what Windows keeps for it."""
+    h = wintypes.HWND(hwnd)
+    n = user32.GetWindowTextLengthW(h)
+    if n <= 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(n + 1)
+    user32.GetWindowTextW(h, buf, n + 1)
+    return buf.value
 
 
 def is_valid(hwnd):
