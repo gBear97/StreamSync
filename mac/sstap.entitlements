@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- sstap reads its Core Audio tap the way an input device is read,
+         and under the hardened runtime that is audio input. The app's own
+         entitlements cover only the app's process, so the helper carries
+         this in its own signature (release.yml signs it with this file).
+         macOS still asks the user, in StreamSync's name, before it may
+         record the computer's audio. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>

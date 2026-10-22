@@ -45,7 +45,11 @@ python3 -c "import tkinter; print(tkinter.TkVersion)"
 git clone https://github.com/gBear97/StreamSync.git
 cd StreamSync
 python3 -m pip install -r requirements.txt
+sh mac/build_sstap.sh
 ```
+
+The last line builds `sstap`, the small helper that records this Mac's
+sound (it needs Xcode's command-line tools: `xcode-select --install`).
 
 ### 2. Prove the engine (no UI, no VLC, no permissions involved)
 
@@ -65,34 +69,38 @@ python3 streamsync.py
 The first-run check appears if anything is missing:
 
 - **VLC**: one click (Homebrew) or the videolan.org button.
-- **BlackHole**: one click - downloads the signed ~100 KB installer,
-  verifies its checksum, then macOS asks for your password.
 
 **Start StreamSync** unlocks once VLC is found (and, from source, the
-Python packages are installed). BlackHole does not hold it back, and a
-missing BlackHole alone does not open the check: without it StreamSync
-hears the Mac's microphone instead of the stream. If the check did not
-open, install BlackHole yourself: `brew install blackhole-2ch`, or the
-BlackHole 2ch installer from
-[existential.audio/blackhole](https://existential.audio/blackhole/).
+Python packages are installed). The check also says whether StreamSync
+can hear this Mac's sound - that never holds it back.
 
-## 4. Audio routing (one time)
+## 4. Let StreamSync hear this Mac (one time)
 
-Click **Open Audio MIDI Setup** in the first-run check (or open it from
-Applications > Utilities if the check had nothing to ask), then: **+**
-(bottom-left) > **Create Multi-Output Device** > tick your
-speakers/headphones **and** BlackHole 2ch. Right-click the new device >
-**Use This Device For Sound Output**. StreamSync listens to BlackHole
-automatically: the first-run screen's "Listening to" line names it, and
-**Settings > Listen to** lets you pick another. If that line names a
-microphone instead, BlackHole is not installed - go back to step 3.
+Nothing to install or route: StreamSync records what the Mac plays
+through macOS's own audio tap, every app except itself. On the first
+sync macOS asks whether StreamSync may record this computer's audio -
+answer **Allow**. To check it later, or to change a "Don't Allow", look
+under **System Settings > Privacy & Security > Screen & System Audio
+Recording > System Audio Recording Only**. Running from source (B), the
+prompt names your terminal instead of StreamSync.
 
-macOS will ask for **Microphone** permission on the first sync - allow it.
+**Settings > Listen to** shows *This Mac's sound* as the automatic
+choice. BlackHole or a microphone can be picked there instead; a
+microphone is for following a stream that plays on another device, and
+hears it a moment late.
+
+On macOS 14.0 or 14.1, which have no audio taps, install BlackHole
+(`brew install blackhole-2ch`, or from
+[existential.audio/blackhole](https://existential.audio/blackhole/)),
+then in Audio MIDI Setup: **+** > **Create Multi-Output Device** > tick
+your speakers **and** BlackHole 2ch > right-click it > **Use This Device
+For Sound Output**. StreamSync picks BlackHole by itself, and macOS asks
+for **Microphone** permission on the first sync.
 
 ## 5. First sync test (no stream needed)
 
-Play any film in any player (QuickTime is fine) with audio going through
-the Multi-Output Device. In StreamSync open the *same* film file
+Play any film in any player (QuickTime is fine), with its sound on. In
+StreamSync open the *same* film file
 (**Open film...**), optionally type a rough position under **Settings >
 Start searching near**, and hit **Sync to stream**. The state line
 under the buttons should read **Synced** (the match's score is in the

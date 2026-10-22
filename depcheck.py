@@ -4,8 +4,7 @@ Checks - before the app itself loads - that VLC, the bundled ffmpeg and
 the required Python packages are present, and offers one-click fixes:
 pip for Python packages, winget (Windows' built-in, signature-verified
 package manager) for VLC. Stdlib-only on purpose: it must run even when
-none of the app's packages are installed yet. (netcerts is part of
-StreamSync and is stdlib-only for the same reason.)
+none of the app's packages are installed yet.
 """
 
 import importlib.util
@@ -15,8 +14,6 @@ import shutil
 import subprocess
 import sys
 import threading
-
-import netcerts
 
 # (import name, pip name)
 REQUIRED_PKGS = [
@@ -34,10 +31,7 @@ VLC_MAC_DYLIBS = [
     "/Applications/VLC.app/Contents/MacOS/lib/libvlc.dylib",
     os.path.expanduser("~/Applications/VLC.app/Contents/MacOS/lib/libvlc.dylib"),
 ]
-BLACKHOLE_DRIVERS = [
-    "/Library/Audio/Plug-Ins/HAL/BlackHole2ch.driver",
-    "/Library/Audio/Plug-Ins/HAL/BlackHole16ch.driver",
-]
+TAP_MACOS = (14, 2)  # Core Audio taps - "This Mac's sound" (audio_capture.py)
 # An .app launched from Finder inherits a minimal PATH (no ~/.zprofile), so
 # Homebrew's bin is missing from it - look in its two standard locations.
 BREW_PATHS = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
@@ -109,11 +103,28 @@ def vlc_dll_path():
     return None
 
 
-def blackhole_present():
-    """macOS only: is the BlackHole loopback driver installed? (None on Windows)"""
+def system_audio():
+    """macOS only: can StreamSync hear this Mac's sound by itself? "ok";
+    "build" from a source checkout whose sstap helper is not built yet;
+    "old" before macOS 14.2, which has no audio taps. None off macOS.
+
+    The same rules as audio_capture's, repeated here because this file
+    stays stdlib-only and audio_capture needs numpy.
+    """
     if not IS_MAC:
         return None
-    return any(os.path.isdir(p) for p in BLACKHOLE_DRIVERS)
+    import platform
+    try:
+        version = tuple(int(p) for p in platform.mac_ver()[0].split(".")[:2])
+    except ValueError:
+        version = (0, 0)
+    if version < TAP_MACOS:
+        return "old"
+    if not frozen():
+        here = os.path.dirname(os.path.abspath(__file__))
+        if not os.access(os.path.join(here, "mac", "build", "sstap"), os.X_OK):
+            return "build"
+    return "ok"
 
 
 def ffmpeg_ok():
@@ -151,7 +162,7 @@ def collect():
                        and os.path.isfile(VLC32_DLL)),
         "ffmpeg": None if pkgs else ffmpeg_ok(),
         "pkgmgr": pkgmgr_path(),
-        "blackhole": blackhole_present(),
+        "sysaudio": system_audio(),
     }
 
 
@@ -222,7 +233,7 @@ class _Dialog:
                   ).grid(row=0, column=0, columnspan=2, sticky="w")
 
         self.row_lbls = {}
-        for i, key in enumerate(("packages", "vlc", "ffmpeg", "blackhole"),
+        for i, key in enumerate(("packages", "vlc", "ffmpeg", "sysaudio"),
                                 start=1):
             lbl = ttk.Label(frm, text="")
             lbl.grid(row=i, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -236,15 +247,6 @@ class _Dialog:
         self.vlc_btn = ttk.Button(btns, text="Install VLC automatically",
                                   command=self._fix_vlc)
         self.vlc_btn.pack(side="left", padx=(8, 0))
-        if IS_MAC:
-            self.bh_btn = ttk.Button(btns, text="Install BlackHole",
-                                     command=self._fix_blackhole)
-            self.bh_btn.pack(side="left", padx=(8, 0))
-            ttk.Button(btns, text="Open Audio MIDI Setup",
-                       command=self._open_audio_midi_setup).pack(
-                side="left", padx=(8, 0))
-        else:
-            self.bh_btn = None
         ttk.Button(btns, text="Open videolan.org",
                    command=self._open_vlc_site).pack(side="left", padx=(8, 0))
 
@@ -290,16 +292,16 @@ class _Dialog:
             self.row_lbls["vlc"].config(
                 text="[MISSING] VLC media player - get it at videolan.org/vlc")
 
-        if c["blackhole"] is True:
-            self.row_lbls["blackhole"].config(
-                text="[OK] BlackHole audio driver: installed (route sound "
-                     "through a Multi-Output Device)")
-        elif c["blackhole"] is False:
-            self.row_lbls["blackhole"].config(
-                text="[NEEDED FOR AUDIO SYNC] BlackHole virtual audio driver "
-                     "not found")
-        else:
-            self.row_lbls["blackhole"].config(text="")
+        sysaudio = {
+            "ok": "[OK] This Mac's sound: StreamSync hears it directly - "
+                  "macOS asks once for permission",
+            "build": "[BUILD ONCE] This Mac's sound: run sh mac/build_sstap.sh "
+                     "(needs Xcode's command-line tools)",
+            "old": "[NEEDS macOS 14.2] to hear this Mac's sound - before it, "
+                   "use BlackHole (existential.audio/blackhole), picked under "
+                   "Settings > Listen to",
+        }
+        self.row_lbls["sysaudio"].config(text=sysaudio.get(c["sysaudio"], ""))
 
         if c["ffmpeg"] is True:
             self.row_lbls["ffmpeg"].config(text="[OK] ffmpeg (bundled): working")
@@ -319,9 +321,6 @@ class _Dialog:
             self.vlc_btn.state(["!disabled"])
             self.vlc_btn.config(text="Install VLC automatically"
                                 if c["pkgmgr"] else "Download VLC...")
-        if self.bh_btn is not None:
-            self.bh_btn.state(["!disabled"] if c["blackhole"] is False
-                              else ["disabled"])
         self.cont_btn.state(["!disabled"] if all_ok(c) else ["disabled"])
         if all_ok(c):
             self.status.config(
@@ -358,94 +357,6 @@ class _Dialog:
                        "--accept-source-agreements",
                        "--accept-package-agreements"],
                       "VLC installed successfully.")
-
-    def _fix_blackhole(self):
-        """One-click BlackHole install, no Homebrew needed.
-
-        Downloads the developer's signed+notarized pkg from their official
-        URL, but only after the file's sha256 matches the checksum that
-        Homebrew publishes independently - two separate parties must agree
-        on the bytes before macOS's own installer (which additionally
-        verifies the signature and notarization) is asked to run it.
-        """
-        self.pip_btn.state(["disabled"])
-        self.vlc_btn.state(["disabled"])
-        if self.bh_btn is not None:
-            self.bh_btn.state(["disabled"])
-        self.status.config(text="Working...")
-
-        def work():
-            import hashlib
-            import json
-            import tempfile
-            import urllib.request
-
-            def get(url):
-                # netcerts, not plain urlopen: a frozen build carries no CA
-                # roots of its own, so verification would fail on every URL.
-                req = urllib.request.Request(
-                    url, headers={"User-Agent": "StreamSync-setup"})
-                with netcerts.urlopen(req, timeout=30) as r:
-                    return r.read()
-
-            try:
-                self.q.put(("line", "Fetching current BlackHole version info "
-                                    "(from Homebrew's public metadata)..."))
-                meta = json.loads(get(
-                    "https://formulae.brew.sh/api/cask/blackhole-2ch.json"))
-                ver, url, sha = meta["version"], meta["url"], meta["sha256"]
-                self.q.put(("line", f"BlackHole 2ch v{ver}: {url}"))
-
-                self.q.put(("line", "Downloading installer..."))
-                data = get(url)
-                digest = hashlib.sha256(data).hexdigest()
-                if digest != sha:
-                    self.q.put(("done", 1,
-                                "Checksum mismatch - refusing to install. "
-                                "Use the videolan-style manual route: "
-                                "https://existential.audio/blackhole/"))
-                    return
-                self.q.put(("line", f"Downloaded {len(data) // 1024} KB, "
-                                    "sha256 verified against Homebrew's "
-                                    "published checksum."))
-
-                pkg = os.path.join(tempfile.mkdtemp(), f"BlackHole2ch-{ver}.pkg")
-                with open(pkg, "wb") as f:
-                    f.write(data)
-
-                self.q.put(("line", "Running the macOS installer - enter your "
-                                    "password in the system prompt. (macOS "
-                                    "also verifies the developer's signature "
-                                    "and notarization here.)"))
-                r = subprocess.run(
-                    ["osascript", "-e",
-                     f'do shell script "installer -pkg \'{pkg}\' -target /" '
-                     "with administrator privileges"],
-                    capture_output=True, text=True, timeout=300)
-                if r.returncode != 0:
-                    err = (r.stderr or "").strip()
-                    if "-128" in err:
-                        self.q.put(("done", 1, "Install cancelled."))
-                    else:
-                        self.q.put(("done", 1, f"Installer failed: {err}"))
-                    return
-                self.q.put(("done", 0,
-                            "BlackHole installed. Last step (one time): in "
-                            "Audio MIDI Setup, click '+' > Create "
-                            "Multi-Output Device, tick your speakers AND "
-                            "BlackHole 2ch, then set it as the sound output."))
-            except Exception as e:
-                self.q.put(("done", 1, f"Download failed ({e}) - get it from "
-                                       "https://existential.audio/blackhole/ "
-                                       "instead."))
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def _open_audio_midi_setup(self):
-        try:
-            subprocess.run(["open", "-a", "Audio MIDI Setup"], timeout=10)
-        except Exception:
-            pass
 
     def _open_vlc_site(self):
         import webbrowser

@@ -146,7 +146,267 @@ def main():
     except RuntimeError as e:
         assert "unplugged" in str(e), e
         print(f"broken device: {e}")
+
+    # 4b. a source slow to start (macOS checking a new helper, a permission
+    # prompt) is waited for, and its startup does not eat the recording's
+    # time; an explicit timeout still means what it says
+    class SlowStart(FakeDevice):
+        def __enter__(self):
+            time.sleep(6.5)               # past the default 0.3 + 5 s
+            return super().__enter__()
+    mon = monitor_for(SlowStart(jitter=0.005))
+    try:
+        began = time.monotonic()
+        data, _, _ = mon.capture(0.3)
+        assert data.size == int(0.3 * SR)
+        print(f"slow start: waited {time.monotonic() - began:.1f} s for the source")
+    finally:
+        mon.stop()
+    mon = monitor_for(SlowStart(jitter=0.005))
+    try:
+        began = time.monotonic()
+        mon.capture(0.3, timeout=2.0)
+        raise AssertionError("an explicit timeout was not kept")
+    except RuntimeError as e:
+        assert "in time" in str(e) and time.monotonic() - began < 4.0, e
+    finally:
+        mon.stop()
+
+    system_audio_tests()
+    source_choice_tests()
     print("AUDIO CAPTURE TEST PASSED")
+
+
+# --- This Mac's sound: SystemAudioRecorder over a fake sstap ---------------
+
+# Speaks sstap's protocol (mac/sstap.swift) on stdout, with capture times
+# from a clock it states in its hello ("test_t0": when sample 0 was
+# captured), so the test knows exactly when every sample "happened". It
+# stops when its stdin closes, as sstap does.
+FAKE_SSTAP = r'''
+import json, os, struct, sys, threading, time
+import numpy as np
+
+opt = dict(a.split("=", 1) for a in sys.argv[1:])
+rate = float(opt.get("rate", 48000))
+lat = int(opt.get("lat", 0))
+mode = opt.get("mode", "ok")
+out = sys.stdout.buffer
+
+def say(obj):
+    data = json.dumps(obj).encode()
+    out.write(b"SSJ1" + struct.pack("<I", len(data)) + data)
+    out.flush()
+
+def stdin_closed():
+    sys.stdin.buffer.read()
+    os._exit(0)
+threading.Thread(target=stdin_closed, daemon=True).start()
+
+if mode == "error":
+    say({"type": "error", "code": "tap-failed",
+         "message": "macOS would not let StreamSync tap this Mac's sound"})
+    sys.exit(2)
+t0 = time.perf_counter() + 0.05
+say({"type": "hello", "version": 1, "test_t0": t0,
+     "tap": {"rate": rate, "aggregate_rate": rate, "channels": 2},
+     "output": {"latency": {"device": lat // 2, "safety": 0,
+                            "stream": lat - lat // 2, "buffer": 512,
+                            "rate": rate}}})
+if "playing" in opt:
+    say({"type": "status", "playing": opt["playing"] == "1"})
+n, block = 0, 512
+while True:
+    host = t0 + n / rate
+    wait = host + block / rate - time.perf_counter()
+    if wait > 0:
+        time.sleep(wait)
+    if mode == "silent":
+        x = np.zeros(block, "<f4")
+    else:
+        x = (0.5 * np.sin(2 * np.pi * 440 * np.arange(n, n + block) / rate)).astype("<f4")
+    out.write(b"SSA1" + struct.pack("<IdddII", 0, host, float(n),
+                                    time.perf_counter(), block, 3) + x.tobytes())
+    # a --compare source's blocks are not the stream's
+    out.write(b"SSA1" + struct.pack("<IdddII", 1, host, float(n),
+                                    time.perf_counter(), 4, 3) + b"\x00" * 16)
+    out.flush()
+    n += block
+    if mode == "change" and n >= rate * 0.3:
+        say({"type": "event", "event": "output-changed"})
+        sys.exit(3)
+    if mode == "garbage" and n >= rate * 0.3:
+        out.write(b"JUNK")
+        out.flush()
+        time.sleep(5)
+'''
+
+
+def system_audio_tests():
+    import os
+    import sys
+    import tempfile
+
+    import audio_capture as ac
+
+    fake = os.path.join(tempfile.mkdtemp(), "fake_sstap.py")
+    with open(fake, "w") as f:
+        f.write(FAKE_SSTAP)
+
+    def monitor(sr=48000, **opt):
+        cmd = [sys.executable, fake] + [f"{k}={v}" for k, v in opt.items()]
+        src = ac.SystemAudioSource(cmd=cmd)
+        mon = AudioMonitor("loopback", sr=sr, keep=30,
+                           source=lambda: (src.recorder(sr), src.hint))
+        return mon, src
+
+    # 5. dated by sstap's capture times plus the output's own delay -
+    # exactly, not by when the blocks happened to arrive
+    mon, src = monitor(lat=480)                 # 10 ms at 48 kHz
+    try:
+        data, sr, t0, lo = mon.capture_span(0.5, start=mon.mark())
+        hello_t0 = src.rec.hello["test_t0"]
+        want = hello_t0 + lo / 48000 + 0.010
+        assert abs(t0 - want) < 2e-6, (t0, want)
+        k = np.arange(lo, lo + data.size)
+        assert np.allclose(data, 0.5 * np.sin(2 * np.pi * 440 * k / 48000),
+                           atol=1e-5), "samples were not the stream's"
+        print(f"system audio: stamped to {abs(t0 - want) * 1e6:.2f} us of "
+              "capture time + output delay")
+    finally:
+        mon.stop()
+    assert src.rec.proc.poll() is not None, "sstap left running after stop()"
+
+    # 6. another output rate is resampled onto the monitor's grid, with
+    # the same timing
+    mon, src = monitor(sr=48000, rate=44100, lat=441)   # 10 ms at 44.1 kHz
+    try:
+        data, sr, t0, lo = mon.capture_span(0.5, start=mon.mark())
+        first = src.rec.hello["test_t0"] + 0.010
+        want = first + lo / 48000
+        assert sr == 48000 and data.size == 24000
+        assert abs(t0 - want) < 2e-6, (t0, want)
+        t = want - 0.010 - src.rec.hello["test_t0"] + np.arange(data.size) / 48000
+        assert np.allclose(data, 0.5 * np.sin(2 * np.pi * 440 * t), atol=3e-3)
+        print("system audio: 44.1 kHz output resampled to 48 kHz on time")
+    finally:
+        mon.stop()
+
+    # 7. silence says why: macOS withholding it, or nothing playing here
+    for playing, needle in (("1", "System Audio Recording"),
+                            ("0", "Nothing is playing on this Mac")):
+        mon, src = monitor(mode="silent", playing=playing)
+        try:
+            mon.capture(0.3, start=mon.mark())
+            raise AssertionError("silence was accepted")
+        except RuntimeError as e:
+            assert needle in str(e), e
+        finally:
+            mon.stop()
+    print("system audio: silence explained (refused permission / nothing playing)")
+
+    # 8. sstap's own error reaches the user
+    mon, _ = monitor(mode="error")
+    try:
+        mon.capture(0.2, timeout=5.0)
+        raise AssertionError("an sstap error was not reported")
+    except RuntimeError as e:
+        assert "would not let StreamSync" in str(e), e
+    finally:
+        mon.stop()
+
+    # 9. a new sound output ends a recording in progress, and the next
+    # sync starts fresh (the monitor restarts sstap)
+    mon, src = monitor(mode="change")
+    try:
+        try:                          # the fake switches outputs at 0.3 s
+            mon.capture(1.0, start=mon.mark(), timeout=5.0)
+            raise AssertionError("a changed output went unnoticed")
+        except RuntimeError as e:
+            assert "sound output changed" in str(e), e
+        data, _, _ = mon.capture(0.1, start=mon.mark(), timeout=5.0)
+        assert data.size == 4800
+    finally:
+        mon.stop()
+
+    # 10. a garbled stream is an error, not a hang
+    mon, _ = monitor(mode="garbage")
+    try:
+        mon.capture(1.0, start=mon.mark(), timeout=5.0)
+        raise AssertionError("garbage from sstap was accepted")
+    except RuntimeError as e:
+        assert "unexpected" in str(e), e
+    finally:
+        mon.stop()
+    print("system audio: errors, output change and garbage handled")
+
+
+def source_choice_tests():
+    """What Listen to offers, and what each choice opens, on a Mac with
+    and without taps - over a fake soundcard, so it runs anywhere."""
+    import sys
+    import types
+
+    import audio_capture as ac
+
+    class Mic:
+        def __init__(self, name):
+            self.name = name
+
+    mics = [Mic("MacBook Pro Microphone"), Mic("BlackHole 2ch")]
+    fake_sc = types.SimpleNamespace(all_microphones=lambda: list(mics),
+                                    default_microphone=lambda: mics[0])
+    saved = (sys.modules.get("soundcard"), ac.IS_MAC, ac.macos_version,
+             ac.helper_path)
+    sys.modules["soundcard"] = fake_sc
+    ac.IS_MAC = True
+    try:
+        # macOS 14.2+: this Mac's sound first, and the default
+        ac.macos_version = lambda: (15, 0)
+        ac.helper_path = lambda: "/Applications/StreamSync.app/Contents/MacOS/sstap"
+        names = ac.list_speakers()
+        assert names[0] == ac.SYSTEM_AUDIO and names[1] == "BlackHole 2ch", names
+        assert ac.default_speaker_name() == ac.SYSTEM_AUDIO
+        src, hint = ac._open_source("loopback", "")
+        assert isinstance(src, ac.SystemAudioSource) and callable(hint)
+        src, _ = ac._open_source("loopback", "blackhole")
+        assert src.name == "BlackHole 2ch"
+        # a named device that is gone is said so - never a quiet mic
+        mics.remove(mics[1])
+        try:
+            ac._open_source("loopback", "BlackHole 2ch")
+            raise AssertionError("a missing device fell back silently")
+        except RuntimeError as e:
+            assert "not connected" in str(e), e
+        # a source run without the helper built says how to build it
+        ac.helper_path = lambda: None
+        try:
+            ac._open_source("loopback", "")
+            raise AssertionError("a missing helper went unexplained")
+        except RuntimeError as e:
+            assert "build_sstap.sh" in str(e), e
+
+        # before 14.2: BlackHole if it is there, else the reason - not a mic
+        ac.macos_version = lambda: (14, 1)
+        assert ac.SYSTEM_AUDIO not in ac.list_speakers()
+        assert ac.default_speaker_name() == ac.SYSTEM_AUDIO
+        try:
+            ac._open_source("loopback", "")
+            raise AssertionError("an old macOS fell back to the mic")
+        except RuntimeError as e:
+            assert "14.2" in str(e) and "BlackHole" in str(e), e
+        mics.append(Mic("BlackHole 2ch"))
+        assert ac.default_speaker_name() == "BlackHole 2ch"
+        src, _ = ac._open_source("loopback", "")
+        assert src.name == "BlackHole 2ch"
+    finally:
+        if saved[0] is not None:
+            sys.modules["soundcard"] = saved[0]
+        else:
+            sys.modules.pop("soundcard", None)
+        ac.IS_MAC, ac.macos_version, ac.helper_path = saved[1:]
+    print("listen-to choices: tap first on 14.2+, BlackHole before it, "
+          "never a silent mic")
 
 
 if __name__ == "__main__":

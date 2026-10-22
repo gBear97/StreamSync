@@ -26,7 +26,11 @@
     <key>com.apple.security.cs.allow-dyld-environment-variables</key>
     <true/>
 
-    <!-- Audio sync records from the loopback device (BlackHole). -->
+    <!-- Audio sync records from an input device when one is picked under
+         Listen to (BlackHole, a microphone), and the watch-party host's
+         microphone. This Mac's sound is recorded by the sstap helper,
+         which carries the same entitlement in its own signature
+         (mac/sstap.entitlements). -->
     <key>com.apple.security.device.audio-input</key>
     <true/>
 

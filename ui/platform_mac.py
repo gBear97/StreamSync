@@ -85,9 +85,9 @@ class Adapter(adapter.PlatformAdapter):
     STREAM_LABEL = "Stream app"
     STREAM_AUTO_LABEL = "Automatic (first browser found)"
     REFRESH_STREAMS_ON_SETTINGS = False
-    LISTEN_HELP = ("The input that carries the stream's sound - BlackHole, with a "
-                   "Multi-Output Device as the system output. StreamSync hears it there, even "
-                   "with the browser minimized.")
+    LISTEN_HELP = ("This Mac's sound: everything the Mac plays except StreamSync itself, "
+                   "with nothing to install (macOS asks once). BlackHole or a microphone work "
+                   "too.")
     DEFAULT_DEVICE_NOTE = "automatic"
     UPDATE_UNAVAILABLE = ("This copy is running from source, so it can't replace itself - "
                           "git pull instead.")

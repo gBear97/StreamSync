@@ -9,8 +9,9 @@ trust anchors at all and every HTTPS call failed with
     [SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer certificate
 
 which is why the updater could never reach GitHub, and why the one-click
-BlackHole install would have failed the same way. So did a watch party
-whose relay address was wss://, until session.py took its roots from here.
+BlackHole install (since replaced by audio taps) would have failed the
+same way. So did a watch party whose relay address was wss://, until
+session.py took its roots from here.
 
 Roots are taken from the first of these that yields any:
 
