@@ -7,4 +7,4 @@ Windows installer's version, and the names of the files CI publishes.
 A release's tag must match it (v + this), or the Release workflow stops.
 """
 
-__version__ = "2.0.4"
+__version__ = "2.0.5"
