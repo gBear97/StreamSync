@@ -167,7 +167,10 @@ class Shell(adapter.PlatformAdapter):
             return
         self._film_loaded(path)
         if self.player is self.embedded:
-            self._set_status(f"Loaded {Path(path).name}. Playback starts on first sync.")
+            # Space plays it too, sync or not: the line used to say that
+            # playback waited for the first sync
+            self._set_status(f"Loaded {Path(path).name}. Sync to stream starts it where "
+                             "the stream is; Space plays it from here.")
         else:
             self._set_status("Opening in external VLC...")
         self._save_config()
