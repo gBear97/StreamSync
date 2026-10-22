@@ -43,6 +43,9 @@ SILENCE = 1e-4      # peak below this is "nothing is playing"
 BLOCK_S = 0.02      # device read size
 STAMP_SPAN = 2.0    # seconds of later blocks used to date a sample
 GAP_TOLERANCE = 0.25  # a real stall is far longer than scheduling jitter
+OPEN_TIMEOUT = 60.0   # a source may take this long to start delivering: macOS
+                      # checking a new helper, or its permission prompt
+                      # waiting on the user, the first time it records
 
 SYSTEM_AUDIO = "This Mac's sound"   # the tap, as Settings > Listen to names it
 TAP_MACOS = (14, 2)                 # Core Audio process taps arrived in 14.2
@@ -402,6 +405,7 @@ class AudioMonitor:
         self._error = None
         self._hint = None
         self._rec = None
+        self._live_at = None     # monotonic time the first block arrived
         self._last_use = time.monotonic()
 
     # ------------------------------------------------------- lifecycle
@@ -416,6 +420,7 @@ class AudioMonitor:
             self._stop = False
             self._error = None
             self._blocks.clear()
+            self._live_at = None
             self._first = self._total   # frames keep counting, so a mark()
             self._last_use = time.monotonic()  # from before stays valid
             self._thread = threading.Thread(target=self._run, daemon=True)
@@ -465,6 +470,8 @@ class AudioMonitor:
                     if data.size == 0:
                         continue
                     with self._cond:
+                        if self._live_at is None:
+                            self._live_at = time.monotonic()
                         self._total += data.size
                         self._blocks.append((self._total, t, data))
                         limit = self._total - int(self.keep * self.sr)
@@ -559,12 +566,19 @@ class AudioMonitor:
         allowed: on a loopback it means the stream is not playing, while
         on a microphone it is just a pause between sentences. The start
         frame lets a caller extend the same recording later.
+
+        The default timeout, seconds + 5, counts from when the source is
+        delivering: a source still starting gets up to OPEN_TIMEOUT first,
+        so a first sync is not lost to macOS checking the helper or to the
+        user reading a permission prompt. An explicit timeout is the whole
+        wait.
         """
         need = int(round(seconds * self.sr))
         if not self.running():
             self.start()
+        strict = timeout is not None
         timeout = seconds + 5.0 if timeout is None else timeout
-        deadline = time.monotonic() + timeout
+        called = time.monotonic()
         with self._cond:
             self._last_use = time.monotonic()
             while True:
@@ -576,6 +590,12 @@ class AudioMonitor:
                     lo = max(start, self._first)
                 if self._total - lo >= need:
                     break
+                if strict or (self._live_at is not None and self._live_at <= called):
+                    deadline = called + timeout
+                elif self._live_at is not None:     # it started during this wait
+                    deadline = self._live_at + timeout
+                else:                               # still starting
+                    deadline = called + max(timeout, OPEN_TIMEOUT)
                 left = deadline - time.monotonic()
                 if left <= 0:
                     raise RuntimeError(

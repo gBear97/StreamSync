@@ -147,6 +147,31 @@ def main():
         assert "unplugged" in str(e), e
         print(f"broken device: {e}")
 
+    # 4b. a source slow to start (macOS checking a new helper, a permission
+    # prompt) is waited for, and its startup does not eat the recording's
+    # time; an explicit timeout still means what it says
+    class SlowStart(FakeDevice):
+        def __enter__(self):
+            time.sleep(6.5)               # past the default 0.3 + 5 s
+            return super().__enter__()
+    mon = monitor_for(SlowStart(jitter=0.005))
+    try:
+        began = time.monotonic()
+        data, _, _ = mon.capture(0.3)
+        assert data.size == int(0.3 * SR)
+        print(f"slow start: waited {time.monotonic() - began:.1f} s for the source")
+    finally:
+        mon.stop()
+    mon = monitor_for(SlowStart(jitter=0.005))
+    try:
+        began = time.monotonic()
+        mon.capture(0.3, timeout=2.0)
+        raise AssertionError("an explicit timeout was not kept")
+    except RuntimeError as e:
+        assert "in time" in str(e) and time.monotonic() - began < 4.0, e
+    finally:
+        mon.stop()
+
     system_audio_tests()
     source_choice_tests()
     print("AUDIO CAPTURE TEST PASSED")
