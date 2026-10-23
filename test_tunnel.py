@@ -14,6 +14,7 @@ import os
 import queue
 import shutil
 import socket
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -261,6 +262,67 @@ def signatures():
     print(f"signature: {other}, signed by its own maker, is refused")
 
 
+def signature_check():
+    """Windows' check runs without PSModulePath, and a check that could not
+    run says so instead of blaming the file. A StreamSync started from
+    PowerShell 7 handed pwsh's module path on to Windows PowerShell, which
+    then could not load Get-AuthenticodeSignature: the 2026-10-23 CI build
+    threw away a cloudflared Cloudflare had signed."""
+    env = hosting._signature_env(r"C:\x\cloudflared.exe",
+                                 {"PSModulePath": r"C:\pwsh\Modules", "PSMODULEPATH": "a",
+                                  "psmodulepath": "b", "Path": r"C:\Windows"})
+    assert env == {"Path": r"C:\Windows", "SS_SIGNED": r"C:\x\cloudflared.exe"}, env
+    said = hosting._first_error(
+        '#< CLIXML\n<Objs Version="1.1.0.1"></Objs>\n'
+        "Get-AuthenticodeSignature : The 'Get-AuthenticodeSignature' command was found in the "
+        "module\n'Microsoft.PowerShell.Security', but the module could not be loaded.\n"
+        "At line:1 char:6\n+ $s = Get-AuthenticodeSignature -LiteralPath $env:SS_SIGNED")
+    assert said == ("Get-AuthenticodeSignature : The 'Get-AuthenticodeSignature' command was "
+                    "found in the module 'Microsoft.PowerShell.Security', but the module could "
+                    "not be loaded."), said
+    real = hosting._authenticode
+    cases = [(("", "", "the module could not be loaded"), "could not check"),
+             (("Valid", 'CN="Cloudflare, Inc.", O="Cloudflare, Inc."', ""), None),
+             (("Valid", "CN=Microsoft Windows, O=Microsoft Corporation", ""),
+              "not signed by Cloudflare"),
+             (("HashMismatch", 'CN="Cloudflare, Inc."', ""), "not signed by Cloudflare")]
+    try:
+        for answer, refusal in cases:
+            hosting._authenticode = lambda path, a=answer: a
+            try:
+                hosting.verify_signature(r"C:\x\cloudflared.exe", plat="win32")
+                assert refusal is None, f"{answer} passed"
+            except hosting.DownloadError as e:
+                assert refusal and refusal in str(e), (answer, e)
+                assert e.detail == answer[2], (answer, e.detail)
+    finally:
+        hosting._authenticode = real
+    if sys.platform != "win32":
+        print("signature check: no PSModulePath, and 'could not check' is a reason of its own")
+        return
+    # the real thing: Windows PowerShell handed PowerShell 7's module path
+    pwsh = shutil.which("pwsh")
+    if not pwsh:
+        print("signature check: no pwsh here to borrow a module path from")
+        return
+    p7 = subprocess.run([pwsh, "-NoProfile", "-Command", "$env:PSModulePath"],
+                        capture_output=True, text=True, timeout=120).stdout.strip()
+    notepad = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32",
+                           "notepad.exe")
+    old = os.environ.get("PSModulePath")
+    os.environ["PSModulePath"] = p7
+    try:
+        status, signer, error = hosting._authenticode(notepad)
+    finally:
+        if old is None:
+            os.environ.pop("PSModulePath", None)
+        else:
+            os.environ["PSModulePath"] = old
+    assert status == "Valid" and signer.startswith("CN=Microsoft"), (status, signer, error, p7)
+    print("signature check: Windows PowerShell reads a signature with pwsh's module path "
+          "inherited")
+
+
 def name_waits():
     answers = iter([{"Status": 3}, {"Status": 0, "Answer": [{"data": "104.16.0.1"}]}])
 
@@ -483,6 +545,7 @@ def main():
         finding()
         downloading()
         signatures()
+        signature_check()
         name_waits()
         local_relay()
         tunnels()
