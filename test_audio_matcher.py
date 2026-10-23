@@ -18,7 +18,9 @@ find_match_audio recovers the timestamp. Also covers:
   the overlap to fit;
 - the same ladder over a film nearly 3 h and one 4 h long (decoding
   stubbed), whose retries once decoded the whole film again because the
-  decode cache was a chunk short.
+  decode cache was a chunk short;
+- a DTS track, decoded from its core alone, and a DTS stream with no
+  core, which has to fall back to a full decode.
 
 bench_audio.py measures real-world accuracy; this only guards regressions.
 """
@@ -124,6 +126,7 @@ def main():
         assert err < 0.12, f"{name}: start time mishandled, err {err:.3f}s"
 
     quiet_scene(tmp)
+    dts_core(tmp, clip, feats)
     chunk_boundary(clip)
     long_film_retries()
     print("AUDIO MATCHER TEST PASSED")
@@ -166,6 +169,54 @@ def quiet_scene(tmp):
         assert abs(t - truth) < 0.12, f"quiet scene: wrong match {t:.3f}s"
         assert score >= audio_matcher.SCORE_OK and z >= audio_matcher.Z_OK, \
             f"quiet scene: correct match not trusted (score {score:.3f}, z {z:.1f})"
+
+
+def dts_core(tmp, clip, feats):
+    """A DTS soundtrack is decoded from its core alone, and still found.
+
+    DTS-HD - most Blu-ray remuxes - decodes several times faster without
+    its lossless extension. ffmpeg cannot write DTS-HD, so this checks
+    what it can: a plain DTS track decodes to exactly the samples a full
+    decode gives, and the capture is found in it. A DTS stream with no
+    core (DTS Express) decodes to nothing core-only, so decode_audio must
+    try again in full - stubbed, as ffmpeg cannot write that either.
+    """
+    dts = os.path.join(tmp, "clip_dts.mkv")
+    made = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-y",
+                           "-i", clip, "-ar", "48000", "-ac", "2",
+                           "-c:a", "dca", "-strict", "-2", dts],
+                          capture_output=True)
+    if made.returncode:
+        print("DTS track: this ffmpeg cannot write DTS - skipped")
+    else:
+        core = audio_matcher.decode_audio(dts, 60.0, 30.0)
+        full = audio_matcher._decode(dts, 60.0, 30.0, audio_matcher.SR, ())
+        assert np.array_equal(core, full), \
+            "core-only decoding changed a plain DTS track"
+        t, score, z = audio_matcher.find_match_audio(dts, feats,
+                                                     TRUTH - 30, TRUTH + 30)
+        print(f"DTS track: matched {t:.3f}s (err {abs(t - TRUTH) * 1000:.0f} ms, "
+              f"score {score:.3f}, z {z:.1f})")
+        assert abs(t - TRUTH) < 0.12, f"DTS track: wrong match {t:.3f}s"
+        assert score >= audio_matcher.SCORE_OK and z >= audio_matcher.Z_OK, \
+            f"DTS track: match not trusted (score {score:.3f}, z {z:.1f})"
+
+    real, tried = audio_matcher._decode, []
+
+    def decode(path, t0, dur, sr, opts):
+        tried.append(tuple(opts))
+        return np.zeros(0, np.float32) if opts else real(path, t0, dur, sr, opts)
+
+    audio_matcher._decode = decode
+    try:
+        x = audio_matcher.decode_audio(clip, 60.0, 10.0)
+    finally:
+        audio_matcher._decode = real
+    print(f"no DTS core: {x.size / audio_matcher.SR:.1f} s decoded in full "
+          "after an empty core-only decode")
+    assert tried == [audio_matcher.DTS_CORE_ONLY, ()], f"decodes tried: {tried}"
+    assert abs(x.size - 10 * audio_matcher.SR) < audio_matcher.SR // 10, \
+        f"fallback decoded {x.size} samples"
 
 
 def chunk_boundary(clip):

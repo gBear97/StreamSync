@@ -101,16 +101,34 @@ def decode_audio(path, t0, dur, sr=SR):
     aresample pins the samples to their timestamps, so an audio track that
     starts late (or has a gap) is padded with silence rather than slid
     earlier - a slide would shift the match by the same amount.
+
+    A DTS-HD track is decoded from its core alone (see DTS_CORE_ONLY). A
+    DTS stream with no core - DTS Express - gives nothing that way, so an
+    empty result is decoded again in full.
     """
-    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-nostats",
-           "-ss", f"{max(t0, 0.0):.3f}", "-i", path, "-t", f"{dur:.3f}",
-           "-vn", "-sn", "-ac", "1", "-ar", str(sr),
-           "-af", "aresample=async=1:first_pts=0", "-f", "f32le", "-"]
-    out = subprocess.run(cmd, capture_output=True, creationflags=_creationflags())
-    x = np.frombuffer(out.stdout, dtype=np.float32)
+    x = _decode(path, t0, dur, sr, DTS_CORE_ONLY)
+    if x.size < sr:
+        x = _decode(path, t0, dur, sr, ())
     if x.size < sr:
         raise MatchError("Could not decode audio from the file in that range.")
     return x
+
+
+# A DTS-HD soundtrack - most Blu-ray remuxes have one - is a lossy DTS
+# core with a lossless (MA) or high-resolution (HRA) extension on top.
+# The matcher hears a 16 kHz mono mix, which the core gives just as well,
+# and skipping the extension decodes several times faster. The option
+# belongs to ffmpeg's DTS decoder; every other decoder leaves it unused.
+DTS_CORE_ONLY = ("-core_only", "1")
+
+
+def _decode(path, t0, dur, sr, decoder_opts):
+    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-nostats",
+           *decoder_opts, "-ss", f"{max(t0, 0.0):.3f}", "-i", path,
+           "-t", f"{dur:.3f}", "-vn", "-sn", "-ac", "1", "-ar", str(sr),
+           "-af", "aresample=async=1:first_pts=0", "-f", "f32le", "-"]
+    out = subprocess.run(cmd, capture_output=True, creationflags=_creationflags())
+    return np.frombuffer(out.stdout, dtype=np.float32)
 
 
 def _band_mags(x, sr):
