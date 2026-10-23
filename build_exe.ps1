@@ -9,6 +9,7 @@ if (-not $?) { exit 1 }
 python -m PyInstaller --noconfirm --windowed --name StreamSync `
     --collect-all imageio_ffmpeg `
     --collect-all soundcard `
+    --hidden-import websockets.asyncio.server `
     streamsync.py
 if (-not $?) { exit 1 }
 

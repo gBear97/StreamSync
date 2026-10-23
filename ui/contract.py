@@ -125,6 +125,22 @@ CONTRACT = {
                             "_party.set_session_text(text) if the dialog is open",
         "_leave_session": "(); ctl.leave(), _session_changed(), then the status 'Left the "
                           "session.'",
+        # hosting through this computer (a Cloudflare quick tunnel)
+        "_host_here": "(params, exe, download); ctl.begin_hosting() here, so Cancel finds it at "
+                      "once, then a worker thread runs ctl.open_tunnel and posts "
+                      "('hosting', text) as it goes, then ('hosting_ready', local, public) or "
+                      "('hosting_failed', reason, manual); params are ctl.host's arguments "
+                      "after relay_url",
+        "_hosting_now": "() -> bool; the tunnel is opening: ctl.hosting set, no session yet",
+        "_on_hosting": "(text); queue: the status line and _party.set_host_note(text), unless "
+                       "the start was cancelled",
+        "_on_hosting_ready": "(local, public); queue: ctl.host(local, remember_relay=False) "
+                             "with the saved params, ctl.public_relay = public, "
+                             "_session_changed and a save - unless cancelled meanwhile",
+        "_on_hosting_failed": "(reason, manual); queue: the status line and "
+                              "_party.hosting_failed(reason, manual)",
+        "_cancel_hosting": "(); ctl.stop_hosting(), the status line, _party.refresh()",
+        "_open_cloudflared_page": "(); Cloudflare's cloudflared download page, in the browser",
         # devices and the stream list
         "_populate_audio_devices": "(); thread: lists the outputs, '(default) X' first, and "
                                    "posts ('devices', items)",
@@ -258,10 +274,14 @@ CONTRACT = {
         "WatchPartyDialog.refresh": "(); the idle or the running view, on "
                                     "ctl.session_running()",
         "WatchPartyDialog.refresh_code": "(); the running view's code from ctl.session.code "
-                                         "('…' until there is one); writes only on a change",
+                                         "('…' until there is one, Copy invite disabled "
+                                         "till then); writes only on a change",
         "WatchPartyDialog.set_session_text": "(text); the running view's latest session line, "
                                              "then refresh_code()",
         "WatchPartyDialog.set_mics": "(names); the microphone choices",
+        "WatchPartyDialog.set_host_note": "(text); the tunnel's progress under the Host button",
+        "WatchPartyDialog.hosting_failed": "(reason, manual); the reason under the Host button, "
+                                           "with the way to get cloudflared by hand if manual",
         "WatchPartyDialog.close": "(); destroys the window, app._party = None",
         "UpdateDialog": "class; the Update window",
         "UpdateDialog.__init__": "(app, tag, rel, can_install, unavailable_text); the offer, "

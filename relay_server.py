@@ -5,7 +5,10 @@ that passes through is session metadata - positions, timestamps and
 non-invertible fingerprint hashes. No media content exists anywhere in
 this protocol, so the relay stores and forwards nothing copyrighted.
 
-Run:  python relay_server.py [--port 8765]
+Run:  python relay_server.py [--port 8765] [--host 127.0.0.1]
+--host 127.0.0.1 listens to this computer alone - all a tunnel on the same
+computer needs, and no firewall asks about it. StreamSync's Watch party
+runs this same relay inside the app that way (hosting.LocalRelay).
 It's a single asyncio process; thousands of viewers per instance is fine
 because traffic is a few small messages per second per room, and fan-out
 never waits on any one viewer: a slow connection drops its own messages
@@ -217,18 +220,21 @@ async def handle(ws, grace=HOST_GRACE):
                                        "n": len(room.viewers)})
 
 
-async def main(port, grace=HOST_GRACE):
+async def main(port, grace=HOST_GRACE, host="0.0.0.0"):
     async def handler(ws):
         await handle(ws, grace)
-    async with websockets.serve(handler, "0.0.0.0", port, max_size=MAX_MSG):
-        print(f"StreamSync relay listening on :{port}")
+    async with websockets.serve(handler, host, port, max_size=MAX_MSG):
+        print(f"StreamSync relay listening on {'' if host == '0.0.0.0' else host}:{port}")
         await asyncio.Future()
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--host", default="0.0.0.0",
+                    help="address to listen on: 127.0.0.1 for a tunnel on this "
+                         "computer (default: every network)")
     ap.add_argument("--host-grace", type=float, default=HOST_GRACE,
                     help="seconds a disconnected host may take to resume")
     args = ap.parse_args()
-    asyncio.run(main(args.port, args.host_grace))
+    asyncio.run(main(args.port, args.host_grace, args.host))

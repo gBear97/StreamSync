@@ -54,6 +54,7 @@ VERSION=$("$PY" -c 'from version import __version__; print(__version__)')
     --collect-all soundcard \
     --collect-all certifi \
     --hidden-import certifi \
+    --hidden-import websockets.asyncio.server \
     streamsync.py
 
 PLIST=dist/StreamSync.app/Contents/Info.plist

@@ -26,9 +26,12 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
+import webbrowser
+
 import audio_capture
 import controller
 import diagnostics
+import hosting
 import matcher
 from players import VLCError
 from ui import adapter, dialogs, mainwin, theme, update, video, widgets  # noqa: F401
@@ -46,7 +49,9 @@ class Shell(adapter.PlatformAdapter):
         "update": "_on_update", "update_none": "_on_update_none", "update_err": "_on_update_err",
         "update_progress": "_on_update_progress", "update_step": "_on_update_step",
         "update_installing": "_on_update_installing", "update_ready": "_on_update_ready",
-        "update_failed": "_on_update_failed", "update_cancelled": "_on_update_cancelled"}
+        "update_failed": "_on_update_failed", "update_cancelled": "_on_update_cancelled",
+        "hosting": "_on_hosting", "hosting_ready": "_on_hosting_ready",
+        "hosting_failed": "_on_hosting_failed"}
 
     TEXT_CLASSES = {"Entry", "TEntry", "Text", "Spinbox", "TSpinbox", "TCombobox"}
 
@@ -66,6 +71,7 @@ class Shell(adapter.PlatformAdapter):
         self._synced_at = None       # monotonic time of the last sync that moved the film
         self._party_live = False
         self._session_text = ""
+        self._hosting_params = None  # ctl.host's arguments while the tunnel opens
         self._film_length = None
         self._pos = (None, None)     # the time and length the last tick read
         self._settings = self._party = self._update_dialog = None
@@ -460,6 +466,75 @@ class Shell(adapter.PlatformAdapter):
         self.ctl.leave()
         self._session_changed()
         self._set_status("Left the session.")
+
+    # --- hosting through this computer ----------------------------------------
+
+    def _host_here(self, params, exe, download):
+        """Host through this computer: the relay and a Cloudflare quick
+        tunnel open on a worker thread (cloudflared downloaded first if
+        `download`), and the session starts from the queue once the
+        tunnel's address is live. params: ctl.host's arguments after
+        relay_url."""
+        self._hosting_params = params
+        q, ctl = self.q, self.ctl
+        h = ctl.begin_hosting()          # here, so Cancel finds it at once
+
+        def work():
+            try:
+                local, public = ctl.open_tunnel(h, exe, download,
+                                                lambda text: q.put(("hosting", text)))
+            except hosting.Cancelled:
+                return
+            except Exception as e:
+                q.put(("hosting_failed", str(e) or type(e).__name__,
+                       isinstance(e, hosting.DownloadError)))
+                return
+            q.put(("hosting_ready", local, public))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _hosting_now(self):
+        """True while this computer's tunnel is opening, before the session."""
+        return self.ctl.hosting is not None and self.ctl.session is None
+
+    def _on_hosting(self, text):
+        if not self._hosting_now():
+            return                   # cancelled: a step reported late
+        self._set_status(text)
+        if self._party is not None:
+            self._party.set_host_note(text)
+
+    def _on_hosting_ready(self, local, public):
+        params, self._hosting_params = self._hosting_params, None
+        h = self.ctl.hosting
+        if params is None or h is None or h.public_url != public:
+            return                   # cancelled while it opened
+        try:
+            self.ctl.host(local, remember_relay=False, **params)
+        except Exception as e:
+            self.ctl.stop_hosting()
+            self._on_hosting_failed(f"could not start ({e})", False)
+            return
+        self.ctl.public_relay = public
+        self._session_changed()
+        self._save_config()
+        self._set_status("Hosting through a free Cloudflare tunnel - Copy invite gives "
+                         "your viewers the address and code.")
+
+    def _on_hosting_failed(self, reason, manual):
+        self._hosting_params = None
+        self._set_status(f"Could not host through this computer: {reason}")
+        if self._party is not None:
+            self._party.hosting_failed(reason, manual)
+
+    def _cancel_hosting(self):
+        self._hosting_params = None
+        self.ctl.stop_hosting()
+        self._set_status("Hosting cancelled.")
+        if self._party is not None:
+            self._party.refresh()
+
+    def _open_cloudflared_page(self):
+        webbrowser.open(hosting.DOWNLOAD_PAGE)
 
     # --- devices and the stream list ------------------------------------------
 

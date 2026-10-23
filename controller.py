@@ -39,6 +39,7 @@ from pathlib import Path
 import audio_capture
 import audio_matcher
 import diagnostics
+import hosting
 import matcher
 import session
 from players import ExternalPlayer, VLCError
@@ -120,6 +121,10 @@ class SyncController:
         self.auto_follow = True
         self.auto_interval = 30
         self.relay_url = "ws://localhost:8765"
+        self.host_via = "tunnel"     # "tunnel": host through this computer; "relay": relay_url
+        self.hosting = None          # hosting.Hosting while hosting through this computer
+        self.public_relay = None     # the address viewers use then (wss://….trycloudflare.com)
+        self._ended_hosting = []     # Hostings stopped or stopping, for close() to make sure of
         self.session = None          # active HostSession / ViewerSession
         self._closers = []           # threads stopping sessions since ended
         self._monitor_factory = monitor_factory or (
@@ -576,8 +581,12 @@ class SyncController:
 
     # ----------------------------------------------------------- sessions
 
-    def host(self, relay_url, password, from_player, mic_name, delay_hint, title):
-        self.relay_url = relay_url
+    def host(self, relay_url, password, from_player, mic_name, delay_hint, title,
+             remember_relay=True):
+        """remember_relay=False for this computer's own relay: its address
+        lasts one party, and must not replace the relay saved for joining."""
+        if remember_relay:
+            self.relay_url = relay_url
         src = None
         if from_player:
             player = self.player
@@ -600,6 +609,78 @@ class SyncController:
     def leave(self):
         if self.session is not None:
             self._end_session()
+        elif self.hosting is not None:
+            self.stop_hosting()       # left while the tunnel was still opening
+
+    # Hosting through this computer: hosting.Hosting runs the relay inside
+    # StreamSync and a quick tunnel to it. The host's session then talks to
+    # the relay directly, and viewers come in through the tunnel.
+
+    def find_cloudflared(self):
+        """(path, version, own) - see hosting.find. A few file checks and a
+        `cloudflared --version`: quick enough for the Tk thread."""
+        return hosting.find()
+
+    def begin_hosting(self):
+        """The Hosting for a party from this computer, made on the Tk thread
+        before open_tunnel runs: a Cancel pressed at once finds it to stop,
+        and the window reads 'opening' from the start."""
+        h = hosting.Hosting()
+        h.on_down = lambda: self._tunnel_down(h)
+        self.hosting = h
+        return h
+
+    def open_tunnel(self, h, exe, download, say):
+        """thread: begin_hosting()'s `h` opened - the relay here and a quick
+        tunnel to it, once cloudflared is downloaded if `download`. Returns
+        (local_url, public_url) once the tunnel's address resolves. Raises
+        hosting.Cancelled if stop_hosting() came first, otherwise
+        RuntimeError (a DownloadError for the download) with the reason.
+        say(text) reports progress."""
+        try:
+            if download:
+                say(f"Downloading cloudflared from Cloudflare's releases on GitHub "
+                    f"(about {hosting.APPROX_MB} MB)...")
+                shown = [0]
+
+                def progress(done, total):
+                    if h.cancelled:
+                        raise hosting.Cancelled()
+                    pct = int(done * 100 / total) if total else 0
+                    if pct >= shown[0] + 10:
+                        shown[0] = pct
+                        say(f"Downloading cloudflared... {pct}%")
+                exe, version = hosting.download(progress=progress)
+                diagnostics.log(f"hosting: downloaded cloudflared {version} to {exe}, "
+                                "checksum and Cloudflare's signature checked")
+            public = h.start(exe, say)
+        except BaseException as e:
+            h.stop()
+            if self.hosting is h:
+                self.hosting = None
+            if not isinstance(e, hosting.Cancelled):
+                diagnostics.log(f"hosting: could not open the tunnel: {e}")
+            raise
+        live = (f"in DNS after {h.dns_seconds:.1f} s" if h.dns_live
+                else f"not in DNS yet after {h.dns_seconds or 0:.0f} s")
+        diagnostics.log(f"hosting: relay at {h.local_url}, tunnel at {public} ({live})")
+        return h.local_url, public
+
+    def stop_hosting(self):
+        """Close this computer's tunnel and relay, or cancel them opening.
+        In the background: cloudflared can take seconds to exit."""
+        h, self.hosting = self.hosting, None
+        self.public_relay = None
+        if h is not None:
+            self._ended_hosting.append(h)
+            threading.Thread(target=h.stop, daemon=True).start()
+
+    def _tunnel_down(self, h):
+        """cloudflared ended by itself in the middle of a party (its thread)."""
+        diagnostics.log("hosting: cloudflared stopped by itself")
+        if self.hosting is h and self.session_running():
+            self.q.put(("session", "The Cloudflare tunnel stopped, so viewers can't reach "
+                                   "the party now. Leave, then host again for a new address."))
 
     def _end_session(self):
         """Stop the session in the background. Stopping says goodbye to
@@ -612,12 +693,23 @@ class SyncController:
         player under a goodbye still going out."""
         sess, self.session = self.session, None
         sess.stop_flag.set()
+        # this computer's relay and tunnel go after the session: its goodbye
+        # goes out through them
+        h, self.hosting = self.hosting, None
+        self.public_relay = None
+        if h is not None:
+            self._ended_hosting.append(h)
 
         def stop():
             try:
                 sess.stop()
             except Exception as e:
                 diagnostics.log(f"session stop failed: {e!r}")
+            if h is not None:
+                try:
+                    h.stop()
+                except Exception as e:
+                    diagnostics.log(f"hosting stop failed: {e!r}")
         closer = threading.Thread(target=stop, daemon=True)
         closer.start()
         self._closers = [t for t in self._closers if t.is_alive()] + [closer]
@@ -647,6 +739,7 @@ class SyncController:
             "auto_interval": self.auto_interval,
             "auto_follow": self.auto_follow,
             "relay_url": self.relay_url,
+            "host_via": self.host_via,
         })
         try:
             CONFIG_PATH.write_text(json.dumps(cfg))
@@ -678,6 +771,8 @@ class SyncController:
         self.auto_follow = bool(cfg.get("auto_follow", True))
         if cfg.get("relay_url"):
             self.relay_url = cfg["relay_url"]
+        if cfg.get("host_via") in ("tunnel", "relay"):
+            self.host_via = cfg["host_via"]
         return cfg
 
     def film_to_restore(self, cfg):
@@ -690,6 +785,8 @@ class SyncController:
         self._closing = True
         if self.session is not None:
             self._end_session()
+        elif self.hosting is not None:
+            self.stop_hosting()
         # give each goodbye - this session's, or one still going out from
         # a Leave just before - a moment to go out before the player
         # stops, but a dead relay must not hold the window open for its
@@ -697,6 +794,10 @@ class SyncController:
         deadline = time.monotonic() + SESSION_CLOSE_WAIT
         for closer in self._closers:
             closer.join(max(0.0, deadline - time.monotonic()))
+        # cloudflared is a process of its own: one still exiting now would
+        # outlive StreamSync, holding a dead tunnel open
+        for h in self._ended_hosting:
+            h.kill()
         if self._monitor is not None:
             self._monitor.stop()
         try:
