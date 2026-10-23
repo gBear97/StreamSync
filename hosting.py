@@ -61,7 +61,12 @@ _ADDR = re.compile(r"\b(?:wss?|https?)://[^\s<>\"']+", re.I)
 
 
 class DownloadError(RuntimeError):
-    """Why cloudflared could not be fetched, in words for the user."""
+    """Why cloudflared could not be fetched, in words for the user; `detail`
+    (if any) is for the log."""
+
+    def __init__(self, reason, detail=""):
+        super().__init__(reason)
+        self.detail = detail
 
 
 class Cancelled(RuntimeError):
@@ -255,12 +260,13 @@ def _extract(tgz, out):
         raise DownloadError(f"the archive could not be read ({_short(e)})")
 
 
-def verify_signature(path):
+def verify_signature(path, plat=None):
     """Cloudflare's own signature on `path`, or DownloadError. The checksum
     says the download is the file the release lists; this says Cloudflare
     made it. (No other platform signs its builds: Linux is checked by
     checksum alone.)"""
-    if sys.platform == "darwin":
+    plat = plat or sys.platform
+    if plat == "darwin":
         req = f'anchor apple generic and certificate leaf[subject.OU] = "{MAC_TEAM}"'
         try:
             r = subprocess.run(["/usr/bin/codesign", "--verify", "--strict", f"-R={req}", path],
@@ -268,24 +274,63 @@ def verify_signature(path):
             ok = r.returncode == 0
         except (OSError, subprocess.SubprocessError):
             ok = False
-    elif sys.platform == "win32":
-        ps = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32",
-                          "WindowsPowerShell", "v1.0", "powershell.exe")
-        script = ("$s = Get-AuthenticodeSignature -LiteralPath $env:SS_SIGNED; "
-                  "[string]$s.Status + '|' + $s.SignerCertificate.Subject")
-        try:
-            r = subprocess.run([ps, "-NoProfile", "-NonInteractive", "-Command", script],
-                               capture_output=True, text=True, timeout=60,
-                               env=dict(os.environ, SS_SIGNED=path),
-                               creationflags=_NO_WINDOW)
-            status, _, subject = r.stdout.strip().partition("|")
-            ok = status == "Valid" and subject.startswith(WIN_SIGNER)
-        except (OSError, subprocess.SubprocessError):
-            ok = False
+    elif plat == "win32":
+        status, signer, error = _authenticode(path)
+        if not status:
+            # the check itself did not run: say so, rather than blame the file
+            raise DownloadError("Windows could not check its signature, so it was "
+                                "thrown away", detail=error)
+        ok = status == "Valid" and signer.startswith(WIN_SIGNER)
     else:
         return
     if not ok:
         raise DownloadError("it is not signed by Cloudflare, so it was thrown away")
+
+
+def _signature_env(path, environ=None):
+    """The environment for Windows' signature check: this one less
+    PSModulePath, plus the file to check (in a variable, so no path is
+    ever read as PowerShell).
+
+    A StreamSync started from PowerShell 7 inherits pwsh's module path.
+    Handed on to Windows PowerShell 5.1, it makes 5.1 load pwsh's
+    Microsoft.PowerShell.Security, which fails: Get-AuthenticodeSignature
+    printed nothing, and a file Cloudflare had signed was thrown away.
+    Without the variable, 5.1 builds its own default path."""
+    env = {k: v for k, v in (os.environ if environ is None else environ).items()
+           if k.upper() != "PSMODULEPATH"}
+    env["SS_SIGNED"] = path
+    return env
+
+
+def _authenticode(path):
+    """(status, signer, error) for `path` from Windows PowerShell's
+    Get-AuthenticodeSignature. status is "" when the check could not run,
+    and error then says why."""
+    ps = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32",
+                      "WindowsPowerShell", "v1.0", "powershell.exe")
+    script = ("$s = Get-AuthenticodeSignature -LiteralPath $env:SS_SIGNED; "
+              "[string]$s.Status + '|' + $s.SignerCertificate.Subject")
+    try:
+        r = subprocess.run([ps, "-NoProfile", "-NonInteractive", "-Command", script],
+                           capture_output=True, text=True, timeout=60,
+                           env=_signature_env(path), creationflags=_NO_WINDOW)
+    except (OSError, subprocess.SubprocessError) as e:
+        return "", "", str(e)
+    status, _, signer = r.stdout.strip().partition("|")
+    return status, signer, "" if status else _first_error(r.stderr)
+
+
+def _first_error(text):
+    """PowerShell's error, without the position lines under it or the
+    progress records it writes as CLIXML."""
+    said = []
+    for line in (s.strip() for s in (text or "").splitlines()):
+        if line.startswith(("At line", "+ ")):
+            break
+        if line and not line.startswith(("#<", "<")):
+            said.append(line)
+    return " ".join(said)[:300] or "PowerShell printed nothing"
 
 
 # ---------------------------------------------------------------- running

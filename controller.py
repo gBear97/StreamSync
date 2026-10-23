@@ -659,7 +659,9 @@ class SyncController:
             if self.hosting is h:
                 self.hosting = None
             if not isinstance(e, hosting.Cancelled):
-                diagnostics.log(f"hosting: could not open the tunnel: {e}")
+                detail = getattr(e, "detail", "")
+                diagnostics.log(f"hosting: could not open the tunnel: {e}"
+                                + (f" ({detail})" if detail else ""))
             raise
         live = (f"in DNS after {h.dns_seconds:.1f} s" if h.dns_live
                 else f"not in DNS yet after {h.dns_seconds or 0:.0f} s")
