@@ -54,7 +54,8 @@ jobs:
         run: command -v xvfb-run || (sudo apt-get update && sudo apt-get install -y xvfb)
 
       # Engine, capture timing, controller decisions, fingerprints, the
-      # relay, a whole watch party, the shell over a fake Tk (test_macswap,
+      # relay, a whole watch party, how a viewer follows a host's plays,
+      # pauses and jumps (test_follow), the shell over a fake Tk (test_macswap,
       # and test_winswap with Windows' adapter over a fake windowctl) and
       # the update flow over a fake updater - none needs a sound card,
       # a display or VLC. test_singleinstance holds locks of its own and
@@ -79,7 +80,7 @@ jobs:
           set -e
           for t in test_audio_capture test_players test_controller \
                    test_audio_matcher test_fingerprint test_relay \
-                   test_relay_tls test_session test_updater test_netcerts \
+                   test_relay_tls test_session test_follow test_updater test_netcerts \
                    test_diagnostics test_singleinstance test_macswap \
                    test_winswap test_windowctl test_videomouse \
                    test_widgets test_updateflow test_ui; do

@@ -1,14 +1,16 @@
 """The Settings, Watch party and Update dialogs.
 
-Each dialog is a transient, grabbed Toplevel whose title starts with
-"StreamSync" (Windows lists the open windows as stream candidates and
-leaves out ours only by that prefix). It registers itself on the app -
-app._settings, app._party or app._update_dialog - *before* app._present()
-runs: on the Mac that pumps events, and a second click on the button that
-opened it must find the dialog already open. close() releases the grab,
-destroys the window and unregisters it, and gives the grab back to the
-dialog that held it before (Settings, under an Update dialog that opened
-over it).
+Each dialog is a transient Toplevel whose title starts with "StreamSync"
+(Windows lists the open windows as stream candidates and leaves out ours
+only by that prefix). Settings and Update take the grab; Watch party does
+not, and opens beside the main window when the screen has room: a host
+plays, pauses and moves the film from the main window with it open. Each
+registers itself on the app - app._settings, app._party or
+app._update_dialog - *before* app._present() runs: on the Mac that pumps
+events, and a second click on the button that opened it must find the
+dialog already open. close() releases any grab, destroys the window and
+unregisters it, and gives the grab back to the dialog that held it before
+(Settings, under an Update dialog that opened over it).
 
 The dialogs only show and collect; every action goes through the app's
 methods (ui/contract.py), so the same code runs on both platforms. Their
@@ -91,10 +93,11 @@ def _within(widget, ancestor):
 
 class _Dialog:
     """What the three share: the window, its registration on the app as
-    `slot`, its grab, and close()."""
+    `slot`, its grab (if `modal`), and close()."""
 
     slot = ""
     width = 600                          # design px
+    modal = True                         # holds the grab while open
 
     def _open(self, app, title):
         self.app = app
@@ -141,7 +144,7 @@ class _Dialog:
     def _grab(self, tries=10):
         # A window the window manager has not mapped yet cannot take the
         # grab on every platform; it is asked again shortly.
-        if self._closed:
+        if self._closed or not self.modal:
             return
         if self._prev_grab is None:
             try:
@@ -590,11 +593,39 @@ def relay_address(text):
 
 class WatchPartyDialog(_Dialog):
     """Host and Join side by side, the relay underneath; while a session
-    runs, its code, its latest line and Leave instead."""
+    runs, its code, its latest line and Leave instead.
+
+    Not modal: a host plays and pauses the film in the main window while
+    this shows the code. With the grab it held before, the main window
+    ignored every click until this was closed - and nothing said so."""
 
     slot = "_party"
     width = 680
+    modal = False
     PAD_X, PAD_Y = 26, 22
+    GAP = 12                             # design px between it and the main window
+
+    def _place(self):
+        # Beside the main window, right then left, when the screen has
+        # room, so the film's controls stay in sight; over it, as the other
+        # dialogs open, when it has not.
+        win, root = self.win, self.app.root
+        try:
+            win.update_idletasks()
+            w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+            gap = theme.px(self.GAP)
+            rx, ry, rw = root.winfo_rootx(), root.winfo_rooty(), root.winfo_width()
+            if rx + rw + gap + w <= win.winfo_screenwidth():
+                x = rx + rw + gap
+            elif rx - gap - w >= 0:
+                x = rx - gap - w
+            else:
+                super()._place()
+                return
+            y = max(0, min(ry, win.winfo_screenheight() - h - theme.px(40)))
+            win.geometry(f"+{x}+{y}")
+        except (tk.TclError, TypeError, ValueError):
+            super()._place()
 
     def __init__(self, app):
         win = self._open(app, "StreamSync - Watch party")

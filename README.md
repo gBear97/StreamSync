@@ -376,11 +376,13 @@ makes it reachable from anywhere. No account, nothing to rent, nothing
 to open in a router or firewall.
 
 1. Set up and start the relay as in steps 1 to 3 below, on the host's
-   computer.
+   computer. If Windows asks whether Python may use the network, Cancel
+   is fine: the tunnel reaches the relay from the same computer.
 2. Install `cloudflared` - on a Mac, `brew install cloudflared`; on
    Windows, the MSI from Cloudflare's
-   [downloads page](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/) -
-   and, in a second window, run
+   [downloads page](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/),
+   which asks for administrator approval and makes the `cloudflared`
+   command work in windows opened after it - and, in a second window, run
 
    ```
    cloudflared tunnel --url http://localhost:8765
@@ -409,7 +411,8 @@ both sides can reach - a $5 VPS or small AWS instance serves thousands
 of viewers (traffic is a few tiny messages per second per room, and a
 slow viewer never holds up the others). On that machine:
 
-1. Install Python 3 (on Debian or Ubuntu, `python3-venv` as well).
+1. Install Python 3 (on Debian or Ubuntu, `python3-venv` as well; on
+   Windows, from python.org, whose installer adds the `py` command).
 2. Download `relay_server.py` from this repository and install the one
    package it needs, `websockets`. On Linux or macOS:
 
@@ -419,7 +422,18 @@ slow viewer never holds up the others). On that machine:
    relay-env/bin/pip install websockets
    ```
 
-   (On Windows the last line is `relay-env\Scripts\pip install websockets`.)
+   On Windows, in PowerShell:
+
+   ```
+   curl.exe -O https://raw.githubusercontent.com/gBear97/StreamSync/main/relay_server.py
+   py -m venv relay-env
+   relay-env\Scripts\pip install websockets
+   ```
+
+   (`curl.exe`, because PowerShell's own `curl` is a different command:
+   it reads `-O` as something else and asks for a "Uri". And `py`,
+   because `python3` there can start another Python, or open the
+   Microsoft Store.)
 3. Start it, and keep it running while the party lasts:
 
    ```

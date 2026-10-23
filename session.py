@@ -6,7 +6,8 @@ everything transmitted is positions, UTC timestamps, and non-invertible
 binary fingerprint words (see fingerprint.py). No audio, no video, no
 content of any kind crosses the network.
 
-Timeline model: the host broadcasts state tuples (position, utc, playing).
+Timeline model: the host broadcasts state tuples (position, utc, playing),
+at once when its film plays, pauses or jumps and on a heartbeat besides.
 A viewer renders the host's timeline *delayed* by their personal stream
 delay D - evaluating "where was the host D seconds ago" - which makes
 pauses and seeks land exactly when the commentary about them arrives.
@@ -34,6 +35,7 @@ import numpy as np
 
 import audio_capture
 import audio_matcher
+import diagnostics
 import fingerprint
 import matcher
 import netcerts
@@ -41,6 +43,10 @@ from ntpclock import SharedClock
 
 FP_HOP = fingerprint.FP_HOP
 STATE_INTERVAL = 2.0        # host heartbeat
+STATE_CHECK = 0.1           # how often the host looks for a play, pause or jump
+JUMP_TOLERANCE = 0.3        # a host position this far off its last state's line
+FOLLOW_INTERVAL = 1.0       # a viewer's longest wait between follow passes
+TIMELINE_STATES = 3000      # host states a viewer keeps: minutes of scrubbing
 VOICE_CHUNK = 4.0           # host voice words per message (seconds)
 LISTEN_SECONDS = 4.0        # host loopback position check (listen mode)
 LISTEN_NEAR = 30.0          # listen-mode search half-width once locked
@@ -126,7 +132,16 @@ class StateTimeline:
                                 "utc": float(msg["utc"]),
                                 "playing": bool(msg["playing"])})
             self.states.sort(key=lambda s: s["utc"])
-            del self.states[:-600]
+            del self.states[:-TIMELINE_STATES]
+
+    def next_after(self, t):
+        """UTC of the first state after t, or None: when the timeline next
+        changes for a viewer standing at t."""
+        with self.lock:
+            for s in self.states:
+                if s["utc"] > t:
+                    return s["utc"]
+            return None
 
     def at(self, t):
         """(position, playing) on the host timeline at UTC time t."""
@@ -143,6 +158,20 @@ class StateTimeline:
             if current["playing"]:
                 pos += t - current["utc"]
             return pos, current["playing"]
+
+
+def state_changed(last, now):
+    """True if the host state `now` is not what `last` predicts: the film
+    played, paused or jumped in between. Both are (pos, utc, playing);
+    `last` is None before anything was sent."""
+    if last is None:
+        return True
+    pos0, utc0, playing0 = last
+    pos, utc, playing = now
+    if playing != playing0:
+        return True
+    expected = pos0 + (utc - utc0 if playing0 else 0.0)
+    return abs(pos - expected) > JUMP_TOLERANCE
 
 
 class VoiceBuffer:
@@ -600,16 +629,24 @@ class HostSession:
         return self.tracker.anchor
 
     def _state_loop(self):
-        seq = 0
+        """The host's state to viewers: at once when the film plays, pauses
+        or jumps, and every STATE_INTERVAL besides. Sent on the heartbeat
+        alone, a pause reached viewers up to 2 s late - they played on past
+        it, then stepped back - and a jump landed as late."""
+        seq, last, sent_at = 0, None, None
         while not self.stop_flag.is_set():
             st = self._current_state()
             if st is not None and self.link is not None:
-                pos, utc, playing = st
-                self._send({"type": "state", "ck": "state", "seq": seq,
-                            "pos": pos, "utc": utc, "playing": playing,
-                            "default_delay": self.default_delay})
-                seq += 1
-            self.stop_flag.wait(STATE_INTERVAL)
+                now = time.monotonic()
+                if (sent_at is None or now - sent_at >= STATE_INTERVAL
+                        or state_changed(last, st)):
+                    pos, utc, playing = st
+                    self._send({"type": "state", "ck": "state", "seq": seq,
+                                "pos": pos, "utc": utc, "playing": playing,
+                                "default_delay": self.default_delay})
+                    seq += 1
+                    last, sent_at = st, now
+            self.stop_flag.wait(STATE_CHECK)
 
     def _voice_loop(self):
         """Voice words cut on the UTC grid (word k covers utc k*FP_HOP), so
@@ -723,12 +760,14 @@ class ViewerSession:
         self._fp_meta = None
         self._refused = None      # the relay's reason for turning us away
         self._monitor = None
+        self._wake = threading.Event()   # a host state came, or the session ended
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
 
     def stop(self):
         self.stop_flag.set()
+        self._wake.set()
         if self.link:
             self.link.close()
         self._shutdown()
@@ -745,6 +784,7 @@ class ViewerSession:
 
     def _shutdown(self):
         self.stop_flag.set()
+        self._wake.set()
         self.clock.stop()
         if self._monitor is not None:
             self._monitor.stop()
@@ -828,6 +868,7 @@ class ViewerSession:
             try:
                 if t == "state":
                     self.timeline.add(msg)
+                    self._wake.set()
                 elif t == "voice":
                     self.voice.add(msg["t0"], _unb64(msg["data"]))
                 elif t == "fp_meta":
@@ -861,6 +902,8 @@ class ViewerSession:
 
     def _follow_loop(self):
         was_playing = None
+        paused_host = None    # the host position the paused film was put at
+        trouble = None        # what stopped the player following, said once
         while not self.stop_flag.is_set():
             perf = time.perf_counter()
             t_view = self.clock.perf_to_utc(perf) - self.effective_delay()
@@ -876,15 +919,51 @@ class ViewerSession:
                             # target is where the film belongs at `perf`;
                             # the player carries it forward from there
                             self.player.sync_seek(target, perf, 0.0)
-                        was_playing = True
+                        was_playing, paused_host = True, None
                     else:
-                        if was_playing is not False:
+                        # A host who jumps while paused moves the paused
+                        # film too, not only once they play again. It is
+                        # the host's position that is watched: this
+                        # viewer's own nudges move `target`, and the
+                        # player has made those already.
+                        if (was_playing is not False or paused_host is None
+                                or abs(host_pos - paused_host) > DRIFT_TOLERANCE):
                             self.player.pause()
                             self.player.seek(target)
+                            paused_host = host_pos
                         was_playing = False
-                except Exception:
-                    pass
-            self.stop_flag.wait(1.0)
+                except Exception as e:
+                    # Said once, and tried again on the next pass. Passed
+                    # over in silence, a film that would not start left
+                    # the viewer saying "Following the session" while it
+                    # stood still for the rest of the party.
+                    why = str(e) or type(e).__name__
+                    if why != trouble:
+                        trouble = why
+                        self._say(f"Could not follow the host: {why}")
+                        diagnostics.log(f"watch party: could not follow the host: {why}")
+                else:
+                    if trouble is not None:
+                        trouble = None
+                        self._say("Following the session again.")
+                        diagnostics.log("watch party: following the host again")
+            # A host state arriving cuts the wait short: it may be due
+            # sooner than anything the wait was worked out from. Cleared
+            # after, which loses nothing - the next pass reads the timeline.
+            self._wake.wait(self._follow_wait())
+            self._wake.clear()
+
+    def _follow_wait(self):
+        """Seconds to the next follow pass: when this viewer's delayed
+        timeline reaches the host's next state, if that comes first. A
+        pause or a jump is applied as it reaches the viewer, not up to a
+        second late."""
+        t_view = (self.clock.perf_to_utc(time.perf_counter())
+                  - self.effective_delay())
+        nxt = self.timeline.next_after(t_view)
+        if nxt is None:
+            return FOLLOW_INTERVAL
+        return min(FOLLOW_INTERVAL, max(0.01, nxt - t_view))
 
     def _measure_loop(self):
         self._monitor = mon = audio_capture.AudioMonitor(
