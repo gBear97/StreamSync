@@ -1075,6 +1075,7 @@ def watch_party(env, root, app):
         check_in("Watch party text", s, shown)
     check("the delay hint starts at 10", d.delay_field.get(), "10")
     check("the host button is live with a film", d.host_btn.cget("state"), "normal")
+    check("hosting goes through a free Cloudflare tunnel at first", d.tunnel_var.get(), True)
     shot(root, d.win, "04-watch-party")
 
     # Not modal: a host plays and pauses in the main window with it open.
@@ -1174,6 +1175,9 @@ def watch_party(env, root, app):
             def start(self):
                 pass
 
+            def stop(self):
+                self.stop_flag.set()
+
         def press(button, relay):
             d.relay_field.entry.delete(0, "end")
             d.relay_field.entry.insert(0, relay)
@@ -1189,6 +1193,7 @@ def watch_party(env, root, app):
 
         real_host = engine.HostSession
         engine.HostSession = Host
+        d.tunnel_var.set(False)          # these are the relay server field's checks
         try:
             for name, button, started, err in (
                     ("Join", d._join, joined, d.join_err),
@@ -1221,6 +1226,99 @@ def watch_party(env, root, app):
             check("ws:// is saved", saved(), "ws://203.0.113.7:8765")
             check("a good address clears the mark",
                   d.relay_field.entry.cget("highlightbackground") == theme.ERROR, False)
+
+            # Hosting through this computer, the default. A missing
+            # cloudflared is fetched only once the user says yes, and
+            # otherwise the way to get it is shown. The tunnel opens on a
+            # worker thread - here, a stand-in for ctl.open_tunnel - and
+            # Host reads Cancel meanwhile.
+            from ui import dialogs as dlg
+            import hosting as tunnels
+            ctl = app.ctl
+            real_ask = dlg.messagebox.askokcancel
+            public = "wss://fake-able-mind-words.trycloudflare.com"
+            opened = []
+
+            def open_tunnel(h, exe, download, say):
+                # begin_hosting's real Hosting, never started: nothing opens
+                opened.append((exe, download))
+                say("Downloading cloudflared... 50%")
+                h.public_url = public
+                return "ws://127.0.0.1:9", public
+
+            ctl.find_cloudflared = lambda: (None, None, False)
+            ctl.open_tunnel = open_tunnel
+            d.tunnel_var.set(True)
+            try:
+                dlg.messagebox.askokcancel = lambda *a, **k: False
+                d._host()
+                pump(root, 0.2)
+                check("declined: nothing opens", (opened, ctl.session), ([], None))
+                check("declined: the way to get cloudflared, with Cloudflare's page",
+                      (bool(d.host_note.winfo_ismapped()), bool(d.host_link.winfo_ismapped()),
+                       d.host_note.cget("text").startswith("A Cloudflare tunnel needs")),
+                      (True, True, True))
+                shot(root, d.win, "05-watch-party-get-cloudflared")
+
+                dlg.messagebox.askokcancel = lambda *a, **k: True
+                hosted.clear()
+                d._host()
+                pump(root, 0.6)
+                check("yes: cloudflared is downloaded first", opened, [(None, True)])
+                check("the session uses this computer's relay", hosted, ["ws://127.0.0.1:9"])
+                check("the running view shows the tunnel's address",
+                      (bool(d.running.winfo_ismapped()), d.addr_field.get(),
+                       bool(d.addr_note.winfo_ismapped())), (True, public, True))
+                check("so does the relay field", d.relay_var.get(), public)
+                check("the saved relay is not the tunnel's", saved(), "ws://203.0.113.7:8765")
+                check("the tunnel choice is saved",
+                      json.loads(env.config.read_text()).get("host_via"), "tunnel")
+                ctl.session.code = "ABCD-EFGH"
+                d._copy_invite()
+                pump(root, 0.1)
+                check("Copy invite copies the address and the code", root.clipboard_get(),
+                      f"StreamSync watch party: {public} code ABCD-EFGH")
+                check("and says so", d.invite_btn.cget("text"), "Copied")
+                d.refresh_code()
+                shot(root, d.win, "05-watch-party-hosting-here")
+                h = ctl.hosting
+                app._leave_session()
+                pump(root, 0.3)
+                check("Leave closes the tunnel", (h.cancelled, ctl.hosting), (True, None))
+                check("and the relay field has the saved relay back", d.relay_var.get(),
+                      "ws://203.0.113.7:8765")
+
+                def slow_open(h, exe, download, say):
+                    deadline = time.monotonic() + 10
+                    while not h.cancelled and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    raise tunnels.Cancelled()
+
+                ctl.find_cloudflared = lambda: ("/fake/cloudflared", "2026.10.3", False)
+                ctl.open_tunnel = slow_open
+                d._host()
+                check("at once, Host reads Cancel", d.host_btn.cget("text"), "Cancel")
+                h = ctl.hosting
+                pump(root, 0.2)
+                d.host_btn.invoke()
+                pump(root, 0.3)
+                check("Cancel stops it", (h.cancelled, ctl.hosting), (True, None))
+                check("and Host is back", d.host_btn.cget("text"), "Start hosting")
+            finally:
+                dlg.messagebox.askokcancel = real_ask
+                del ctl.find_cloudflared, ctl.open_tunnel
+
+            # an invite pasted as the code: its address goes to the relay field
+            joined.clear()
+            d.join_code.set(f"StreamSync watch party: {public} code wxyz-2345")
+            d._join()
+            pump(root, 0.1)
+            check("Join takes an invite's address", joined, [public])
+            check("and its code", (d.join_code.get(), ctl.session.code),
+                  ("WXYZ-2345", "WXYZ-2345"))
+            ctl.session.stop_flag.set()
+            pump(root, 0.9)
+            ctl.session = None
         finally:
             engine.HostSession = real_host
     finally:

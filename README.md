@@ -317,8 +317,9 @@ from which audio cannot be reconstructed; a whole film's fingerprint is
 ~56 KB of hashes).
 
 Open the film first, then **Watch party** at the bottom of the main
-window. Both sides set the **Relay server** at the bottom of that window
-(see [Relay server](#relay-server) for running one).
+window. The simplest way to host needs no setting up: leave **Free
+Cloudflare tunnel** ticked and StreamSync runs the relay itself and makes
+it reachable from anywhere (see [Relay server](#relay-server)).
 
 **Host**: choose where the film's position comes from - *What this
 computer hears* (play the film in any player; StreamSync follows it by
@@ -326,10 +327,12 @@ listening) or *This app's player*. Pick your microphone: it is
 fingerprinted continuously so viewers can measure their personal stream
 delay against your voice. A password is optional; the **Delay hint for
 viewers** (10 s by default, 2 to 45 s) stands until each viewer has
-measured their own. **Start hosting**, then share the session code the window shows
-with your viewers.
+measured their own. **Start hosting**, then press **Copy invite** and send
+your viewers the line it copies: the party's address and its code.
 
-**Join**: enter the code (and password), then **Join**. Your file is
+**Join**: paste the host's invite into **Session code** - or type the code,
+with the host's relay under **Relay server** - and the password if there
+is one, then **Join**. Your file is
 verified against the host's hashes first - different bitrates and
 releases are fine (a constant offset is detected and absorbed); a
 different cut or the wrong film is refused with a clear message rather
@@ -338,9 +341,11 @@ than synced wrong. Then playback follows the host's timeline, delayed by
 commentary in your ears - and when the host pauses, your copy pauses at
 the moment the commentary about it reaches you.
 
-While a session runs, the Watch party window shows its code and latest
-status, and **Leave session**; a dot beside the main window's Watch party
-button says one is running.
+While a session runs, the Watch party window shows its code, the address
+viewers come in at with **Copy invite**, its latest status, and **Leave
+session**; a dot beside the main window's Watch party button says one is
+running. The window stays out of the way - beside the main window, and
+the main window's controls keep working while it is open.
 
 Under the hood: both ends sync to internet time (NTP) so "position X at
 time T" means the same instant everywhere - machine clocks are often
@@ -366,43 +371,49 @@ only to that host.
 ### Relay server
 
 A watch party runs through a relay: a small program the host and every
-viewer connect to, which passes the session's messages along. The apps
-do not include one, so someone runs it where both sides can reach it.
-There are two ways.
+viewer connect to, which passes the session's messages along. There are
+three ways to have one.
 
-**No server needed.** The host runs the relay on their own computer and
-a free [Cloudflare quick tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
-makes it reachable from anywhere. No account, nothing to rent, nothing
-to open in a router or firewall.
+**Through a free Cloudflare tunnel - nothing to set up.** Leave **Free
+Cloudflare tunnel** ticked under Host and press **Start hosting**.
+StreamSync runs the relay inside the app, reachable only from this
+computer, and opens a free [Cloudflare quick tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+to it with Cloudflare's `cloudflared`. No account, nothing to rent,
+nothing to open in a router or firewall. A few seconds later the window
+shows the party's address, `wss://some-random-words.trycloudflare.com`,
+beside **Copy invite**.
 
-1. Set up and start the relay as in steps 1 to 3 below, on the host's
-   computer. If Windows asks whether Python may use the network, Cancel
-   is fine: the tunnel reaches the relay from the same computer.
-2. Install `cloudflared` - on a Mac, `brew install cloudflared`; on
-   Windows, the MSI from Cloudflare's
-   [downloads page](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/),
-   which asks for administrator approval and makes the `cloudflared`
-   command work in windows opened after it - and, in a second window, run
+- `cloudflared` is used where it is installed - by Homebrew on a Mac, by
+  Cloudflare's installer on Windows. If it isn't, StreamSync offers to
+  download it from Cloudflare's releases on GitHub (about 20 MB on a Mac,
+  50 MB on Windows) into its own folder, and runs it only once Cloudflare's
+  published checksum and signature check out. Say no, or if the download
+  fails, and the window links to Cloudflare's
+  [download page](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/)
+  instead.
+- The address is new each time you host, and lasts while you do: Leave,
+  or quitting StreamSync, closes the tunnel.
+- This suits a group of friends rather than a large audience: the party
+  is only up while the host's computer is, and a quick tunnel - a free
+  service Cloudflare offers for testing - holds 200 connections at once.
+  The host's own session talks to the relay directly, so all 200 are
+  viewers'. Anyone joining after that is told the party is full, and
+  everyone already in carries on. Bandwidth is not what limits it: 200
+  viewers take about 0.3 Mb/s of the host's upload.
+- Some networks block `cloudflared`; the window then says why it could
+  not open the tunnel, and a relay server is the way round.
 
-   ```
-   cloudflared tunnel --url http://localhost:8765
-   ```
-
-   After a few seconds it prints an address like
-   `https://some-random-words.trycloudflare.com`.
-3. Everyone, host included, pastes that address into **Relay server**.
-   StreamSync connects to the `wss://` address it stands for -
-   `wss://some-random-words.trycloudflare.com` - and the field shows it
-   so once Host or Join is pressed.
-
-Keep both windows open while the party lasts. The address changes every
-time `cloudflared` starts, so share the new one each time. This suits a
-group of friends rather than a large audience: the relay is only up
-while the host's computer is, and a quick tunnel - a free service
-Cloudflare offers for testing - holds 200 connections at once: the
-host's and 199 viewers'. Anyone joining after that is told the party is
-full, and everyone already in carries on. Bandwidth is not what limits
-it: those 199 viewers take about 0.3 Mb/s of the host's upload.
+**A tunnel you run yourself.** The same, by hand. Start the relay as in
+steps 1 to 3 below with `--host 127.0.0.1` (it then listens to this
+computer alone, and no firewall asks about it), and in a second window
+run `cloudflared tunnel --url http://localhost:8765` - install it first:
+on a Mac, `brew install cloudflared`; on Windows, the MSI from
+Cloudflare's download page, which asks for administrator approval and
+makes the command work in windows opened after it. It prints an address
+like `https://some-random-words.trycloudflare.com`: the host unticks
+**Free Cloudflare tunnel**, and everyone, host included, pastes that
+address into **Relay server** (StreamSync connects to the `wss://`
+address it stands for). Keep both windows open while the party lasts.
 
 If the party cannot reach the relay, the message says why when it can
 tell: a certificate that did not verify, say, or a tunnel answering
@@ -448,10 +459,11 @@ slow viewer never holds up the others). On that machine:
 4. Let inbound TCP port 8765 through that machine's firewall - on a VPS
    or AWS, in its firewall rules or security group.
 
-Then the host and every viewer set **Relay server** in the Watch party
-window to `ws://<that machine's address>:8765` - the same address on
-all sides. The default, `ws://localhost:8765`, only reaches a relay
-running on the same computer.
+Then the host unticks **Free Cloudflare tunnel**, and the host and every
+viewer set **Relay server** in the Watch party window to
+`ws://<that machine's address>:8765` - the same address on all sides.
+The default, `ws://localhost:8765`, only reaches a relay running on the
+same computer.
 
 ## macOS setup
 

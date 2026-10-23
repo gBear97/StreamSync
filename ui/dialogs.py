@@ -23,9 +23,11 @@ checking the screens against the boards, at any scale.
 import math
 import tkinter as tk
 from pathlib import Path
+from tkinter import messagebox
 from urllib.parse import urlsplit
 
 import controller
+import hosting
 import session
 from ui import theme, widgets
 from version import __version__
@@ -593,11 +595,18 @@ def relay_address(text):
 
 class WatchPartyDialog(_Dialog):
     """Host and Join side by side, the relay underneath; while a session
-    runs, its code, its latest line and Leave instead.
+    runs, its code, its address with Copy invite, its latest line and
+    Leave instead.
 
     Not modal: a host plays and pauses the film in the main window while
     this shows the code. With the grab it held before, the main window
-    ignored every click until this was closed - and nothing said so."""
+    ignored every click until this was closed - and nothing said so.
+
+    Hosting goes through a free Cloudflare tunnel from this computer unless
+    that is unticked (then: the relay server below). The tunnel opens on a
+    worker thread (app._host_here) and the Host button reads Cancel
+    meanwhile; a missing cloudflared is downloaded only once the user
+    says yes, and otherwise the way to get it is shown."""
 
     slot = "_party"
     width = 680
@@ -635,6 +644,8 @@ class WatchPartyDialog(_Dialog):
         self.src_var = tk.StringVar(win, value="listen")
         self.mic_var = tk.StringVar(win, value=DEFAULT_MIC)
         self.relay_var = tk.StringVar(win, value=app.ctl.relay_url)
+        self.tunnel_var = tk.BooleanVar(win, value=app.ctl.host_via != "relay")
+        self._shown_public = None        # a tunnel's address the relay field shows
 
         outer = _frame(win)
         outer.pack(fill="both", expand=True, padx=px(self.PAD_X), pady=px(self.PAD_Y))
@@ -707,10 +718,21 @@ class WatchPartyDialog(_Dialog):
         self.delay_field.set("10")
         self.delay_field.pack(side="left", padx=(px(8), 0))
         _label(row, "s", fg=theme.MUTED).pack(side="left", padx=(px(8), 0))
+        # ticked: this computer's relay through a quick tunnel; unticked:
+        # the relay server field below the cards
+        self.tunnel_check = widgets.Check(b, "Free Cloudflare tunnel", self.tunnel_var,
+                                          sub="StreamSync runs the relay for you")
+        self.tunnel_check.pack(anchor="w", pady=(px(12), 0))
         self.host_btn = widgets.FlatButton(b, "Start hosting", kind="primary", height=42,
                                            font=theme.font(14, True), command=self._host)
         self.host_btn.pack(side="bottom", fill="x", pady=(px(12), 0))
         self.host_err = _label(b, "", 12, fg=theme.ERROR, wrap=wrap)
+        # the tunnel's progress, or how to get cloudflared by hand
+        self.host_note = _label(b, "", 12, fg=theme.MUTED, wrap=wrap)
+        self.host_link = widgets.FlatButton(b, "Cloudflare's download page", kind="link",
+                                            height=22, font=theme.font(12), padx=0,
+                                            underline=True,
+                                            command=self.app._open_cloudflared_page)
 
         join = widgets.Card(grid, padding=18)
         join.grid(row=0, column=1, sticky="nsew", padx=(px(8), 0))
@@ -743,6 +765,21 @@ class WatchPartyDialog(_Dialog):
                                    width=14, takefocus=0)
         self.code_field.pack(anchor="w", pady=(px(12), 0))
         self.code_field.configure(state="readonly")
+        # where viewers come in, and the line to send them
+        self.addr_row = row = _frame(b)
+        row.pack(fill="x", pady=(px(10), 0))
+        self.invite_btn = widgets.FlatButton(row, "Copy invite", kind="ghost", height=32,
+                                             padx=14, command=self._copy_invite)
+        self.invite_btn.pack(side="right")
+        self.addr_field = tk.Entry(row, font=theme.font(12), fg=theme.MUTED, bg=theme.CARD,
+                                   readonlybackground=theme.CARD, relief="flat", bd=0,
+                                   highlightthickness=0, insertbackground=theme.TEXT,
+                                   takefocus=0)
+        self.addr_field.pack(side="left", fill="x", expand=True, padx=(0, px(10)))
+        self.addr_field.configure(state="readonly")
+        self.addr_note = _label(b, f"A free Cloudflare tunnel from this computer: up to "
+                                   f"{hosting.VIEWERS} viewers, for as long as you host.",
+                                12, fg=theme.MUTED)
         self.session_lbl = _label(b, "", 13, wrap=self.width - 2 * self.PAD_X - 2 * 18 - 2)
         self.session_lbl.pack(anchor="w", fill="x", pady=(px(12), 0))
         self.leave_btn = widgets.FlatButton(b, "Leave session", height=38,
@@ -765,14 +802,29 @@ class WatchPartyDialog(_Dialog):
             self.live_title.config(text="Watching with a host" if viewer else "Hosting")
             self.session_lbl.config(text=app._session_text)
             self.refresh_code()
+            self._show_address()
             return
         self._shown_code = None
+        if self._shown_public is not None:
+            # the tunnel's address went with its party: back to the saved relay
+            if self.relay_var.get() == self._shown_public:
+                self.relay_var.set(app.ctl.relay_url)
+            self._shown_public = None
         film = bool(app.ctl.video_path)
         self.host_text.config(text="Viewers sync their own copies to you. Only your voice is "
                                    "sent." + ("" if film else " Open the film first."))
         state = "normal" if film else "disabled"
-        self.host_btn.config(state=state)
-        self.join_btn.config(state=state)
+        opening = app._hosting_now()
+        if opening:                      # the tunnel is opening: Host reads Cancel
+            self.host_btn.config(text="Cancel", kind="ghost", command=app._cancel_hosting,
+                                 state="normal")
+            self.join_btn.config(state="disabled")
+        else:
+            self.host_btn.config(text="Start hosting", kind="primary", command=self._host,
+                                 state=state)
+            self.join_btn.config(state=state)
+            if self.host_note.winfo_ismapped() and not self.host_link.winfo_ismapped():
+                self._host_feedback()    # progress from a start that ended
 
     def refresh_code(self):
         # A host's code is None until the relay answers, seconds after
@@ -787,11 +839,49 @@ class WatchPartyDialog(_Dialog):
         e.insert(0, code)
         e.configure(state="readonly")
 
+    def _address(self):
+        """Where this party's viewers come in: a tunnel's address, else the
+        relay the session uses."""
+        ctl = self.app.ctl
+        return ctl.public_relay or ctl.relay_url
+
+    def _show_address(self):
+        addr, tunnel = self._address(), self.app.ctl.public_relay is not None
+        e = self.addr_field
+        if e.get() != addr:
+            e.configure(state="normal")
+            e.delete(0, "end")
+            e.insert(0, addr)
+            e.configure(state="readonly")
+        _show(self.addr_note, tunnel, anchor="w", after=self.addr_row, pady=(theme.px(6), 0))
+        if tunnel and self.relay_var.get() != addr:
+            self.relay_var.set(addr)     # the relay field shows it too, read-only
+            self._shown_public = addr
+
     def set_session_text(self, text):
         if self._closed:
             return
         self.session_lbl.config(text=text)
         self.refresh_code()
+
+    def set_host_note(self, text):
+        """The tunnel's progress, under the Host button."""
+        if self._closed:
+            return
+        self._host_feedback(note=text)
+
+    def hosting_failed(self, reason, manual):
+        """The tunnel did not open. `manual`: cloudflared could not be had,
+        so the way to get it by hand goes with the reason."""
+        if self._closed:
+            return
+        self.refresh()
+        self._host_feedback(
+            error=f"Could not host through this computer: {reason}",
+            note=self._MANUAL if manual else None, link=manual)
+
+    _MANUAL = ("Install cloudflared from Cloudflare's download page, then press Start "
+               "hosting again - or untick the tunnel to use a relay server.")
 
     def set_mics(self, names):
         if self._closed:
@@ -808,6 +898,8 @@ class WatchPartyDialog(_Dialog):
     def _upper_code(self, _event=None):
         e = self.join_code.entry
         text = e.get()
+        if "://" in text:
+            return                       # a pasted invite: Join takes it apart
         if text != text.upper():
             at = e.index("insert")
             self.join_code.set(text.upper())
@@ -816,6 +908,25 @@ class WatchPartyDialog(_Dialog):
     def _error(self, lbl, btn, text):
         lbl.config(text=text)
         _show(lbl, bool(text), side="bottom", anchor="w", after=btn, pady=(theme.px(12), 0))
+
+    def _host_feedback(self, note=None, link=False, error=None):
+        """The lines under the Host button, top to bottom: a note (progress,
+        or the way to get cloudflared), the download page's link, an error.
+        Packed from the bottom, so each goes in above the one before."""
+        px = theme.px
+        for w in (self.host_err, self.host_link, self.host_note):
+            w.pack_forget()
+        below = self.host_btn
+        if error:
+            self.host_err.config(text=error)
+            self.host_err.pack(side="bottom", anchor="w", after=below, pady=(px(12), 0))
+            below = self.host_err
+        if link:
+            self.host_link.pack(side="bottom", anchor="w", after=below, pady=(px(4), 0))
+            below = self.host_link
+        if note:
+            self.host_note.config(text=note)
+            self.host_note.pack(side="bottom", anchor="w", after=below, pady=(px(12), 0))
 
     def _relay(self, lbl, btn):
         """The relay address in its field, shown as it will be used - an
@@ -832,7 +943,7 @@ class WatchPartyDialog(_Dialog):
 
     def _host(self):
         app, ctl = self.app, self.app.ctl
-        self._error(self.host_err, self.host_btn, "")
+        self._host_feedback()
         if not ctl.video_path:
             return
         try:
@@ -845,17 +956,22 @@ class WatchPartyDialog(_Dialog):
             self._error(self.host_err, self.host_btn, "2 to 45 seconds")
             return
         self.delay_field.set_error(False)
+        self.relay_field.set_error(False)
+        mic = self.mic_var.get()
+        params = dict(password=self.host_pw.get().strip() or None,
+                      from_player=self.src_var.get() == "player",
+                      mic_name=None if mic == DEFAULT_MIC else (mic or None),
+                      delay_hint=delay,
+                      title=Path(ctl.video_path).stem)
+        ctl.host_via = "tunnel" if self.tunnel_var.get() else "relay"
+        if ctl.host_via == "tunnel":
+            self._host_here(params)
+            return
         relay = self._relay(self.host_err, self.host_btn)
         if relay is None:
             return
-        mic = self.mic_var.get()
         try:
-            ctl.host(relay,
-                     self.host_pw.get().strip() or None,
-                     from_player=self.src_var.get() == "player",
-                     mic_name=None if mic == DEFAULT_MIC else (mic or None),
-                     delay_hint=delay,
-                     title=Path(ctl.video_path).stem)
+            ctl.host(relay, **params)
         except Exception as e:
             self._error(self.host_err, self.host_btn, f"Could not start: {e}")
             return
@@ -863,17 +979,64 @@ class WatchPartyDialog(_Dialog):
         app._save_config()
         self.refresh()
 
+    def _host_here(self, params):
+        """Through a free Cloudflare tunnel from this computer: cloudflared
+        where it is installed, else downloaded once the user says yes, else
+        the way to get it."""
+        app = self.app
+        exe, _version, _own = app.ctl.find_cloudflared()
+        if exe is None and not self._ask_download():
+            self._host_feedback(note="A Cloudflare tunnel needs cloudflared. " + self._MANUAL,
+                                link=True)
+            return
+        app._save_config()               # the tunnel choice
+        app._host_here(params, exe, exe is None)
+        self.refresh()                   # Host reads Cancel
+        self._host_feedback(note="Starting...")
+
+    def _ask_download(self):
+        return messagebox.askokcancel(
+            "StreamSync - Watch party",
+            "Hosting through a free Cloudflare tunnel needs Cloudflare's cloudflared, and it "
+            "isn't on this computer. Download it now?",
+            detail=(f"StreamSync downloads it from Cloudflare's releases on GitHub (about "
+                    f"{hosting.APPROX_MB} MB) into its own folder, and runs it only once "
+                    "Cloudflare's published checksum and signature check out."),
+            icon="question", parent=self.win)
+
+    def _copy_invite(self):
+        """The address and the code, one line to send viewers."""
+        code = getattr(self.app.ctl.session, "code", None)
+        if not code:
+            return                       # the relay has not given one yet
+        text = hosting.invite(self._address(), code)
+        try:
+            self.win.clipboard_clear()
+            self.win.clipboard_append(text)
+        except tk.TclError:
+            return
+        self.invite_btn.config(text="Copied")
+        self.app.root.after(2000, lambda: self._closed or self.invite_btn.config(
+            text="Copy invite"))
+
     def _join(self):
         app, ctl = self.app, self.app.ctl
         self._error(self.join_err, self.join_btn, "")
         if not ctl.video_path:
             return
+        # an invite pasted as the code: its address goes in the relay field
+        given = self.join_code.get().strip()
+        address, code = hosting.parse_invite(given)
+        if address:
+            self.relay_var.set(address)
+        code = code or given.upper()
+        if code != given:
+            self.join_code.set(code)
         relay = self._relay(self.join_err, self.join_btn)
         if relay is None:
             return
         try:
-            ctl.join(relay, self.join_code.get().strip().upper(),
-                     self.join_pw.get().strip() or None, app.mute_var.get())
+            ctl.join(relay, code, self.join_pw.get().strip() or None, app.mute_var.get())
         except Exception as e:
             self._error(self.join_err, self.join_btn, f"Could not start: {e}")
             return
