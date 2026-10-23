@@ -396,9 +396,11 @@ to open in a router or firewall.
 Keep both windows open while the party lasts. The address changes every
 time `cloudflared` starts, so share the new one each time. This suits a
 group of friends rather than a large audience: the relay is only up
-while the host's computer is, and a quick tunnel is a free service
-Cloudflare offers for testing, with a cap on how much it carries at
-once.
+while the host's computer is, and a quick tunnel - a free service
+Cloudflare offers for testing - holds 200 connections at once: the
+host's and 199 viewers'. Anyone joining after that is told the party is
+full, and everyone already in carries on. Bandwidth is not what limits
+it: those 199 viewers take about 0.3 Mb/s of the host's upload.
 
 If the party cannot reach the relay, the message says why when it can
 tell: a certificate that did not verify, say, or a tunnel answering

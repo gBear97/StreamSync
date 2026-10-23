@@ -362,6 +362,13 @@ def _open(url):
                             ssl=ctx).__enter__())
 
 
+# A free Cloudflare quick tunnel holds 200 connections at once - the host's
+# and 199 viewers' (measured 2026-10-22) - and answers the next with 429.
+# That once read "it answered HTTP 429, not as a relay".
+TUNNEL_FULL = ("the party is full - a free Cloudflare tunnel takes about "
+               "200 people at once (HTTP 429)")
+
+
 def _why(exc):
     """What an attempt to open the relay's websocket ran into, in a few
     words for the user - or None when nothing went wrong but that nothing
@@ -382,6 +389,8 @@ def _why(exc):
             return f"it answered HTTP {code}; is the relay behind it running?"
         if code == 530:             # Cloudflare's, for a tunnel that stopped
             return f"it answered HTTP {code}; is its tunnel still running?"
+        if code == 429:             # a quick tunnel's connections are all taken
+            return TUNNEL_FULL
         return f"it answered HTTP {code}, not as a relay"
     if isinstance(exc, InvalidHandshake):
         return "it did not answer as a relay"
@@ -392,7 +401,8 @@ def _connect(url, inbox, hello, ok_types, stop, deadline):
     """Open a Link and send `hello`, retrying with backoff until a reply
     in ok_types arrives. Returns (link, reply); raises RuntimeError with
     the relay's reason if it refuses, or once out of time "could not
-    reach the relay" and what the last attempt ran into (see _why)."""
+    reach the relay" and what the last attempt ran into (see _why) - or,
+    if its tunnel was full, just that the party is full."""
     delay, last = 1.0, None
     while not stop.is_set():
         link, last = None, None
@@ -425,6 +435,8 @@ def _connect(url, inbox, hello, ok_types, stop, deadline):
         stop.wait(delay)
         delay = min(delay * 2, 8.0)
     why = _why(last)
+    if why == TUNNEL_FULL:
+        raise RuntimeError(why)     # it was reached; there is no room
     raise RuntimeError("could not reach the relay"
                        + (f" - {why}" if why else ""))
 
