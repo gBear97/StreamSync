@@ -183,6 +183,10 @@ class Shell(adapter.PlatformAdapter):
         self._show_film(Path(path).name, None)
         self._set_sync_state("none")
         self._show_main_state()
+        if self._party is not None:
+            # it stays open beside the main window now: Host and Join
+            # wait for a film, and this is the film
+            self._party.refresh()
 
         # The length is known before playback starts, so the timeline and
         # the header can show it at once; ffmpeg reads it in a moment.

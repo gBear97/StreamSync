@@ -1077,6 +1077,34 @@ def watch_party(env, root, app):
     check("the host button is live with a film", d.host_btn.cget("state"), "normal")
     shot(root, d.win, "04-watch-party")
 
+    # Not modal: a host plays and pauses in the main window with it open.
+    # With the grab it held, the main window ignored every click until
+    # Watch party was closed (a PC host's Play, 2026-10-22).
+    check("Watch party takes no grab", root.grab_current(), None)
+    d.lift()
+    check("nor when it is brought back to the front", root.grab_current(), None)
+    # beside the main window, not over the film's controls, where there is room
+    from ui import theme as _theme
+    root.update_idletasks()
+    rx, rw = root.winfo_rootx(), root.winfo_width()
+    dx, dw = d.win.winfo_rootx(), d.win.winfo_width()
+    gap, sw = _theme.px(d.GAP), d.win.winfo_screenwidth()
+    if rx + rw + gap + dw <= sw or rx - gap - dw >= 0:
+        check("Watch party opens beside the main window", dx >= rx + rw or dx + dw <= rx,
+              True)
+    else:
+        print(f"  (a {sw}-px screen has no room beside the main window: placement not checked)")
+    # a film opened while it is open turns Host and Join on
+    film = app.ctl.video_path
+    app.ctl.video_path = None
+    d.refresh()
+    check("no film: Host waits for one", d.host_btn.cget("state"), "disabled")
+    app.ctl.video_path = film
+    app._film_loaded(film)
+    pump(root, 0.1)
+    check("a film opened with Watch party open turns Host on",
+          (d.host_btn.cget("state"), d.join_btn.cget("state")), ("normal", "normal"))
+
     # the running view: a host whose code arrives a tick after the start
     session = SimpleNamespace(code=None, stop_flag=threading.Event())
     app.ctl.session = session

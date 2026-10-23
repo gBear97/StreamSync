@@ -73,7 +73,8 @@ CONTRACT = {
                         "before ctl.load_file; a VLCError shows an error and changes nothing. "
                         "Then _film_loaded(path), the status line and a save",
         "_film_loaded": "(path); a film is in: _film_length None, _sync_state 'none', _show_film "
-                        "and _show_main_state; a thread probes the length and posts "
+                        "and _show_main_state, then _party.refresh() if the dialog is "
+                        "open; a thread probes the length and posts "
                         "('film_info', path, seconds)",
         "_on_film_info": "(path, seconds); queue: ignores a stale path, else sets _film_length "
                          "and calls _show_film",
@@ -251,7 +252,9 @@ CONTRACT = {
                                 "None",
         "WatchPartyDialog": "class; the Watch party window",
         "WatchPartyDialog.__init__": "(app); builds it, sets app._party = self before "
-                                     "app._present(win), then starts app._populate_mics()",
+                                     "app._present(win), then starts app._populate_mics(); "
+                                     "no grab, and beside the main window when the "
+                                     "screen has room",
         "WatchPartyDialog.refresh": "(); the idle or the running view, on "
                                     "ctl.session_running()",
         "WatchPartyDialog.refresh_code": "(); the running view's code from ctl.session.code "
@@ -259,8 +262,7 @@ CONTRACT = {
         "WatchPartyDialog.set_session_text": "(text); the running view's latest session line, "
                                              "then refresh_code()",
         "WatchPartyDialog.set_mics": "(names); the microphone choices",
-        "WatchPartyDialog.close": "(); releases the grab, destroys the window, app._party = "
-                                  "None",
+        "WatchPartyDialog.close": "(); destroys the window, app._party = None",
         "UpdateDialog": "class; the Update window",
         "UpdateDialog.__init__": "(app, tag, rel, can_install, unavailable_text); the offer, "
                                  "or why this copy can't install it; sets app._update_dialog "
