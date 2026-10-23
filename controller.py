@@ -661,7 +661,9 @@ class SyncController:
             if not isinstance(e, hosting.Cancelled):
                 diagnostics.log(f"hosting: could not open the tunnel: {e}")
             raise
-        diagnostics.log(f"hosting: relay at {h.local_url}, tunnel at {public}")
+        live = (f"in DNS after {h.dns_seconds:.1f} s" if h.dns_live
+                else f"not in DNS yet after {h.dns_seconds or 0:.0f} s")
+        diagnostics.log(f"hosting: relay at {h.local_url}, tunnel at {public} ({live})")
         return h.local_url, public
 
     def stop_hosting(self):

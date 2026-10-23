@@ -646,6 +646,7 @@ class WatchPartyDialog(_Dialog):
         self.relay_var = tk.StringVar(win, value=app.ctl.relay_url)
         self.tunnel_var = tk.BooleanVar(win, value=app.ctl.host_via != "relay")
         self._shown_public = None        # a tunnel's address the relay field shows
+        self._progress = False           # the Host note is the tunnel's progress
 
         outer = _frame(win)
         outer.pack(fill="both", expand=True, padx=px(self.PAD_X), pady=px(self.PAD_Y))
@@ -803,6 +804,8 @@ class WatchPartyDialog(_Dialog):
             self.session_lbl.config(text=app._session_text)
             self.refresh_code()
             self._show_address()
+            if self._progress:
+                self._host_feedback()    # the tunnel opened: its progress is done
             return
         self._shown_code = None
         if self._shown_public is not None:
@@ -823,7 +826,7 @@ class WatchPartyDialog(_Dialog):
             self.host_btn.config(text="Start hosting", kind="primary", command=self._host,
                                  state=state)
             self.join_btn.config(state=state)
-            if self.host_note.winfo_ismapped() and not self.host_link.winfo_ismapped():
+            if self._progress:
                 self._host_feedback()    # progress from a start that ended
 
     def refresh_code(self):
@@ -869,6 +872,7 @@ class WatchPartyDialog(_Dialog):
         if self._closed:
             return
         self._host_feedback(note=text)
+        self._progress = True
 
     def hosting_failed(self, reason, manual):
         """The tunnel did not open. `manual`: cloudflared could not be had,
@@ -914,6 +918,7 @@ class WatchPartyDialog(_Dialog):
         or the way to get cloudflared), the download page's link, an error.
         Packed from the bottom, so each goes in above the one before."""
         px = theme.px
+        self._progress = False
         for w in (self.host_err, self.host_link, self.host_note):
             w.pack_forget()
         below = self.host_btn
@@ -992,7 +997,7 @@ class WatchPartyDialog(_Dialog):
         app._save_config()               # the tunnel choice
         app._host_here(params, exe, exe is None)
         self.refresh()                   # Host reads Cancel
-        self._host_feedback(note="Starting...")
+        self.set_host_note("Starting...")
 
     def _ask_download(self):
         return messagebox.askokcancel(

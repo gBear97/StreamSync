@@ -429,7 +429,7 @@ class QuickTunnel:
             p.wait(5)
 
 
-def wait_for_name(name, timeout=15.0, cancelled=lambda: False):
+def wait_for_name(name, timeout=20.0, cancelled=lambda: False):
     """True once Cloudflare's DNS has a new tunnel's `name`, else False
     after `timeout`. For a second or so after the tunnel opens, the name
     does not resolve; a viewer who looked it up then would be told "no such
@@ -462,6 +462,7 @@ class Hosting:
         self.relay = LocalRelay()
         self.tunnel = None
         self.local_url = self.public_url = None
+        self.dns_live, self.dns_seconds = None, None   # how the address went live
         self.on_down = None          # the tunnel ended by itself, mid-party
         self._cancelled = threading.Event()
 
@@ -487,7 +488,9 @@ class Hosting:
             raise
         self._check()
         say("Waiting for the address to go live...")
-        wait_for_name(url[len("https://"):], cancelled=lambda: self.cancelled)
+        t0 = time.monotonic()
+        self.dns_live = wait_for_name(url[len("https://"):], cancelled=lambda: self.cancelled)
+        self.dns_seconds = time.monotonic() - t0
         self._check()
         self.public_url = "wss://" + url[len("https://"):]
         return self.public_url

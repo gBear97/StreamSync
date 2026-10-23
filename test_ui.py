@@ -1287,6 +1287,11 @@ def watch_party(env, root, app):
                 check("Leave closes the tunnel", (h.cancelled, ctl.hosting), (True, None))
                 check("and the relay field has the saved relay back", d.relay_var.get(),
                       "ws://203.0.113.7:8765")
+                # its progress went with it (a live run left "Waiting for the
+                # address to go live..." under Start hosting)
+                check("no progress note is left after the party",
+                      (d.host_note.winfo_manager(), d.host_btn.cget("text")),
+                      ("", "Start hosting"))
 
                 def slow_open(h, exe, download, say):
                     deadline = time.monotonic() + 10
