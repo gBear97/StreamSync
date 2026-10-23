@@ -492,6 +492,13 @@ try:
         check(f"a web server answering {status}",
               gives_up(f"ws://127.0.0.1:{web.server_port}"),
               f"{REACH} - {want}")
+    # A quick tunnel whose 200 connections are taken answers 429. The relay
+    # was reached, so not "could not reach" - just that the party is full.
+    Answers.status = 429
+    check("a full quick tunnel (429)",
+          gives_up(f"ws://127.0.0.1:{web.server_port}"),
+          "the party is full - a free Cloudflare tunnel takes about 200 people "
+          "at once (HTTP 429)")
     # wss:// to something that does not speak TLS - a plain relay, say
     check("wss:// to a plain server",
           gives_up(f"wss://127.0.0.1:{web.server_port}"),
