@@ -274,7 +274,8 @@ CONTRACT = {
         "WatchPartyDialog.refresh": "(); the idle or the running view, on "
                                     "ctl.session_running()",
         "WatchPartyDialog.refresh_code": "(); the running view's code from ctl.session.code "
-                                         "('…' until there is one); writes only on a change",
+                                         "('…' until there is one, Copy invite disabled "
+                                         "till then); writes only on a change",
         "WatchPartyDialog.set_session_text": "(text); the running view's latest session line, "
                                              "then refresh_code()",
         "WatchPartyDialog.set_mics": "(names); the microphone choices",

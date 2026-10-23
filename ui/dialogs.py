@@ -830,9 +830,11 @@ class WatchPartyDialog(_Dialog):
                 self._host_feedback()    # progress from a start that ended
 
     def refresh_code(self):
-        # A host's code is None until the relay answers, seconds after
-        # the start; a viewer's is known from the start.
-        code = getattr(self.app.ctl.session, "code", None) or "…"
+        # A host's code is None until the relay answers, after the film's
+        # fingerprint (half a minute for a big file); a viewer's is known
+        # from the start.
+        real = getattr(self.app.ctl.session, "code", None)
+        code = real or "…"
         if code == self._shown_code or self._closed:
             return
         self._shown_code = code
@@ -841,6 +843,9 @@ class WatchPartyDialog(_Dialog):
         e.delete(0, "end")
         e.insert(0, code)
         e.configure(state="readonly")
+        # No invite before the code: a click that copied nothing would leave
+        # whatever the clipboard held, to be pasted to friends as the invite.
+        self.invite_btn.config(state="normal" if real else "disabled")
 
     def _address(self):
         """Where this party's viewers come in: a tunnel's address, else the

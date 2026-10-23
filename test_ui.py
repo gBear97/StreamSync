@@ -1273,13 +1273,17 @@ def watch_party(env, root, app):
                 check("the saved relay is not the tunnel's", saved(), "ws://203.0.113.7:8765")
                 check("the tunnel choice is saved",
                       json.loads(env.config.read_text()).get("host_via"), "tunnel")
+                # the film's fingerprint comes first: no code, so no invite yet
+                check("no Copy invite before the code", d.invite_btn.cget("state"),
+                      "disabled")
                 ctl.session.code = "ABCD-EFGH"
+                d.set_session_text("Session live - code ABCD-EFGH. Waiting for viewers.")
+                check("Copy invite once the code is in", d.invite_btn.cget("state"), "normal")
                 d._copy_invite()
                 pump(root, 0.1)
                 check("Copy invite copies the address and the code", root.clipboard_get(),
                       f"StreamSync watch party: {public} code ABCD-EFGH")
                 check("and says so", d.invite_btn.cget("text"), "Copied")
-                d.refresh_code()
                 shot(root, d.win, "05-watch-party-hosting-here")
                 h = ctl.hosting
                 app._leave_session()
