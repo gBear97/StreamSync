@@ -76,6 +76,10 @@ class Adapter(adapter.PlatformAdapter):
     FOCUS_FILM_ON_FULLSCREEN = True
     OVERLAYS_PER_FULLSCREEN = True
     WITHDRAW_FILM_FOR_EXTERNAL = False
+    # Watch party stays transient here: macOS has nothing like Windows'
+    # hand-over of the foreground to an owned window, and the Mac never
+    # showed one
+    PARTY_TRANSIENT = True
     MENU_BUTTONS = ("<Button-3>", "<Button-2>", "<Control-Button-1>")
     SIDEWAYS_WHEEL = ("<Shift-MouseWheel>",)
     WHEEL_UNIT = 60

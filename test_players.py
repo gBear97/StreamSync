@@ -19,17 +19,26 @@ flags - with fakes that record the calls, and the embedded player's frame
 rate and its exact step while paused (the fullscreen bar's +-1 frame).
 And external VLC's time, length and play state come from its poller,
 not from HTTP on the reading (Tk) thread, even while VLC hangs.
+
+Last, a film that has never played, as a watch party meets it: paused at
+a host's position (libvlc 3 ignores a seek until a film has played), and
+at its start for a host - over a fake of libvlc 3's first play, and on
+real libvlc where VLC is installed (Windows CI, a Mac with VLC.app).
 """
 
 import os
 import pathlib
 import random
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import types
 
 import players
+
+REAL_VLC = players.vlc     # the tests below put a fake in its place
 
 
 class FakeMP:
@@ -757,6 +766,272 @@ def paused_nudge():
     print("paused nudge: clamped at 0; nothing at all before playback")
 
 
+class Libvlc3MP:
+    """libvlc 3's media player around a film's first play, as measured on
+    3.0.23 (2026-10-24): a film loaded and not played, or stopped, reads
+    get_time() -1 and ignores set_time(); play() opens it and it plays a
+    moment later; a gone film goes Opening -> Ended in a few hundredths of
+    a second instead of Error, and play() on an ended player does
+    nothing; set_pause(1) lands a moment later, and a paused player takes
+    a seek at once. `log` keeps the calls and state changes in order,
+    each with the mute at the time."""
+
+    def __init__(self, opens_after=0.1, gone=False, state=None, pos=0.0):
+        self.state = state or FAKE_VLC.State.NothingSpecial
+        self.opens_after, self.gone = opens_after, gone
+        self.began = self.pause_due = self.ran_from = None
+        self.pos = pos                     # where the film is, while not running
+        self.muted = False
+        self.log = []
+
+    def _note(self, what, value=None):
+        self.log.append((what, value, self.muted))
+
+    def _now_pos(self):
+        if self.ran_from is None:
+            return self.pos
+        return self.pos + (time.perf_counter() - self.ran_from)
+
+    def _tick(self):
+        S, now = FAKE_VLC.State, time.perf_counter()
+        if self.state == S.Opening:
+            if self.gone and now - self.began > 0.03:
+                self.state = S.Ended
+                self._note("state", S.Ended)
+            elif not self.gone and now - self.began >= self.opens_after:
+                self.state, self.ran_from = S.Playing, now
+                self._note("state", S.Playing)
+        if self.pause_due is not None and now >= self.pause_due:
+            self.pos, self.ran_from, self.pause_due = self._now_pos(), None, None
+            self.state = S.Paused
+            self._note("state", S.Paused)
+
+    def event_manager(self):
+        return types.SimpleNamespace(event_attach=lambda *a: None)
+
+    def get_state(self):
+        self._tick()
+        return self.state
+
+    def is_playing(self):
+        return self.get_state() == FAKE_VLC.State.Playing
+
+    def get_time(self):
+        S = FAKE_VLC.State
+        state = self.get_state()
+        if state in (S.NothingSpecial, S.Stopped):
+            return -1
+        return 0 if state == S.Opening else int(round(self._now_pos() * 1000))
+
+    def play(self):
+        S = FAKE_VLC.State
+        self._note("play", self.get_state())
+        if self.state == S.Paused:
+            self.state, self.ran_from = S.Playing, time.perf_counter()
+        elif self.state in (S.NothingSpecial, S.Stopped):
+            self.state, self.began, self.pos = S.Opening, time.perf_counter(), 0.0
+        # Ended (or Error): nothing at all, as libvlc 3
+
+    def set_pause(self, flag):
+        self._note("set_pause", flag)
+        if flag and self.get_state() == FAKE_VLC.State.Playing:
+            self.pause_due = time.perf_counter() + 0.02
+
+    def set_time(self, ms):
+        self._note("set_time", ms)
+        if self.pause_due is not None:
+            # libvlc's input thread takes its controls in order: a seek
+            # sent after a pause lands on the paused film
+            self.pause_due = time.perf_counter()
+        if self.get_state() in (FAKE_VLC.State.Playing, FAKE_VLC.State.Paused):
+            self.pos = ms / 1000.0
+            if self.ran_from is not None:
+                self.ran_from = time.perf_counter()
+        # not started, stopped or ended: ignored
+
+    def stop(self):
+        self._note("stop")
+        self.state, self.pos = FAKE_VLC.State.Stopped, 0.0
+        self.began = self.pause_due = self.ran_from = None
+
+    def audio_set_mute(self, flag):
+        self.muted = bool(flag)
+        self._note("mute", self.muted)
+
+    def audio_get_mute(self):
+        return int(self.muted)
+
+    def set_rate(self, rate):
+        pass
+
+    def heard(self):
+        """Whether the film ever ran with its sound on: a Playing state
+        reached, or left, while unmuted."""
+        return any(what == "state" and value == FAKE_VLC.State.Playing and not muted
+                   for what, value, muted in self.log)
+
+    def calls(self, *names):
+        return [(what, value) for what, value, _m in self.log if what in names]
+
+
+def paused_start():
+    """A viewer whose film has never played, joining a paused host, sat at
+    0:00: libvlc 3 ignores a seek until the film has played, so the old
+    pause() and seek() did nothing. pause_at starts the film muted, pauses
+    it as soon as it plays, then seeks - and gives the user's mute back
+    once it has paused. A film that is already going is paused and seeked
+    as before; a gone film fails as a sync does; an ended one is stopped
+    first. And a host's film that has not played is at its start."""
+    S = FAKE_VLC.State
+    saved = players.vlc
+    players.vlc = FAKE_VLC
+
+    def player(mp, muted=False):
+        p = players.EmbeddedPlayer._around(None, mp)
+        p.has_media = True
+        p.set_mute(muted)
+        return p
+
+    try:
+        # never played: started muted, paused, then the seek - which sticks
+        mp = Libvlc3MP(opens_after=0.15)
+        p = player(mp)
+        assert p.clock_state()[:2] == (0.0, False), p.clock_state()
+        began = time.perf_counter()
+        p.pause_at(37.3)
+        took = time.perf_counter() - began
+        time.sleep(0.2)
+        assert (mp.get_state(), mp.get_time()) == (S.Paused, 37300), \
+            (mp.get_state(), mp.get_time())
+        assert mp.calls("play", "set_pause", "set_time") == [
+            ("play", S.NothingSpecial), ("set_pause", 1), ("set_time", 37300)], mp.log
+        assert not mp.heard() and mp.muted is False, mp.log
+        paused = [i for i, (w, v, _m) in enumerate(mp.log) if (w, v) == ("state", S.Paused)]
+        unmuted = [i for i, (w, v, _m) in enumerate(mp.log) if (w, v) == ("mute", False)]
+        assert paused and unmuted[-1] > paused[0], mp.log   # sound back once paused
+        assert p.time() == 37.3 and p.clock_state()[:2] == (37.3, False)
+        print(f"never played: pause_at(37.3) started it muted, paused it and "
+              f"seeked in {took:.2f} s; it shows 37.3 s, sound back as it was")
+
+        # a viewer who keeps the film muted stays muted
+        mp = Libvlc3MP()
+        player(mp, muted=True).pause_at(12.0)
+        assert mp.get_time() == 12000 and mp.muted is True, mp.log
+
+        # paused already, or playing: no start, just the pause and the seek
+        mp = Libvlc3MP(state=S.Paused, pos=10.0)
+        player(mp).pause_at(30.0)
+        assert mp.calls("play", "mute") == [("mute", False)], mp.log
+        assert mp.get_time() == 30000, mp.get_time()
+        mp = Libvlc3MP(state=S.Playing, pos=10.0)
+        mp.ran_from = time.perf_counter()
+        p = player(mp)
+        p.pause_at(30.0)
+        time.sleep(0.05)
+        assert mp.calls("play", "set_pause", "set_time") == [
+            ("set_pause", 1), ("set_time", 30000)], mp.log
+        assert (mp.get_state(), mp.get_time()) == (S.Paused, 30000)
+        print("paused or playing already: paused and seeked, nothing started")
+
+        # gone: fails as a sync does, in about a second, sound given back
+        mp = Libvlc3MP(gone=True)
+        p = player(mp)
+        began = time.perf_counter()
+        try:
+            p.pause_at(30.0)
+            raise AssertionError("a gone film was paused at 30 s")
+        except players.VLCError as e:
+            assert "could not play" in str(e), e
+        assert time.perf_counter() - began < 1.6, time.perf_counter() - began
+        assert mp.muted is False and not mp.calls("set_time"), mp.log
+
+        # ended (played to its end): play() alone would do nothing
+        mp = Libvlc3MP(opens_after=0.0, state=S.Ended, pos=5400.0)
+        player(mp).pause_at(12.5)
+        assert mp.calls("stop", "play")[:2] == [("stop", None), ("play", S.Stopped)], mp.log
+        assert (mp.get_state(), mp.get_time()) == (S.Paused, 12500), mp.log
+        print("a gone film fails in about a second; an ended one is stopped, "
+              "then started")
+
+        # a host's film: at its start until it plays, stopped likewise;
+        # what libvlc cannot place stays None
+        mp = Libvlc3MP(state=S.Stopped)
+        assert player(mp).clock_state()[:2] == (0.0, False)
+        q = players.EmbeddedPlayer._around(None, Libvlc3MP())
+        assert q.clock_state()[:2] == (None, False), "no film, yet a position"
+        try:
+            q.pause_at(3.0)
+            raise AssertionError("paused a player with no film")
+        except players.VLCError as e:
+            assert "No video file" in str(e), e
+        print("host: a loaded film that has not played, or was stopped, is "
+              "at 0:00, paused; with no film there is no position")
+    finally:
+        players.vlc = saved
+
+
+def _film(path, seconds=60):
+    """A small film with a moving picture and a tone, made with the ffmpeg
+    the app already ships with (imageio-ffmpeg)."""
+    import imageio_ffmpeg
+    subprocess.run(
+        [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", f"testsrc=size=160x120:rate=25:duration={seconds}",
+         "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
+         "-c:v", "mpeg4", "-g", "250", "-c:a", "aac", "-shortest", path],
+        check=True, capture_output=True)
+
+
+def real_paused_start():
+    """paused_start on real libvlc: a film made here and never played is
+    paused at 37.3 s - mid-GOP - shows 37.3 s and plays on from there; a
+    gone film fails within a couple of seconds; a loaded film that has not
+    played is at 0:00 for a host. Dummy audio and video outputs: nothing
+    shows or sounds, and no sound card is needed."""
+    if REAL_VLC is None:
+        print("SKIPPED real libvlc: VLC is not installed here")
+        return
+    saved = players.vlc
+    players.vlc = REAL_VLC
+    try:
+        inst = REAL_VLC.Instance("--aout=dummy", "--vout=dummy", "--quiet")
+        if inst is None:
+            print("SKIPPED real libvlc: no instance (VLC's plugins not found)")
+            return
+        folder = tempfile.mkdtemp(prefix="streamsync-players-")
+        film = os.path.join(folder, "film.mp4")
+        _film(film)
+        p = players.EmbeddedPlayer._around(inst, inst.media_player_new())
+        p.load(film)
+        assert p.clock_state()[:2] == (0.0, False), p.clock_state()
+        p.pause_at(37.3)
+        time.sleep(0.3)
+        state, at = p.mp.get_state(), p.time()
+        assert state == REAL_VLC.State.Paused and abs(at - 37.3) < 0.05, (state, at)
+        assert p.clock_state()[:2] == (at, False), p.clock_state()
+        p.ensure_playing()
+        time.sleep(0.6)
+        later = p.time()
+        assert 37.4 < later < 38.6, later
+        p.stop()
+        print(f"real libvlc {REAL_VLC.libvlc_get_version().decode()}: never played, "
+              f"paused at {at:.2f} s, played on to {later:.2f} s")
+
+        gone = players.EmbeddedPlayer._around(inst, inst.media_player_new())
+        gone.load(os.path.join(folder, "gone.mp4"))
+        began = time.perf_counter()
+        try:
+            gone.pause_at(5.0)
+            raise AssertionError("a gone film was paused at 5 s")
+        except players.VLCError as e:
+            assert "could not play" in str(e), e
+        took = time.perf_counter() - began
+        assert took < 3.0, took
+        print(f"real libvlc: a gone film fails in {took:.1f} s")
+    finally:
+        players.vlc = saved
+
+
 def main():
     # 1. the clock: dated position vs truth, despite stale, late events
     p, mp = make()
@@ -830,6 +1105,11 @@ def main():
 
     # 9. embedded: a paused nudge is an exact seek
     paused_nudge()
+
+    # 10. a film that has never played: paused at a host's position, and
+    # at its start for a host - libvlc 3 as measured, then real libvlc
+    paused_start()
+    real_paused_start()
     print("PLAYERS TEST PASSED")
 
 

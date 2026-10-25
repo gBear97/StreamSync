@@ -43,6 +43,15 @@ class PlatformAdapter:
     # Hide the built-in player's film window on a switch to the VLC app.
     # The Mac has always kept it up.
     WITHDRAW_FILM_FOR_EXTERNAL = True
+    # Make the Watch party window transient to the main window. Not on
+    # Windows: there that makes it a window the main window owns, which
+    # Windows keeps just above it, and when the window in front of
+    # StreamSync goes away Windows hands the foreground to the next one
+    # down - Watch party, not the main window, and the keys went with it
+    # (on the PC, 1-3 s at a time after clicks in the main window and a
+    # second launch's hand-off, 2026-10-22). Settings and Update stay
+    # transient: they hold the grab while they are open.
+    PARTY_TRANSIENT = False
     # The mouse buttons that open the film menu. Aqua's right button is
     # Button-2, and a one-button mouse sends Control-click.
     MENU_BUTTONS = ("<Button-3>",)

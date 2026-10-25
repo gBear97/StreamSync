@@ -266,7 +266,12 @@ def download_verified(asset, release, dest_dir, progress=None):
 
 # Runs after we exit, so nothing swaps a bundle that is still open. Keeps
 # the old app until the new one is in place, and puts it back if not.
+# It deletes itself first: sh reads on from the file it already has open,
+# so every way out of it - swapped, put back or failed - leaves nothing in
+# the temp folder, where each update left one before (sweep_downloads
+# clears those).
 _SWAP = r"""#!/bin/sh
+rm -f -- "$0"
 PID="$1"; APP="$2"; NEW="$3"; OLD="$APP.old"
 i=0
 while kill -0 "$PID" 2>/dev/null && [ $i -lt 150 ]; do
@@ -462,8 +467,11 @@ def install_and_relaunch_windows(setup_path):
 # has quit, so the app cannot remove it then, and nothing else ever did:
 # every update on the PC left its 44 MB installer behind. The Mac removes
 # its disk image as it installs, but leaves the folder of an update that
-# never got that far. So each launch clears them all away.
+# never got that far. So each launch clears them all away - and the Mac's
+# swap scripts (_SWAP), one of which every update left there until the
+# script learned to delete itself.
 DOWNLOAD_PREFIX = "streamsync-dl-"
+SWAP_PREFIX, SWAP_SUFFIX = "streamsync-swap-", ".sh"
 # A launch that an update started begins while that update's installer
 # is still running - it starts the new version, then finishes - and
 # Windows will not delete a program while it runs. So a folder that will
@@ -516,19 +524,46 @@ def old_downloads(root=None):
     return sorted(found)
 
 
+def old_swap_scripts(root=None):
+    """The Mac's update swap scripts directly in the temp folder (or in
+    `root`): plain files named streamsync-swap-*.sh - not a folder or a
+    link of that name."""
+    found = []
+    with os.scandir(root or tempfile.gettempdir()) as entries:
+        for entry in entries:
+            if (entry.name.startswith(SWAP_PREFIX) and entry.name.endswith(SWAP_SUFFIX)
+                    and entry.is_file(follow_symlinks=False)):
+                found.append(entry.path)
+    return sorted(found)
+
+
 def sweep_downloads(root=None, tries=SWEEP_TRIES, every=SWEEP_EVERY,
                     remove=shutil.rmtree, sleep=time.sleep):
-    """Remove the update downloads in the temp folder (or in `root`).
+    """Remove the update downloads in the temp folder (or in `root`), and
+    the Mac's swap scripts left there.
 
     Only the folders that are there as it starts are ever removed. An
     update this same launch downloads while it is still trying again gets
     a folder of its own, made later, and that one is never touched.
-    Returns (removed, size, left): the folders removed, how many bytes
-    they held, and those still there after the last try.
+    Swap scripts are removed once, first: nothing holds one, and a script
+    still running reads on from the file it has open. Returns (removed,
+    size, left): the folders and scripts removed, how many bytes they
+    held, and those still there after the last try.
     """
     # Fixed here, once: a folder that appears after this is never looked at.
     pending = {path: _folder_bytes(path) for path in old_downloads(root)}
-    removed, size = [], 0
+    removed, size, stuck = [], 0, []
+    for path in old_swap_scripts(root):
+        try:
+            held = os.lstat(path).st_size
+            os.unlink(path)
+        except FileNotFoundError:
+            continue             # gone already: not ours to count
+        except OSError:
+            stuck.append(path)
+            continue
+        removed.append(path)
+        size += held
     for attempt in range(tries):
         if attempt:
             sleep(every)
@@ -547,11 +582,20 @@ def sweep_downloads(root=None, tries=SWEEP_TRIES, every=SWEEP_EVERY,
                 size += pending.pop(path)
         if not pending:
             break
-    return removed, size, sorted(pending)
+    return removed, size, sorted(stuck + list(pending))
 
 
-def _downloads(n):
-    return f"{n} old update download{'' if n == 1 else 's'}"
+def _downloads(paths):
+    """What `paths` are, in a few words: '2 old update downloads', '1 old
+    swap script', or both."""
+    scripts = sum(1 for p in paths if os.path.basename(p).startswith(SWAP_PREFIX))
+    folders = len(paths) - scripts
+    said = []
+    if folders:
+        said.append(f"{folders} old update download{'' if folders == 1 else 's'}")
+    if scripts:
+        said.append(f"{scripts} old swap script{'' if scripts == 1 else 's'}")
+    return " and ".join(said)
 
 
 def start_sweep(log, **kw):
@@ -567,10 +611,13 @@ def start_sweep(log, **kw):
             log(f"could not clear old update downloads: {e!r}")
             return
         if removed:
-            log(f"removed {_downloads(len(removed))} "
-                f"({size / (1 << 20):.0f} MB)")
+            # a script's few hundred bytes are not worth a size of their own
+            downloads = any(not os.path.basename(p).startswith(SWAP_PREFIX)
+                            for p in removed)
+            log(f"removed {_downloads(removed)}"
+                + (f" ({size / (1 << 20):.0f} MB)" if downloads else ""))
         if left:
-            log(f"could not remove {_downloads(len(left))}; the next launch "
+            log(f"could not remove {_downloads(left)}; the next launch "
                 "tries again")
 
     thread = threading.Thread(target=work, name="update-sweep", daemon=True)

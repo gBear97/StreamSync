@@ -101,7 +101,10 @@ class _Dialog:
     width = 600                          # design px
     modal = True                         # holds the grab while open
 
-    def _open(self, app, title):
+    def _open(self, app, title, transient=True):
+        """The dialog's window, withdrawn. `transient`: owned by the main
+        window (see PlatformAdapter.PARTY_TRANSIENT for the one that may
+        not be)."""
         self.app = app
         self._closed = False
         self._prev_grab = None
@@ -110,7 +113,8 @@ class _Dialog:
         win.title(title)
         win.configure(bg=theme.GROUND)
         win.resizable(False, False)
-        win.transient(app.root)
+        if transient:
+            win.transient(app.root)
         return win
 
     def _show_built(self):
@@ -637,11 +641,17 @@ class WatchPartyDialog(_Dialog):
             super()._place()
 
     def __init__(self, app):
-        win = self._open(app, "StreamSync - Watch party")
+        win = self._open(app, "StreamSync - Watch party", transient=app.PARTY_TRANSIENT)
         px = theme.px
         self._mics = []
         self._shown_code = None
-        self.src_var = tk.StringVar(win, value="listen")
+        self._ended_seen = None          # the ended session whose last line is shown
+        # "Film position from" as it was last picked, here or in a window
+        # before this one: it went back to "What this computer hears" each
+        # time the window was made again. ctl saves it with the settings.
+        self.src_var = tk.StringVar(win, value=app.ctl.position_from)
+        self.src_var.trace_add("write", lambda *a: setattr(app.ctl, "position_from",
+                                                           self.src_var.get()))
         self.mic_var = tk.StringVar(win, value=DEFAULT_MIC)
         self.relay_var = tk.StringVar(win, value=app.ctl.relay_url)
         self.tunnel_var = tk.BooleanVar(win, value=app.ctl.host_via != "relay")
@@ -677,9 +687,17 @@ class WatchPartyDialog(_Dialog):
 
         win.protocol("WM_DELETE_WINDOW", self.close)
         win.bind("<Escape>", lambda e: self.close())
+        # the session code as it was left - after a join that failed, say,
+        # and the window closed (close() keeps it on the app)
+        self.join_code.set(app._party_code)
         self.refresh()
         self._show_built()
         app._populate_mics()
+
+    def close(self):
+        if not self._closed:
+            self.app._party_code = self.join_code.get()
+        super().close()
 
     def _build_idle(self, parent, col_w):
         px = theme.px
@@ -804,8 +822,10 @@ class WatchPartyDialog(_Dialog):
             self.session_lbl.config(text=app._session_text)
             self.refresh_code()
             self._show_address()
-            if self._progress:
-                self._host_feedback()    # the tunnel opened: its progress is done
+            # the tunnel's progress is done, and what went wrong before is
+            # past: none of it is left under the buttons after this party
+            self._host_feedback()
+            self._error(self.join_err, self.join_btn, "")
             return
         self._shown_code = None
         if self._shown_public is not None:
@@ -828,6 +848,26 @@ class WatchPartyDialog(_Dialog):
             self.join_btn.config(state=state)
             if self._progress:
                 self._host_feedback()    # progress from a start that ended
+        self._show_ended()
+
+    def _show_ended(self):
+        """Why a session ended by itself - a join refused, a copy that did
+        not verify, the relay gone - under the button that would start the
+        next one. It used to show only in the main window: this view took
+        over from the running view, and the line went with it. Once per
+        session, so it does not come back over what a press says later.
+        Leave clears ctl.session, so a session that is left says nothing."""
+        sess = self.app.ctl.session
+        if sess is None or sess is self._ended_seen:
+            return
+        self._ended_seen = sess
+        why = getattr(sess, "last_said", "")
+        if not why:
+            return
+        if isinstance(sess, session.ViewerSession):
+            self._error(self.join_err, self.join_btn, why)
+        else:
+            self._host_feedback(error=why)
 
     def refresh_code(self):
         # A host's code is None until the relay answers, after the film's
@@ -1269,6 +1309,9 @@ def _gallery(argv=None):
 
     class Ctl:
         relay_url = "ws://localhost:8765"
+        host_via = "tunnel"
+        public_relay = None
+        position_from = "listen"
         auto_interval = 30
         video_path = "film.mkv"
         session = None
@@ -1298,9 +1341,10 @@ def _gallery(argv=None):
             self.ctl = Ctl()
             for name in ("NAME", "STREAM_LABEL", "STREAM_AUTO_LABEL", "LISTEN_HELP",
                          "DEFAULT_DEVICE_NOTE", "UPDATE_UNAVAILABLE",
-                         "REFRESH_STREAMS_ON_SETTINGS"):
+                         "REFRESH_STREAMS_ON_SETTINGS", "PARTY_TRANSIENT"):
                 setattr(self, name, getattr(A, name))
             self._settings = self._party = self._update_dialog = None
+            self._party_code = ""
             self._device_items = ["(default) Speakers", "Speakers", "Headphones"]
             self._stream_choices = ["Twitch - a stream - Browser", "Kick - another - Browser"]
             self._session_text = "Session live - code K7QX. Waiting for viewers."

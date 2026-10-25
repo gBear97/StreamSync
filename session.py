@@ -506,6 +506,7 @@ class HostSession:
         self.inbox = queue.Queue()
         self.tracker = ListenTracker()
         self._monitors = []
+        self.last_said = ""       # see _say
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -542,6 +543,10 @@ class HostSession:
             m.stop()
 
     def _say(self, text):
+        # Set before it is queued, and so before the stop flag of a
+        # session that ends: the window reads why it ended from here once
+        # the flag is up, where the queue may not have delivered it yet.
+        self.last_said = text
         self.events.put(("session", text))
 
     def _send(self, obj):
@@ -773,6 +778,7 @@ class ViewerSession:
         self._refused = None      # the relay's reason for turning us away
         self._monitor = None
         self._wake = threading.Event()   # a host state came, or the session ended
+        self.last_said = ""       # see _say
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -802,6 +808,7 @@ class ViewerSession:
             self._monitor.stop()
 
     def _say(self, text):
+        self.last_said = text     # before it is queued: see HostSession._say
         self.events.put(("session", text))
 
     def effective_delay(self):
@@ -937,11 +944,13 @@ class ViewerSession:
                         # film too, not only once they play again. It is
                         # the host's position that is watched: this
                         # viewer's own nudges move `target`, and the
-                        # player has made those already.
+                        # player has made those already. pause_at starts
+                        # a film that has never played first: libvlc
+                        # ignores a seek until then, and a viewer who
+                        # joined a paused host sat at 0:00.
                         if (was_playing is not False or paused_host is None
                                 or abs(host_pos - paused_host) > DRIFT_TOLERANCE):
-                            self.player.pause()
-                            self.player.seek(target)
+                            self.player.pause_at(target)
                             paused_host = host_pos
                         was_playing = False
                 except Exception as e:

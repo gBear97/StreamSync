@@ -269,10 +269,14 @@ CONTRACT = {
         "WatchPartyDialog": "class; the Watch party window",
         "WatchPartyDialog.__init__": "(app); builds it, sets app._party = self before "
                                      "app._present(win), then starts app._populate_mics(); "
-                                     "no grab, and beside the main window when the "
-                                     "screen has room",
+                                     "no grab, beside the main window when the screen "
+                                     "has room, transient only if app.PARTY_TRANSIENT; "
+                                     "Join's code from app._party_code and Film position "
+                                     "from ctl.position_from, which follows its changes",
         "WatchPartyDialog.refresh": "(); the idle or the running view, on "
-                                    "ctl.session_running()",
+                                    "ctl.session_running(); in the idle view, why a "
+                                    "session that ended by itself ended (its last_said), "
+                                    "once, under Join or Host",
         "WatchPartyDialog.refresh_code": "(); the running view's code from ctl.session.code "
                                          "('…' until there is one, Copy invite disabled "
                                          "till then); writes only on a change",
@@ -282,7 +286,8 @@ CONTRACT = {
         "WatchPartyDialog.set_host_note": "(text); the tunnel's progress under the Host button",
         "WatchPartyDialog.hosting_failed": "(reason, manual); the reason under the Host button, "
                                            "with the way to get cloudflared by hand if manual",
-        "WatchPartyDialog.close": "(); destroys the window, app._party = None",
+        "WatchPartyDialog.close": "(); Join's code to app._party_code, then destroys the "
+                                  "window, app._party = None",
         "UpdateDialog": "class; the Update window",
         "UpdateDialog.__init__": "(app, tag, rel, can_install, unavailable_text); the offer, "
                                  "or why this copy can't install it; sets app._update_dialog "
@@ -303,8 +308,8 @@ STATE = {
     "ui/shell.py": (
         "root", "q", "ctl", "embedded", "fullscreen", "_swapped", "_was_fullscreen",
         "_closing", "_exit_hard", "stream_window", "_stream_choices", "_device_items",
-        "_sync_state", "_synced_at", "_party_live", "_session_text", "_film_length", "_pos",
-        "_settings", "_party", "_update_dialog",
+        "_sync_state", "_synced_at", "_party_live", "_session_text", "_party_code",
+        "_film_length", "_pos", "_settings", "_party", "_update_dialog",
         "player_var", "mute_var", "auto_var", "follow_var", "interval_var", "swap_var",
         "device_var", "stream_var", "hint_var", "check_updates_var",
     ),

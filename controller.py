@@ -122,6 +122,7 @@ class SyncController:
         self.auto_interval = 30
         self.relay_url = "ws://localhost:8765"
         self.host_via = "tunnel"     # "tunnel": host through this computer; "relay": relay_url
+        self.position_from = "listen"  # a host's film position: "listen" (heard) or "player"
         self.hosting = None          # hosting.Hosting while hosting through this computer
         self.public_relay = None     # the address viewers use then (wss://….trycloudflare.com)
         self._ended_hosting = []     # Hostings stopped or stopping, for close() to make sure of
@@ -742,6 +743,7 @@ class SyncController:
             "auto_follow": self.auto_follow,
             "relay_url": self.relay_url,
             "host_via": self.host_via,
+            "position_from": self.position_from,
         })
         try:
             CONFIG_PATH.write_text(json.dumps(cfg))
@@ -775,6 +777,8 @@ class SyncController:
             self.relay_url = cfg["relay_url"]
         if cfg.get("host_via") in ("tunnel", "relay"):
             self.host_via = cfg["host_via"]
+        if cfg.get("position_from") in ("listen", "player"):
+            self.position_from = cfg["position_from"]
         return cfg
 
     def film_to_restore(self, cfg):

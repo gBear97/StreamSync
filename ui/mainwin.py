@@ -398,17 +398,25 @@ class MainWindow:
             lbl.config(height=2)
 
     def _place_status(self):
-        """Pack the status line into the board on show, or hide it."""
+        """Pack the status line into the board on show, or hide it.
+
+        On Main it keeps two lines' height whether it says anything or
+        not, so the playback card under it - the timeline with it - stays
+        where it is when a status comes, goes or wraps. A pause's two-line
+        "Couldn't find the stream window..." moved the timeline 9-12 px
+        down on the PC just as a jump was clicked, and the click missed.
+        FirstRun has nothing under its line to move: there it shows only
+        while it has something to say, and grows to two lines at most."""
         px, lbl = theme.px, self.status_lbl
         lbl.pack_forget()
+        if self._in_main:
+            lbl.config(bg=theme.CARD, wraplength=px(CARD_INNER_W), height=2)
+            lbl.pack(after=self._state_row, fill="x", pady=(px(6), 0))
+            return
         if not self._status_shown:
             return
-        if self._in_main:
-            lbl.config(bg=theme.CARD, wraplength=px(CARD_INNER_W))
-            lbl.pack(after=self._state_row, fill="x", pady=(px(6), 0))
-        else:
-            lbl.config(bg=theme.GROUND, wraplength=px(CONTENT_W))
-            lbl.pack(after=self._listen_row, fill="x", pady=(px(10), 0))
+        lbl.config(bg=theme.GROUND, wraplength=px(CONTENT_W))
+        lbl.pack(after=self._listen_row, fill="x", pady=(px(10), 0))
         self._cap_status_lines()
 
     # --- views --------------------------------------------------------------------
@@ -533,7 +541,8 @@ class MainWindow:
         self._listen_lbl.config(text=text + tail)
 
     def _show_status_line(self, visible):
-        """Show or hide status_lbl's line; the Shell sets its text."""
+        """Show or hide status_lbl's line; the Shell sets its text. On Main
+        its two lines stay either way (_place_status)."""
         self._status_shown = bool(visible)
         self._place_status()
 

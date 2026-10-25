@@ -368,6 +368,7 @@ class EmbeddedPlayer(_ClosedLoop):
         self._init_loop(EMBED_STALL_GUESS)
         self._watch_time()
         self.embedded = False
+        self._muted = None              # what set_mute() last said, if anything
         # the drawable, kept so load() can hand it back to libvlc
         self.hwnd = self.nsview = None
         if hwnd is not None:
@@ -399,6 +400,7 @@ class EmbeddedPlayer(_ClosedLoop):
         self._init_loop(EMBED_STALL_GUESS)
         self._watch_time()
         self.embedded = False
+        self._muted = None
         self.hwnd = self.nsview = None
         self.has_media = False
         return self
@@ -533,6 +535,48 @@ class EmbeddedPlayer(_ClosedLoop):
         self.ensure_playing(waiting=waiting)
         self.goto(match_t + offset, t0_perf)
 
+    def pause_at(self, seconds, waiting=None):
+        """Paused at `seconds`, whatever the film was doing: how a viewer
+        follows a paused host.
+
+        libvlc 3 ignores a seek until the film has played, so a viewer
+        whose film had never played sat at 0:00 for a paused host, and
+        for every jump it made while paused, until the host played. A film
+        that has not played, or has stopped or ended, is first started and
+        paused as soon as it plays (_prime). That waits for a film slow to
+        open, as a sync does, and a film that will not play raises
+        VLCError."""
+        if not self.has_media:
+            raise VLCError("No video file loaded.")
+        if vlc is not None and self.mp.get_state() not in (vlc.State.Playing,
+                                                            vlc.State.Paused):
+            self._prime(waiting)
+        self.pause()
+        self.seek(seconds)
+
+    def _prime(self, waiting=None):
+        """Start the film and pause it as soon as it plays, muted meanwhile.
+
+        A paused libvlc 3 player takes a seek and shows its frame (checked
+        on 3.0.23, a never-played film paused at 37.3 s and played on from
+        there); one that has not played takes neither. It plays for about
+        a tenth of a second first. The user's own mute is put back once it
+        has paused, so nothing of that is heard - or once it has failed to
+        start."""
+        before = self.mp.audio_get_mute()
+        self.mp.audio_set_mute(True)
+        try:
+            self.ensure_playing(waiting=waiting)
+            self.mp.set_pause(1)
+            # set_pause takes effect a few hundredths of a second later
+            end = time.perf_counter() + 1.0
+            while (self.mp.get_state() != vlc.State.Paused
+                   and time.perf_counter() < end):
+                time.sleep(0.01)
+        finally:
+            muted = self._muted if self._muted is not None else before == 1
+            self.mp.audio_set_mute(muted)
+
     def nudge(self, delta):
         """Shift playback by `delta` seconds. Playing: the closed loop's
         trim or seek, as before. Paused: an exact seek from where the last
@@ -595,11 +639,28 @@ class EmbeddedPlayer(_ClosedLoop):
         return self._clk.position(now), now
 
     def clock_state(self):
-        """(position, playing, perf_counter) for a watch-party host."""
+        """(position, playing, perf_counter) for a watch-party host.
+
+        A film that is loaded and has not played, or was stopped, is at
+        its start: libvlc gives no time for it until it plays, and a host
+        whose film had not played sent viewers nothing until its first
+        Play. Anything else libvlc cannot place stays None."""
         now = time.perf_counter()
         playing = self.is_playing()
         pos = self._clk.position(now) if playing and self._clk.count() else None
-        return (self.time() if pos is None else pos), playing, now
+        if pos is None:
+            pos = self.time()
+        if pos is None and self._at_start():
+            pos = 0.0
+        return pos, playing, now
+
+    def _at_start(self):
+        """A film is loaded and libvlc has not started it - it has never
+        played, or was stopped: it plays from its start, and takes no seek
+        until it does."""
+        return (self.has_media and vlc is not None
+                and self.mp.get_state() in (vlc.State.NothingSpecial,
+                                            vlc.State.Stopped))
 
     def length(self):
         n = self.mp.get_length()
@@ -618,7 +679,8 @@ class EmbeddedPlayer(_ClosedLoop):
         return f if f > 0 else None
 
     def set_mute(self, mute):
-        self.mp.audio_set_mute(bool(mute))
+        self._muted = bool(mute)        # put back after _prime's own mute
+        self.mp.audio_set_mute(self._muted)
 
     def volume(self):
         """Player volume 0-125, or None before audio output exists."""
@@ -860,6 +922,12 @@ class ExternalPlayer(_ClosedLoop):
     def sync_seek(self, match_t, t0_perf, offset, waiting=None):
         self.ensure_playing(waiting=waiting)
         self.goto(match_t + offset, t0_perf)
+
+    def pause_at(self, seconds, waiting=None):
+        """Paused at `seconds`. The VLC app plays a film as it opens it, so
+        there is no unplayed film to start first (EmbeddedPlayer._prime)."""
+        self.pause()
+        self.seek(seconds)
 
     def _seek_line(self, guess):
         """HTTP seeks are whole-second only: pick the next whole second the

@@ -71,6 +71,7 @@ class Shell(adapter.PlatformAdapter):
         self._synced_at = None       # monotonic time of the last sync that moved the film
         self._party_live = False
         self._session_text = ""
+        self._party_code = ""        # Join's session code, kept while Watch party is closed
         self._hosting_params = None  # ctl.host's arguments while the tunnel opens
         self._film_length = None
         self._pos = (None, None)     # the time and length the last tick read
