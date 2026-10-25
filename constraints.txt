@@ -1,0 +1,35 @@
+# The exact versions CI and the release builds install:
+#
+#   python -m pip install -r requirements.txt -c constraints.txt
+#
+# requirements.txt says what StreamSync needs; this says which release of
+# each a build gets. Without it every build took whatever PyPI had that
+# day, so a new upload could change a shipped app unannounced - websockets
+# 16 and 17 already behave differently for the relay - and the 2.0.8 Macs
+# went out with an older certifi than the Windows build did. These are the
+# versions 2.0.8 shipped with.
+#
+# Raise a pin in a pull request of its own, so the tests and builds run on
+# it first. certifi is the set of CA roots the apps' HTTPS trusts, the
+# updater's included, so it wants raising now and then even when nothing
+# has broken.
+
+# What the app runs on: requirements.txt and what it pulls in.
+numpy==2.5.4
+imageio-ffmpeg==0.6.0
+python-vlc==3.0.21203
+soundcard==0.4.6
+websockets==17.3
+certifi==2026.10.19
+cffi==2.1.1
+pycparser==3.12
+
+# What builds it: build_app_mac.sh and build_exe.ps1.
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9
+altgraph==0.17.5
+macholib==1.16.4
+pefile==2024.8.26
+pywin32-ctypes==0.2.3
+packaging==26.3
+setuptools==84.2.1

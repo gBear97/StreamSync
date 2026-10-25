@@ -45,7 +45,8 @@ if tkinter.TkVersion < 8.6:
 PYCHECK
 
 VERSION=$("$PY" -c 'from version import __version__; print(__version__)')
-"$PY" -m pip install -r requirements.txt pyinstaller
+# constraints.txt: the exact versions CI and the releases are built with.
+"$PY" -m pip install -r requirements.txt -c constraints.txt pyinstaller
 # certifi is collected explicitly: netcerts imports it lazily, so
 # PyInstaller's import scan never sees it, and without its cacert.pem the
 # bundle has no CA roots and every HTTPS call fails to verify.

@@ -96,8 +96,16 @@ jobs:
           echo "SETUP=$BASE.exe" >> "$GITHUB_ENV"
           echo "Building StreamSync $FILE from $(git rev-parse --short HEAD)"
 
+      # The versions in constraints.txt, so what ships is what CI tested. A
+      # tag from before that file is rebuilt the way it was built then,
+      # with whatever PyPI has.
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        run: |
+          if [ -f constraints.txt ]; then
+            python -m pip install -r requirements.txt -c constraints.txt
+          else
+            python -m pip install -r requirements.txt
+          fi
 
       - name: Build StreamSync.exe
         shell: pwsh

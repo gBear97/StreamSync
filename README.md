@@ -595,6 +595,11 @@ python streamsync.py          # the first-run check, then the app
 python -m ui.shell            # the app without the first-run check
 ```
 
+`requirements.txt` takes the newest release of each package. CI, the
+release builds and both build scripts add `-c constraints.txt`, which
+holds them to the exact versions a release ships with; add it to the
+`pip install` above to run what the releases run.
+
 `python streamsync.py --selftest` opens the app, tours every dialog and
 closes it again, with a throwaway settings file; it exits 0 when it
 worked.

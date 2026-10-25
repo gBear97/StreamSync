@@ -34,8 +34,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      # constraints.txt holds every run to the versions the releases are
+      # built with, so a new upload to PyPI arrives as a pull request that
+      # raises a pin, not unannounced in a test run.
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt -c constraints.txt
 
       # test_videomouse checks that a click over the picture reaches our
       # window and not libvlc's own (vout_hits). That takes a real 64-bit
@@ -118,7 +121,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt -c constraints.txt
 
       # The Windows window builds an embedded libvlc player as it opens,
       # so the smoke test needs a real 64-bit VLC (see ci/install_vlc.ps1).

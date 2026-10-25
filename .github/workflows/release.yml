@@ -206,8 +206,9 @@ jobs:
           fi
           echo "All five signing secrets are present."
 
+      # The versions in constraints.txt, so what ships is what CI tested.
       - name: Install dependencies
-        run: python3 -m pip install -r requirements.txt
+        run: python3 -m pip install -r requirements.txt -c constraints.txt
 
       - name: Run tests
         run: |
