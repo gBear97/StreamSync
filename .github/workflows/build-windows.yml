@@ -103,20 +103,6 @@ jobs:
         shell: pwsh
         run: ./build_exe.ps1
 
-      # TEMPORARY, to be removed before merging: takes the image's Inno
-      # Setup away so the fallback below runs once for real.
-      - name: "TEMPORARY: remove the image's Inno Setup"
-        shell: pwsh
-        run: |
-          $dir = "${env:ProgramFiles(x86)}\Inno Setup 6"
-          "Image's Inno Setup: $((Get-Item "$dir\ISCC.exe").VersionInfo.ProductVersion)"
-          $p = Start-Process "$dir\unins000.exe" -Wait -PassThru `
-                 -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
-          "uninstaller exited $($p.ExitCode)"
-          for ($i = 0; $i -lt 30 -and (Test-Path "$dir\ISCC.exe"); $i++) { Start-Sleep 1 }
-          if (Test-Path "$dir\ISCC.exe") { Rename-Item $dir "Inno Setup 6 (image)" }
-          "ISCC.exe still there: $(Test-Path "$dir\ISCC.exe")"
-
       # The runner image comes with Inno Setup 6. An image without it gets
       # 6.7.3, the last 6.x, from Inno Setup's own GitHub release, checked
       # against the SHA-256 that release and its .issig file both give.
