@@ -1517,6 +1517,69 @@ def party_leftovers(env, root, app):
         app._leave_session()
         pump(root, 0.3)
 
+        # Hosting again through the tunnel after a party that ended by
+        # itself, without Leave. The ended session stayed on ctl.session,
+        # so Start hosting never turned into Cancel, its progress was
+        # dropped and Join stayed on - and the old party's tunnel was left
+        # running. A ready from an older start must not use up this one's
+        # params either.
+        import hosting
+        ctl = app.ctl
+        public = "wss://fake-able-mind-words.trycloudflare.com"
+        released = threading.Event()
+
+        def quick_open(h, exe, download, say):
+            h.public_url = public
+            return "ws://127.0.0.1:9", public
+
+        def slow_open(h, exe, download, say):
+            say("Opening a free Cloudflare tunnel - a few seconds...")
+            end = time.monotonic() + 10
+            while not (h.cancelled or released.is_set()) and time.monotonic() < end:
+                time.sleep(0.02)
+            if h.cancelled:
+                raise hosting.Cancelled()
+            h.public_url = public
+            return "ws://127.0.0.1:9", public
+
+        ctl.find_cloudflared = lambda: ("/fake/cloudflared", "2026.10.3", False)
+        d.tunnel_var.set(True)
+        try:
+            ctl.open_tunnel, Host.ending = quick_open, RELAY_LOST
+            d._host()
+            end = time.monotonic() + 5               # it opens, starts, and ends by itself
+            while time.monotonic() < end and not (
+                    ctl.session is not None and not ctl.session_running()
+                    and d.idle.winfo_ismapped() and d.host_err.winfo_ismapped()):
+                pump(root, 0.05)
+            old = ctl.hosting
+            check("a tunnel party that ended keeps its tunnel until something ends it",
+                  (old is not None, getattr(old, "cancelled", None),
+                   under(d.host_err)), (True, False, (RELAY_LOST, True)))
+            ctl.open_tunnel, Host.ending = slow_open, None
+            d._host()
+            pump(root, 0.3)
+            check("hosting again: Start hosting turns into Cancel, and Join waits",
+                  (d.host_btn.cget("text"), d.join_btn.cget("state")), ("Cancel", "disabled"))
+            check("the tunnel's progress shows", under(d.host_note),
+                  ("Opening a free Cloudflare tunnel - a few seconds...", True))
+            check("the last party's tunnel is stopped, and ended at quit",
+                  (old.cancelled, old in ctl._ended_hosting), (True, True))
+            app._on_hosting_ready("ws://127.0.0.1:8", "wss://an-older-start.trycloudflare.com")
+            released.set()
+            end = time.monotonic() + 5
+            while not d.running.winfo_ismapped() and time.monotonic() < end:
+                pump(root, 0.05)
+            check("an older start's ready left this one's party to start",
+                  (d.running.winfo_ismapped(), app.ctl.public_relay), (1, public))
+            app._leave_session()
+            pump(root, 0.3)
+        finally:
+            released.set()
+            Host.ending = None
+            del ctl.find_cloudflared, ctl.open_tunnel
+            d.tunnel_var.set(False)
+
         d.close()
         pump(root, 0.1)
     finally:

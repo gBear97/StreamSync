@@ -585,7 +585,11 @@ class SyncController:
     def host(self, relay_url, password, from_player, mic_name, delay_hint, title,
              remember_relay=True):
         """remember_relay=False for this computer's own relay: its address
-        lasts one party, and must not replace the relay saved for joining."""
+        lasts one party, and must not replace the relay saved for joining.
+        It also means the tunnel and relay in ctl.hosting are this party's
+        own (begin_hosting made them), so only the rest of the last party
+        is ended."""
+        self._end_last_party(keep=None if remember_relay else self.hosting)
         if remember_relay:
             self.relay_url = relay_url
         src = None
@@ -600,6 +604,7 @@ class SyncController:
         self.session.start()
 
     def join(self, relay_url, code, password, mute):
+        self._end_last_party()
         self.relay_url = relay_url
         self.session = session.ViewerSession(
             relay_url, code, self.video_path, self.player, self.q,
@@ -613,6 +618,26 @@ class SyncController:
         elif self.hosting is not None:
             self.stop_hosting()       # left while the tunnel was still opening
 
+    def _end_last_party(self, keep=None):
+        """What is left of the last party, ended before another starts. A
+        session that ends by itself (a lost relay, a refused join) stays
+        until Leave - the Watch party window says why it ended from it -
+        and a tunnel host's tunnel and relay stay with it. Started over
+        them, the new party's Start hosting never turned into Cancel (the
+        window reads an opening tunnel as one with no session), and
+        begin_hosting() dropped the old tunnel without stopping it: its
+        cloudflared outlived StreamSync. `keep`: a Hosting the new party
+        opened itself, left alone."""
+        if self.session is not None:
+            own = self.hosting if self.hosting is keep else None
+            if own is not None:
+                self.hosting = None          # out of _end_session's reach
+            self._end_session()              # the session, and its tunnel with it
+            if own is not None:
+                self.hosting = own
+        if self.hosting is not None and self.hosting is not keep:
+            self.stop_hosting()              # a tunnel still opening: a second press
+
     # Hosting through this computer: hosting.Hosting runs the relay inside
     # StreamSync and a quick tunnel to it. The host's session then talks to
     # the relay directly, and viewers come in through the tunnel.
@@ -625,7 +650,9 @@ class SyncController:
     def begin_hosting(self):
         """The Hosting for a party from this computer, made on the Tk thread
         before open_tunnel runs: a Cancel pressed at once finds it to stop,
-        and the window reads 'opening' from the start."""
+        and the window reads 'opening' from the start. What is left of
+        the last party is ended first (_end_last_party)."""
+        self._end_last_party()
         h = hosting.Hosting()
         h.on_down = lambda: self._tunnel_down(h)
         self.hosting = h
