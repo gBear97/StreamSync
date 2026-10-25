@@ -21,8 +21,8 @@ name: Release
 # account's storage quota, which once filled up and would have failed a
 # release after it had been signed and notarized. Drafts are invisible to
 # the updater (it reads /releases/latest), so users never see a release
-# until it is complete, and a failed run leaves a draft the next run
-# picks up again.
+# until it is complete, and a failed run leaves a draft the next run of
+# the same commit picks up again (a run of a newer commit starts afresh).
 
 on:
   push:
@@ -89,27 +89,45 @@ jobs:
           fi
           echo "The release notes are $NOTES."
 
+      # A draft an earlier run left is reused only if that run was of this
+      # same commit, and its notes are refreshed from the file. A draft
+      # opened for another commit - the release run again after a fix was
+      # merged - is deleted and opened afresh. Its builds' names carry that
+      # commit, so this run's uploads would sit beside them instead of
+      # replacing them, and the publish job, which wants exactly one of
+      # each, would fail after both Macs had been notarized. Its target
+      # would also have put the tag on a commit this run never built.
       - name: Create the draft, or reuse one an earlier run left
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ inputs.version || github.ref_name }}"
           NOTES="release-notes/$TAG.md"
-          if draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
-                       --json isDraft -q .isDraft 2>/dev/null); then
+          # --target pins the tag to this commit; the tag itself is
+          # created when the draft is published.
+          create() {
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
+              --target "$GITHUB_SHA" --title "StreamSync $TAG" --notes-file "$NOTES"
+          }
+          if found=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+                       --json isDraft,targetCommitish \
+                       -q '"\(.isDraft) \(.targetCommitish)"' 2>/dev/null); then
+            read -r draft target <<< "$found"
             if [ "$draft" != "true" ]; then
               echo "$TAG is already published. Bump version.py and use a new tag."
               exit 1
             fi
-            # An earlier run's draft may carry older notes; this commit's
-            # file replaces them.
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$NOTES"
-            echo "Reusing the draft $TAG left by an earlier run, with the notes in $NOTES."
+            if [ "$target" = "$GITHUB_SHA" ]; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$NOTES"
+              echo "Reusing the draft $TAG left by an earlier run of this commit, with the notes in $NOTES."
+            else
+              echo "The draft $TAG was opened for $target, not $GITHUB_SHA."
+              echo "Deleting it, and the builds that run attached, and opening a new one."
+              gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+              create
+            fi
           else
-            # --target pins the tag to this commit; the tag itself is
-            # created when the draft is published.
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
-              --target "$GITHUB_SHA" --title "StreamSync $TAG" --notes-file "$NOTES"
+            create
           fi
 
   build:

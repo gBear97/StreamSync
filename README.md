@@ -695,8 +695,10 @@ The Release workflow:
    offered again forever - if `release-notes/<tag>.md` is missing, or if
    the `RELEASE_SIGNING_KEY` secret is missing;
 2. opens a draft release with those notes (drafts are invisible to the
-   updater, which reads `/releases/latest`; a failed run leaves a draft
-   the next run picks up, and gives it the file's current text);
+   updater, which reads `/releases/latest`). A failed run leaves its draft
+   for the next run of the same commit, which gives it the file's current
+   text; a run of a newer commit, say after a fix, deletes that draft and
+   its builds and opens a new one;
 3. builds one `.dmg` per Mac architecture: signs the app with a Developer
    ID, proves the signed bundle can make a verified HTTPS request
    (`--netcheck`) and report its diagnostics, has Apple notarize it,
