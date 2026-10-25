@@ -50,7 +50,9 @@ except Exception:
 }
 
 # No 2>&1: apple_retry.sh already folds notarytool's stderr into what it
-# prints, and keeps its own notes on stderr, out of the JSON.
+# prints, and keeps its own notes on stderr, out of the JSON. If Apple got
+# an upload whose answer was then lost, the next try submits it again; the
+# spare submission stays on Apple's side and does no harm.
 out=$("$RETRY" xcrun notarytool submit "$SUBMIT_PATH" "${AUTH[@]}" \
         --output-format json)
 ID=$(printf '%s' "$out" | field id)

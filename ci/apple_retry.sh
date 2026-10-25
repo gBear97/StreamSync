@@ -8,7 +8,7 @@
 # Five of the seven releases from 2.0.2 to 2.0.8 needed their failed jobs
 # re-run by hand, and not one of those builds had anything wrong with it.
 # Stapling fetches the notarization ticket from api.apple-cloudkit.com,
-# and `stapler validate` fetches it again to compare. On the Intel runner
+# and `stapler validate` asks CloudKit about it again. On the Intel runner
 # that connection dropped - "NSURLErrorDomain Code=-1005 The network
 # connection was lost", then stapler's "Error 68" - in 2.0.2, 2.0.3,
 # 2.0.5, 2.0.7 and 2.0.8. The re-run of 2.0.2 then lost codesign's request
@@ -42,8 +42,11 @@ TRIES=4
 PAUSE="${APPLE_RETRY_PAUSE:-30}"
 
 # What a lost connection looks like from codesign, stapler and notarytool.
-# Only the output of a failed try is held up against these.
-NETWORK='NSURLErrorDomain Code=-10(01|03|04|05|06|09)([^0-9]|$)'
+# Only the output of a failed try is held up against these. The NSURLError
+# codes are a timeout, no such host, no connection, a dropped connection,
+# a failed DNS lookup and no network at all, in either way they get
+# written ("Code=-1005" or "NSURLErrorDomain error -1005.").
+NETWORK='NSURLErrorDomain( Code=| error )-10(01|03|04|05|06|09)([^0-9]|$)'
 NETWORK+='|action failed! Error 68\.'
 NETWORK+='|The network connection was lost'
 NETWORK+='|The request timed out'
