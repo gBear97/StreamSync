@@ -994,7 +994,13 @@ def real_paused_start():
     saved = players.vlc
     players.vlc = REAL_VLC
     try:
-        inst = REAL_VLC.Instance("--aout=dummy", "--vout=dummy", "--quiet")
+        try:
+            inst = REAL_VLC.Instance("--aout=dummy", "--vout=dummy", "--quiet")
+        except Exception as e:
+            # python-vlc imports without libvlc (the Linux runner) and
+            # fails only once it is asked for something
+            print(f"SKIPPED real libvlc: no libvlc here ({e})")
+            return
         if inst is None:
             print("SKIPPED real libvlc: no instance (VLC's plugins not found)")
             return
