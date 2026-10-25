@@ -270,9 +270,9 @@ CONTRACT = {
         "WatchPartyDialog.__init__": "(app); builds it, sets app._party = self before "
                                      "app._present(win), then starts app._populate_mics(); "
                                      "no grab, beside the main window when the screen "
-                                     "has room, transient only if app.PARTY_TRANSIENT; "
-                                     "Join's code from app._party_code and Film position "
-                                     "from ctl.position_from, which follows its changes",
+                                     "has room; Join's code from app._party_code and Film "
+                                     "position from ctl.position_from, which follows its "
+                                     "changes",
         "WatchPartyDialog.refresh": "(); the idle or the running view, on "
                                     "ctl.session_running(); in the idle view, why a "
                                     "session that ended by itself ended (its last_said), "

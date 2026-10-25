@@ -101,10 +101,7 @@ class _Dialog:
     width = 600                          # design px
     modal = True                         # holds the grab while open
 
-    def _open(self, app, title, transient=True):
-        """The dialog's window, withdrawn. `transient`: owned by the main
-        window (see PlatformAdapter.PARTY_TRANSIENT for the one that may
-        not be)."""
+    def _open(self, app, title):
         self.app = app
         self._closed = False
         self._prev_grab = None
@@ -113,8 +110,7 @@ class _Dialog:
         win.title(title)
         win.configure(bg=theme.GROUND)
         win.resizable(False, False)
-        if transient:
-            win.transient(app.root)
+        win.transient(app.root)
         return win
 
     def _show_built(self):
@@ -641,7 +637,7 @@ class WatchPartyDialog(_Dialog):
             super()._place()
 
     def __init__(self, app):
-        win = self._open(app, "StreamSync - Watch party", transient=app.PARTY_TRANSIENT)
+        win = self._open(app, "StreamSync - Watch party")
         px = theme.px
         self._mics = []
         self._shown_code = None
@@ -1341,7 +1337,7 @@ def _gallery(argv=None):
             self.ctl = Ctl()
             for name in ("NAME", "STREAM_LABEL", "STREAM_AUTO_LABEL", "LISTEN_HELP",
                          "DEFAULT_DEVICE_NOTE", "UPDATE_UNAVAILABLE",
-                         "REFRESH_STREAMS_ON_SETTINGS", "PARTY_TRANSIENT"):
+                         "REFRESH_STREAMS_ON_SETTINGS"):
                 setattr(self, name, getattr(A, name))
             self._settings = self._party = self._update_dialog = None
             self._party_code = ""
