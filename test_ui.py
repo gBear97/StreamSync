@@ -1525,7 +1525,7 @@ def party_leftovers(env, root, app):
         else:
             check("Watch party is not owned by the main window", owner, "")
         if sys.platform == "win32":
-            foreground_experiment(env, root, app, d)
+            foreground_falls_back(env, root, app, d)
         d.close()
         pump(root, 0.1)
     finally:
@@ -1537,7 +1537,7 @@ def party_leftovers(env, root, app):
         pump(root, 0.2)
 
 
-# Another program, for foreground_experiment: a window of its own process,
+# Another program, for foreground_falls_back: a window of its own process,
 # driven through a command file. Its root stays withdrawn; "new" makes the
 # window, and the rest act on it - or, for "bring" and "switch", on one of
 # ours the way a second launch's hand-off and the taskbar would.
@@ -1569,6 +1569,9 @@ def poll():
             win.title("StreamSync test - another program")
             win.geometry("260x120+140+140")
             win.update()
+            # Its first window takes the foreground as it starts; the test
+            # may take it back, as a click would
+            u32.AllowSetForegroundWindow(0xFFFFFFFF)
             report(str(int(win.frame(), 16)))
         else:
             if verb == "hide":
@@ -1596,27 +1599,53 @@ root.mainloop()
 """
 
 
-def foreground_experiment(env, root, app, d):
-    """item 7, on Windows' own window manager: where the foreground goes
-    when it leaves another program and comes back to StreamSync, with a
-    Watch party window owned by the main window (transient, as before)
-    and one that is not (as now). Prints what it sees; asserts nothing
-    yet. The PC saw Watch party take the foreground for 1-3 s after
-    clicks in the main window, among foreground changes nobody made
-    (Brave; Windows' invisible input window around each screenshot), and
-    once 6 s after a second launch's hand-off."""
+def foreground_falls_back(env, root, app, d):
+    """item 7, on Windows' own window manager. When another program's
+    window that has the foreground goes away - hidden, as Windows' own
+    invisible input window was around each of the PC's screenshots -
+    Windows hands the foreground to the window just below it. A transient
+    Toplevel is a window the main window owns, and Windows keeps an owned
+    window just above its owner: so the window below was Watch party,
+    which took the foreground and the keys (the PC, 2026-10-22: 1-3 s at a
+    time after clicks in the main window, among foreground changes nobody
+    made). A window of StreamSync's own going away is different: Windows
+    gives the foreground back to the window that was active before it (CI
+    showed that, so a stand-in for another program is used here). Checked
+    with a Watch party window made as before (owned) and the app's (not);
+    what minimizing or closing the window, a second launch's hand-off and
+    a taskbar switch do is printed."""
     import ctypes
     import windowctl
     u32 = ctypes.windll.user32
+    k32 = ctypes.windll.kernel32
     tk = env.tk
 
     def frame(w):
-        return int(w.frame(), 16)
+        return w if isinstance(w, int) else int(w.frame(), 16)
 
-    def give(w):
-        u32.SetForegroundWindow(frame(w) if not isinstance(w, int) else w)
-        pump(root, 0.3)
-        return windowctl.foreground() == (frame(w) if not isinstance(w, int) else w)
+    def take(w):
+        """The foreground for window w, as a click gives it: asked for from
+        this process, and if Windows refuses that (this process lost the
+        right when another program's window took the foreground), with
+        this thread's input attached to the one in front."""
+        h = frame(w)
+        for _ in range(3):
+            u32.SetForegroundWindow(h)
+            pump(root, 0.2)
+            fg = windowctl.foreground()
+            if fg == h:
+                return True
+            ours = k32.GetCurrentThreadId()
+            theirs = u32.GetWindowThreadProcessId(fg, None) if fg else 0
+            if theirs and theirs != ours:
+                u32.AttachThreadInput(ours, theirs, True)
+                u32.BringWindowToTop(h)
+                u32.SetForegroundWindow(h)
+                u32.AttachThreadInput(ours, theirs, False)
+                pump(root, 0.2)
+                if windowctl.foreground() == h:
+                    return True
+        return False
 
     folder = tempfile.mkdtemp(prefix="streamsync-other-")
     cmd, out = os.path.join(folder, "cmd"), os.path.join(folder, "out")
@@ -1643,74 +1672,76 @@ def foreground_experiment(env, root, app, d):
                                    if hwnd else "none")
 
     def trace(seconds):
-        """The foreground over `seconds`, as (seconds in, window) at each change."""
+        """The foreground over `seconds`, at each change."""
         began, seen = time.monotonic(), []
         while time.monotonic() - began < seconds:
             fg = windowctl.foreground()
             if not seen or seen[-1][1] != fg:
                 seen.append((time.monotonic() - began, fg))
             pump(root, 0.02)
+        return seen
+
+    def told(seen):
         return " -> ".join(f"{named(h)} at {t:.2f} s" for t, h in seen)
 
-    def below(hwnd, n=4):
-        """The next top-level windows down from hwnd, visible ones only."""
-        found, h = [], hwnd
-        while len(found) < n:
-            h = u32.GetWindow(h, 2)          # GW_HWNDNEXT
-            if not h:
-                break
-            if u32.IsWindowVisible(h):
-                found.append(named(h))
-        return ", ".join(found)
+    def scene(party, how):
+        """Watch party used, then a click in the main window, then another
+        program's window in front - which then goes away (hide, minimize,
+        destroy), or brings the main window forward (bring: a second
+        launch's hand-off; switch: the taskbar). The foreground's moves
+        over 3 s after, or None if Windows would not set the scene."""
+        made = tell("new")
+        if made is None:
+            return None
+        front = int(made)
+        names[front] = "the other program"
+        take(party)
+        take(root)
+        if how in ("bring", "switch"):
+            take(party)                      # Watch party the last of ours used
+        if not take(front):
+            tell("destroy")
+            return None
+        if how in ("bring", "switch"):
+            tell(how, frame(root))
+        else:
+            tell(how)
+        seen = trace(3.0)
+        if how != "destroy":
+            tell("destroy")
+        return seen
 
+    ran = 0
     try:
         if tell("new", timeout=60) is None:
-            print("  SKIPPED the foreground experiment: the other program never came up")
+            print("  the other program never came up")
             return
         tell("destroy")
-        if not give(root):
-            print("  SKIPPED the foreground experiment: Windows would not give the main "
-                  "window the foreground")
-            return
-        for owned in (True, False):
-            party = tk.Toplevel(root)
-            party.title(f"StreamSync test - Watch party, {'owned' if owned else 'not owned'}")
-            party.geometry("260x160+430+330")
-            if owned:
+        for label in ("owned, as before", "the app's, as now"):
+            if label.startswith("owned"):
+                party = tk.Toplevel(root)
+                party.title("StreamSync test - Watch party, owned as before")
+                party.geometry("260x160+430+330")
                 party.transient(root)
-            pump(root, 0.3)
-            label = "owned" if owned else "not owned"
-            names[frame(party)] = f"Watch party ({label})"
-            for how in ("hide", "minimize", "destroy"):
-                front = int(tell("new"))
-                names[front] = "the other program"
-                give(party)                  # the host used Watch party...
-                give(root)                   # ...then clicked in the main window
-                if not give(front):          # another program comes in front
-                    print(f"  {label}, {how}: SKIPPED, the other program never got it")
+                pump(root, 0.3)
+                names[frame(party)] = "Watch party (owned, as before)"
+                want = frame(party)
+            else:
+                party, want = d.win, frame(root)
+            for how in ("hide", "minimize", "destroy", "bring", "switch"):
+                seen = scene(party, how)
+                if seen is None:
+                    print(f"  Watch party {label}, {how}: Windows would not set the scene")
                     continue
-                order = below(front)
-                tell(how)                    # and goes away
-                print(f"  Watch party {label}; another program in front ({order} below), "
-                      f"then its window {how}: {trace(3.0)}")
-                if how != "destroy":
-                    tell("destroy")
-            for how in ("bring", "switch"):
-                front = int(tell("new"))
-                names[front] = "the other program"
-                give(root)
-                give(party)                  # Watch party the last of ours used
-                if not give(front):
-                    print(f"  {label}, {how}: SKIPPED, the other program never got it")
-                    continue
-                tell(how, frame(root))       # the main window brought forward
-                what = ("a second launch's hand-off" if how == "bring"
-                        else "a taskbar switch")
-                print(f"  Watch party {label}; {what} to the main window from another "
-                      f"program: {trace(6.0)}")
-                tell("destroy")
-            party.destroy()
-            pump(root, 0.2)
+                print(f"  Watch party {label}; another program's window, {how}: {told(seen)}")
+                if how == "hide":
+                    ran += 1
+                    settled = seen[-1][1]
+                    check(f"another program's window hides, Watch party {label}: the "
+                          f"foreground goes to {named(want)}", named(settled), named(want))
+            if party is not d.win:
+                party.destroy()                  # it would sit above the main window
+                pump(root, 0.2)
     finally:
         tell("quit", timeout=5)
         try:
@@ -1718,6 +1749,7 @@ def foreground_experiment(env, root, app, d):
         except subprocess.TimeoutExpired:
             proc.kill()
         shutil.rmtree(folder, ignore_errors=True)
+        check("the foreground checks ran, owned and not", ran, 2)
 
 
 def update_views(env, root, app):
