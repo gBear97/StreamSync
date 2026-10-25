@@ -543,10 +543,13 @@ class HostSession:
             m.stop()
 
     def _say(self, text):
-        # Set before it is queued, and so before the stop flag of a
-        # session that ends: the window reads why it ended from here once
-        # the flag is up, where the queue may not have delivered it yet.
-        self.last_said = text
+        # Why a session ended, for the Watch party window: every way it
+        # ends says so before the stop flag goes up, and the window reads
+        # it from here once the flag is up, where the queue may not have
+        # delivered it yet. A line from a loop still winding down after
+        # the flag does not replace it.
+        if not self.stop_flag.is_set():
+            self.last_said = text
         self.events.put(("session", text))
 
     def _send(self, obj):
@@ -808,7 +811,8 @@ class ViewerSession:
             self._monitor.stop()
 
     def _say(self, text):
-        self.last_said = text     # before it is queued: see HostSession._say
+        if not self.stop_flag.is_set():
+            self.last_said = text     # see HostSession._say
         self.events.put(("session", text))
 
     def effective_delay(self):

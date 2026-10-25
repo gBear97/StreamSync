@@ -159,8 +159,7 @@ CONTRACT = {
                            "message instead)",
         "_load_sub_file": "(); asks for a subtitle file for the built-in player",
         # plumbing
-        "_set_status": "(text); status_lbl and _fs_status, and the status line shown only when "
-                       "there is text",
+        "_set_status": "(text); status_lbl and _fs_status, and _show_status_line(bool(text))",
         "_poll_queue": "(); every 80 ms: dispatches the queue through HANDLERS, then "
                        "_settle_fullscreen(); stops once the app is closing",
         "_tick_time": "(); every 700 ms: the position to _show_position, then _tick_status()",
@@ -201,7 +200,8 @@ CONTRACT = {
         "_show_party_live": "(on); the live dot on the Watch party button",
         "_show_listen": "(label); FirstRun's 'Listening to: ...' line, label as _device_label "
                         "gives it",
-        "_show_status_line": "(visible); shows or hides status_lbl's line",
+        "_show_status_line": "(visible); shows or hides status_lbl's line on FirstRun; on Main it "
+                             "keeps its two lines either way, so nothing under it moves",
     },
     "ui/video.py": {
         "FS_BAR_IDLE": "class attribute; seconds of a resting mouse before the bar hides",

@@ -1525,7 +1525,7 @@ def party_leftovers(env, root, app):
         else:
             check("Watch party is not owned by the main window", owner, "")
         if sys.platform == "win32":
-            foreground_falls_back(env, root, app, d)
+            foreground_experiment(env, root, app, d)
         d.close()
         pump(root, 0.1)
     finally:
@@ -1537,16 +1537,74 @@ def party_leftovers(env, root, app):
         pump(root, 0.2)
 
 
-def foreground_falls_back(env, root, app, d):
-    """item 7, on Windows' own window manager. When the window that has
-    the foreground goes away - hidden, as the PC's invisible input window
-    was around each screenshot, or minimized, as the browser is when the
-    swap ends a pause - Windows hands the foreground to the next window
-    down. A transient Toplevel is owned by the main window, and Windows
-    keeps an owned window just above its owner: so the next window down
-    was Watch party, which took the foreground and the keys from the main
-    window (seen on the PC 2026-10-22, 1-3 s at a time). Shown here with
-    an owned window made as Watch party was, then with the real one."""
+# Another program, for foreground_experiment: a window of its own process,
+# driven through a command file. Its root stays withdrawn; "new" makes the
+# window, and the rest act on it - or, for "bring" and "switch", on one of
+# ours the way a second launch's hand-off and the taskbar would.
+OTHER_PROGRAM = r"""
+import ctypes, os, sys, tkinter as tk
+cmd, out = sys.argv[1], sys.argv[2]
+u32 = ctypes.windll.user32
+root = tk.Tk()
+root.withdraw()
+win = None
+
+def report(text):
+    with open(out + ".tmp", "w") as f:
+        f.write(text)
+    os.replace(out + ".tmp", out)
+
+def poll():
+    global win
+    try:
+        with open(cmd) as f:
+            what = f.read().split()
+        os.remove(cmd)
+    except OSError:
+        what = []
+    if what:
+        verb = what[0]
+        if verb == "new":
+            win = tk.Toplevel(root)
+            win.title("StreamSync test - another program")
+            win.geometry("260x120+140+140")
+            win.update()
+            report(str(int(win.frame(), 16)))
+        else:
+            if verb == "hide":
+                win.withdraw()
+            elif verb == "minimize":
+                win.iconify()
+            elif verb == "destroy":
+                win.destroy()
+            elif verb == "bring":
+                h = int(what[1])
+                if u32.IsIconic(h):
+                    u32.ShowWindow(h, 9)
+                u32.BringWindowToTop(h)
+                u32.SetForegroundWindow(h)
+            elif verb == "switch":
+                u32.SwitchToThisWindow(int(what[1]), True)
+            elif verb == "quit":
+                root.destroy()
+                return
+            report("done " + verb)
+    root.after(20, poll)
+
+root.after(20, poll)
+root.mainloop()
+"""
+
+
+def foreground_experiment(env, root, app, d):
+    """item 7, on Windows' own window manager: where the foreground goes
+    when it leaves another program and comes back to StreamSync, with a
+    Watch party window owned by the main window (transient, as before)
+    and one that is not (as now). Prints what it sees; asserts nothing
+    yet. The PC saw Watch party take the foreground for 1-3 s after
+    clicks in the main window, among foreground changes nobody made
+    (Brave; Windows' invisible input window around each screenshot), and
+    once 6 s after a second launch's hand-off."""
     import ctypes
     import windowctl
     u32 = ctypes.windll.user32
@@ -1556,55 +1614,110 @@ def foreground_falls_back(env, root, app, d):
         return int(w.frame(), 16)
 
     def give(w):
-        u32.SetForegroundWindow(frame(w))
+        u32.SetForegroundWindow(frame(w) if not isinstance(w, int) else w)
         pump(root, 0.3)
-        return windowctl.foreground() == frame(w)
+        return windowctl.foreground() == (frame(w) if not isinstance(w, int) else w)
 
-    def falls_back():
-        """A window comes up in front of ours and is hidden again: who
-        Windows gives the foreground to then (0: nothing it would)."""
-        front = tk.Toplevel(root)
-        front.title("StreamSync test - a window in front")
-        front.geometry("240x120+90+90")
-        pump(root, 0.2)
-        if not give(front):
-            front.destroy()
-            return None
-        front.withdraw()
-        pump(root, 0.4)
-        got = windowctl.foreground()
-        front.destroy()
-        pump(root, 0.1)
-        return got
+    folder = tempfile.mkdtemp(prefix="streamsync-other-")
+    cmd, out = os.path.join(folder, "cmd"), os.path.join(folder, "out")
+    proc = subprocess.Popen([sys.executable, "-c", OTHER_PROGRAM, cmd, out])
+
+    def tell(*words, timeout=30):
+        if os.path.exists(out):
+            os.remove(out)
+        with open(cmd + ".tmp", "w") as f:
+            f.write(" ".join(str(w) for w in words))
+        os.replace(cmd + ".tmp", cmd)
+        end = time.monotonic() + timeout
+        while not os.path.exists(out):
+            if proc.poll() is not None or time.monotonic() > end:
+                return None
+            pump(root, 0.02)
+        with open(out) as f:
+            return f.read()
+
+    names = {frame(root): "main", frame(d.win): "Watch party (the app's)"}
 
     def named(hwnd):
-        return f"{hwnd:#x} {windowctl.window_title(hwnd)!r}" if hwnd else "none"
+        return names.get(hwnd) or (f"{hwnd:#x} {windowctl.window_title(hwnd)!r}"
+                                   if hwnd else "none")
 
-    if not give(root):
-        print("  SKIPPED the foreground check: Windows would not give the main "
-              "window the foreground")
-        return
-    owned = tk.Toplevel(root)
-    owned.title("StreamSync test - owned, as Watch party was")
-    owned.geometry("240x120+380+380")
-    owned.transient(root)
-    pump(root, 0.2)
-    give(root)                                # a click in the main window
-    got = falls_back()
-    if got is None:
-        print("  SKIPPED the foreground check: the window in front never got it")
-        owned.destroy()
-        return
-    print(f"  owned window up: the foreground went to {named(got)}")
-    check("the cause: Windows hands the foreground to a window the main window owns",
-          got, frame(owned))
-    owned.destroy()
-    pump(root, 0.1)
-    give(root)
-    got = falls_back()
-    print(f"  Watch party up: the foreground went to {named(got)}")
-    check("Watch party up, the foreground goes back to the main window", got, frame(root))
-    check("not to Watch party", got != frame(d.win))
+    def trace(seconds):
+        """The foreground over `seconds`, as (seconds in, window) at each change."""
+        began, seen = time.monotonic(), []
+        while time.monotonic() - began < seconds:
+            fg = windowctl.foreground()
+            if not seen or seen[-1][1] != fg:
+                seen.append((time.monotonic() - began, fg))
+            pump(root, 0.02)
+        return " -> ".join(f"{named(h)} at {t:.2f} s" for t, h in seen)
+
+    def below(hwnd, n=4):
+        """The next top-level windows down from hwnd, visible ones only."""
+        found, h = [], hwnd
+        while len(found) < n:
+            h = u32.GetWindow(h, 2)          # GW_HWNDNEXT
+            if not h:
+                break
+            if u32.IsWindowVisible(h):
+                found.append(named(h))
+        return ", ".join(found)
+
+    try:
+        if tell("new", timeout=60) is None:
+            print("  SKIPPED the foreground experiment: the other program never came up")
+            return
+        tell("destroy")
+        if not give(root):
+            print("  SKIPPED the foreground experiment: Windows would not give the main "
+                  "window the foreground")
+            return
+        for owned in (True, False):
+            party = tk.Toplevel(root)
+            party.title(f"StreamSync test - Watch party, {'owned' if owned else 'not owned'}")
+            party.geometry("260x160+430+330")
+            if owned:
+                party.transient(root)
+            pump(root, 0.3)
+            label = "owned" if owned else "not owned"
+            names[frame(party)] = f"Watch party ({label})"
+            for how in ("hide", "minimize", "destroy"):
+                front = int(tell("new"))
+                names[front] = "the other program"
+                give(party)                  # the host used Watch party...
+                give(root)                   # ...then clicked in the main window
+                if not give(front):          # another program comes in front
+                    print(f"  {label}, {how}: SKIPPED, the other program never got it")
+                    continue
+                order = below(front)
+                tell(how)                    # and goes away
+                print(f"  Watch party {label}; another program in front ({order} below), "
+                      f"then its window {how}: {trace(3.0)}")
+                if how != "destroy":
+                    tell("destroy")
+            for how in ("bring", "switch"):
+                front = int(tell("new"))
+                names[front] = "the other program"
+                give(root)
+                give(party)                  # Watch party the last of ours used
+                if not give(front):
+                    print(f"  {label}, {how}: SKIPPED, the other program never got it")
+                    continue
+                tell(how, frame(root))       # the main window brought forward
+                what = ("a second launch's hand-off" if how == "bring"
+                        else "a taskbar switch")
+                print(f"  Watch party {label}; {what} to the main window from another "
+                      f"program: {trace(6.0)}")
+                tell("destroy")
+            party.destroy()
+            pump(root, 0.2)
+    finally:
+        tell("quit", timeout=5)
+        try:
+            proc.wait(10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        shutil.rmtree(folder, ignore_errors=True)
 
 
 def update_views(env, root, app):

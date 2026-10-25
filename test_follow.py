@@ -346,6 +346,31 @@ def unplayed_viewer_meets_a_paused_host():
         players.vlc = saved
 
 
+def why_it_ended_is_kept():
+    """The Watch party window shows why a session ended from last_said,
+    read once the stop flag is up. A line a loop says while it winds down
+    after that - a stream delay measured just then - must not replace it;
+    the main window's status still gets every line."""
+    v = viewer(0.5)
+    try:
+        v._say("Verified (bit error 0.11, file offset +1.12s). Following the session.")
+        v.inbox.put({"type": "ended"})
+        wait(lambda: v.stop_flag.is_set(), 2, "the end")
+        v._say("Your stream delay: 2.00s (updated).")
+        assert v.last_said == "The host ended the session.", v.last_said
+        seen = said(v)
+        assert seen[-2:] == ["The host ended the session.",
+                             "Your stream delay: 2.00s (updated)."], seen
+    finally:
+        end(v)
+    host = session.HostSession("ws://unused", None, queue.Queue())
+    host._say("Relay connection lost (could not reach the relay). Session ended.")
+    host.stop_flag.set()
+    host._say("A viewer verified their copy (2 connected).")
+    assert host.last_said.startswith("Relay connection lost"), host.last_said
+    print("why a session ended: kept for the window, whatever is said after the end")
+
+
 def failures_are_said_once():
     logged = []
     real_log = session.diagnostics.log
@@ -381,6 +406,7 @@ def main():
     pause_lands_when_it_reaches_the_viewer()
     paused_jump_reaches_the_viewer()
     unplayed_viewer_meets_a_paused_host()
+    why_it_ended_is_kept()
     failures_are_said_once()
     print("FOLLOW TEST PASSED")
 
