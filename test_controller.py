@@ -71,6 +71,8 @@ class Stream:
         self.film = "film.mkv"    # what the streamer is playing
         self.audible = True       # can the matcher hear the film at all?
         self.weak_until = 0.0     # recordings shorter than this are weak
+        self.coarse = 0.0         # how far out the matcher's answer is (its steps)
+        self.unclear = 0          # refinements that come back unclear before one doesn't
 
     def pos(self, at=None):
         at = self.clock() if at is None else at
@@ -187,10 +189,22 @@ def install_fakes(stream):
                 or not inside):
             return (lo or 0.0) + 7.0, 0.2 * S, 0.6 * Z    # noise
         if seconds < stream.weak_until:
-            return true, 0.4 * S, Z                       # right but weak
-        return true, 3.0 * S, 2.5 * Z
+            return true + stream.coarse, 0.4 * S, Z       # right but weak
+        return true + stream.coarse, 3.0 * S, 2.5 * Z
+
+    def refine(samples, sr, path, t, search=controller.audio_matcher.REFINE_SEARCH):
+        t0, seconds = samples
+        true = stream.pos(t0)
+        if (path != stream.film or not stream.audible or not stream.playing
+                or abs(true - t) > search):
+            return None
+        if stream.unclear:
+            stream.unclear -= 1
+            return None
+        return true
     controller.audio_matcher.prep_capture = prep
     controller.audio_matcher.find_match_audio = find
+    controller.audio_matcher.refine_match = refine
 
 
 def failing_matcher(errors):
@@ -590,6 +604,7 @@ def test_vanished_film_gives_up():
     ctl.auto_enabled = True
     run_sync(ctl, ctl.sync, "")
     drain(q)
+    controller.diagnostics = Log()      # what the failures log, not the sync
     gone = controller.matcher.MatchError(
         "ffmpeg could not read this file as a video.")  # drive unplugged
     failing_matcher([gone] * 100)
@@ -617,6 +632,7 @@ def test_vanished_paused_film_gives_up():
     ctl.auto_enabled = True
     run_sync(ctl, ctl.sync, "")
     drain(q)
+    controller.diagnostics = Log()      # what the failures log, not the sync
     hear = controller.audio_matcher.find_match_audio
     gone = []
     seen = {}
@@ -1104,11 +1120,14 @@ def picture_fakes(ctl, clock, film, shown_at):
     """Give ctl a screen to grab, on the simulated clock: each grab (7 ms
     apart) shows film.at(shown_at(t)). A grab of the whole window (rect
     (0, 0, 1600, 900)) puts it in a page, at grab pixels x 40-104, y 20-56;
-    any other rect is the picture alone. Returns what it restores."""
+    any other rect is the picture alone. The rects grabbed are kept in
+    ctl.grab.rects. Returns what it restores."""
     import numpy as np
     rng = np.random.default_rng(5)
+    rects = []
 
     def grab(rect, seconds, width):
+        rects.append(tuple(rect))
         times, images = [], []
         end = clock.now + seconds
         while clock.now < end:
@@ -1121,6 +1140,7 @@ def picture_fakes(ctl, clock, film, shown_at):
             times.append(clock.now)
             images.append(pic)
         return np.array(times), np.array(images)
+    grab.rects = rects
     ctl.grab = grab
     saved = (controller.picture_timing.decode_frames, controller.time)
     controller.picture_timing.decode_frames = film.decode
@@ -1217,6 +1237,14 @@ def test_measure_stream_picture():
         assert ctl.picture_lags["willneff - Twitch"]["lag"] == round(info["lag"], 4)
         assert abs(player.nudges[nudges] + info["lag"]) < 1e-3, player.nudges[nudges:]
         assert not ctl.measuring
+        # the whole window only finds the video; the cuts are timed in a band
+        # through it (the video is at 400-1040 x 200-560 on screen)
+        rects = ctl.grab.rects
+        whole = [i for i, r in enumerate(rects) if r == (0, 0, 1600, 900)]
+        bands = [r for r in rects if r != (0, 0, 1600, 900)]
+        assert whole == [0] and bands, rects
+        assert all(r[3] < 0.35 * 360 and 290 <= r[1] <= 330 and 380 <= r[0] <= 420
+                   for r in bands), bands
         # no film sound in the stream: a clear reason, nothing changed
         stream.audible = False
         run_sync(ctl, ctl.measure_stream_picture, lambda: (0, 0, 1600, 900), "other")
@@ -1249,6 +1277,9 @@ def test_film_window_timed_after_sync():
         err = (ctl.film_lead - (lead + 0.0035)) * 1000
         assert abs(err) < 2.0, f"lead {ctl.film_lead * 1000:.1f} ms, error {err:+.1f} ms"
         assert abs(player.nudges[-1] - ctl.film_lead) < 1e-9, player.nudges
+        # the film's picture is grabbed in the band the stream's is
+        assert set(ctl.grab.rects) == {controller.picture_timing.band((0, 0, 640, 360))[0]}, \
+            ctl.grab.rects
         ctl.film_picture_rect = lambda: None                 # the film window hidden
         before = ctl.film_lead
         run_sync(ctl, ctl.sync, "")
@@ -1275,6 +1306,89 @@ def test_film_window_timed_after_sync():
         restore_picture_fakes(saved)
     print(f"film window: its {lead * 1000:.1f} ms picture delay timed after a sync "
           f"({ctl.film_lead * 1000:.1f} ms) and the film run that far ahead")
+
+
+def test_inexact_sync_made_exact_later():
+    # the matcher works in 16 ms steps: a sync its own recording could not
+    # refine (a quiet scene) once left the film 21 ms off the stream
+    lines = lambda: controller.diagnostics.lines
+    ctl, stream, player, clock, q = make()
+    looks = []
+    ctl._loopback().on_capture = lambda: looks.append(1)
+    run_sync(ctl, ctl.sync, "")
+    assert len(looks) == 1 and not player.nudges and \
+        any("refined to" in line for line in lines()), (looks, player.nudges, lines())
+    # unclear for the sync and the look after: the second look makes it exact
+    ctl, stream, player, clock, q = make()
+    stream.coarse, stream.unclear = 0.021, 2
+    run_sync(ctl, ctl.sync, "")
+    err = (player.pos() - stream.pos()) * 1000
+    assert abs(err) < 1e-3, f"the film was left {err:+.1f} ms off the stream"
+    assert len(player.nudges) == 1 and abs(player.nudges[0] + 0.021) < 1e-9, player.nudges
+    assert any("made exact" in line and "-21.0 ms" in line for line in lines()), lines()
+    # lined up with the stream's picture, it goes where that puts it
+    ctl, stream, player, clock, q = make()
+    ctl.film_lead, ctl.stream_key, ctl.line_up = 0.012, "s", "picture"
+    ctl.picture_lags = {"s": {"lag": 0.142, "when": "x", "cuts": 9}}
+    stream.coarse, stream.unclear = -0.015, 1
+    run_sync(ctl, ctl.sync, "")
+    err = (player.pos() - (stream.pos() + 0.012 - 0.142)) * 1000
+    assert abs(err) < 1e-3, f"lined up with the picture, the film is {err:+.1f} ms off"
+    # never clear: three more looks, a line saying so, the film left as matched
+    ctl, stream, player, clock, q = make()
+    stream.coarse, stream.unclear = 0.021, 99
+    looks = []
+    ctl._loopback().on_capture = lambda: looks.append(1)
+    run_sync(ctl, ctl.sync, "")
+    assert len(looks) == 1 + controller.REFINE_TRIES and not player.nudges, \
+        (looks, player.nudges)
+    assert abs(player.pos() - stream.pos() - 0.021) < 1e-9
+    assert any("not made exact" in line for line in lines()), lines()
+    # the stream itself moved 68 ms after the match (a stand-in VLC settling
+    # after a seek): followed once a second look agrees
+    ctl, stream, player, clock, q = make()
+    stream.unclear = 1
+    looks = []
+
+    def moved():
+        looks.append(1)
+        if len(looks) == 2:
+            stream.anchor = (stream.anchor[0] + 0.068, stream.anchor[1])
+    ctl._loopback().on_capture = moved
+    run_sync(ctl, ctl.sync, "")
+    assert len(looks) == 3 and len(player.nudges) == 1 and \
+        abs(player.nudges[0] - 0.068) < 1e-9, (looks, player.nudges)
+    assert abs(player.pos() - stream.pos()) < 1e-9
+    assert any("seen twice" in line for line in lines()), lines()
+    # ...but not chased while it keeps moving
+    ctl, stream, player, clock, q = make()
+    stream.unclear = 1
+    looks = []
+
+    def moving():
+        looks.append(1)
+        if len(looks) >= 2:
+            stream.anchor = (stream.anchor[0] + 0.1, stream.anchor[1])
+    ctl._loopback().on_capture = moving
+    run_sync(ctl, ctl.sync, "")
+    assert not player.nudges and any("no second look agreed" in line for line in lines()), \
+        (player.nudges, lines())
+    # a new sync while it listened: the old look moves nothing
+    ctl, stream, player, clock, q = make()
+    stream.coarse, stream.unclear = 0.021, 1
+    looks = []
+
+    def resynced():
+        looks.append(1)
+        if len(looks) == 2:
+            ctl._gen += 1
+    ctl._loopback().on_capture = resynced
+    run_sync(ctl, ctl.sync, "")
+    assert not player.nudges and not any("made exact" in line for line in lines()), \
+        (player.nudges, lines())
+    print("inexact sync: made exact on more of the stream (21 ms put right, on the sound "
+          "or the picture; a stream that moved 68 ms since, once seen twice); left alone "
+          "when never clear, while the stream keeps moving, or after a new sync")
 
 
 def main():
@@ -1304,6 +1418,7 @@ def main():
     test_picture_settings_saved()
     test_measure_stream_picture()
     test_film_window_timed_after_sync()
+    test_inexact_sync_made_exact_later()
     print("CONTROLLER TEST PASSED")
 
 

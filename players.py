@@ -61,6 +61,10 @@ TRIM_MAX = 0.6              # errors up to this are trimmed; beyond, re-seeked
 # land half a frame out and stay there, and a correction smaller than that
 # (the film window's own delay, 13 ms on a 144 Hz screen) was never made.
 SETTLE_TOL = 0.008
+# A nudge is made whatever its size, down to this: close enough is for where
+# a seek lands, not for a move asked for - a sync's own 7.9 ms correction,
+# under SETTLE_TOL, left the film where it was.
+NUDGE_MIN = 0.001
 RATE_SETTLE = 1.3           # libvlc applies a rate change ~1 s late
 CLOCK_EVENTS = 4
 EXT_PORT = 9723
@@ -170,9 +174,10 @@ class _ClosedLoop:
         if trimming:
             self._set_rate(1.0)
 
-    def goto(self, target, at):
+    def goto(self, target, at, exact=False):
         """Playback should be at `target` at perf_counter() time `at`, and
-        run at 1x from there. Returns at once; the check runs behind."""
+        run at 1x from there. Returns at once; the check runs behind.
+        exact (a nudge): get there even from under SETTLE_TOL away."""
         now = time.perf_counter()
         want = target + (now - at)
         with self._loop_lock:
@@ -196,7 +201,7 @@ class _ClosedLoop:
         else:
             guess = self._stall
             self._seek_line(guess)
-        threading.Thread(target=self._correct, args=(gen, guess, err),
+        threading.Thread(target=self._correct, args=(gen, guess, err, exact),
                          daemon=True).start()
 
     def settling(self):
@@ -230,7 +235,7 @@ class _ClosedLoop:
         pos = self._clk.position(now)
         return None if pos is None else pos - self._desired(now)
 
-    def _correct(self, gen, seek_guess, err):
+    def _correct(self, gen, seek_guess, err, exact=False):
         try:
             for _ in range(4):
                 if seek_guess is not None:
@@ -245,7 +250,10 @@ class _ClosedLoop:
                         self._stall = min(2.0, max(0.0, 0.6 * self._stall
                                                    + 0.4 * measured))
                     seek_guess = None
-                if not self._current(gen) or abs(err) <= SETTLE_TOL:
+                # a nudge's first correction is made down to NUDGE_MIN; after
+                # it, as for any goto, close enough is SETTLE_TOL
+                close, exact = (NUDGE_MIN if exact else SETTLE_TOL), False
+                if not self._current(gen) or abs(err) <= close:
                     return
                 if abs(err) > TRIM_MAX:
                     seek_guess = self._stall
@@ -286,7 +294,7 @@ class _ClosedLoop:
         if base is None:
             base = self._clk.position(now) if self._clk.count() else self.time()
         if base is not None:
-            self.goto(base + delta, now)
+            self.goto(base + delta, now, exact=True)
 
 
 def _why_no_vlc():

@@ -44,6 +44,8 @@ MIN_FRAMES = 15       # frames that must be seen for the film window's lead
 FRAME_MATCH = 0.9     # correlation a grab needs with a film frame to name it
 FRAME_MARGIN = 0.004  # ...and how much better than the frames either side
 LEAD_SPREAD = 0.03    # s: a frame further than this from the median is an outlier
+BAND = (0.30, 0.60)   # a picture's rows grabbed to time it: its middle, clear of subtitles
+BAND_MOST = (1280, 240)   # px: a band wider or taller than this is cut to its middle
 
 # What a browser appends to a page's title, and the unread count a site
 # puts in front of it ("(45) willneff - Twitch - Brave"): neither names the
@@ -63,6 +65,42 @@ def channel_key(title):
 
 def _creationflags():
     return subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
+def band(rect, rows=BAND, most=BAND_MOST):
+    """The part of a picture that is grabbed to time it: (band, crop).
+
+    band = (x, y, w, h) on screen: rows `rows` (fractions of its height) of
+    the picture at rect = (x, y, w, h), cut to its middle `most` pixels
+    wide and tall; crop = the same as fractions of the picture, for
+    decode_frames to cut the film's frames alike.
+
+    A grab waits for the screen's next refresh and then copies, and a big
+    copy is slow: the whole of a 1278 x 1341 window could only be grabbed
+    every other refresh of a 144 Hz screen, so every cut was seen a refresh
+    late and the copy returned later still - a stand-in stream's picture
+    read 119 ms behind its sound where a band read 109. A band is copied in
+    time for every refresh, and two bands of the same size - the stream's
+    and the film window's - are seen equally late, which cancels when the
+    film is lined up with the stream's picture.
+    """
+    x, y, w, h = rect
+    top, bottom = y + h * rows[0], y + h * rows[1]
+    bh = max(1, int(round(min(bottom - top, most[1]))))
+    by = int(round((top + bottom - bh) / 2))
+    bw = max(1, int(min(w, most[0])))
+    bx = int(round(x + (w - bw) / 2))
+    crop = ((bx - x) / w, (by - y) / h, (bx + bw - x) / w, (by + bh - y) / h)
+    return (bx, by, bw, bh), crop
+
+
+def grab_rate(times):
+    """Grabs a second over `times`: a screen's refresh rate when the grabs
+    kept up with it, less when they missed some."""
+    times = np.asarray(times, float)
+    if len(times) < 2 or times[-1] <= times[0]:
+        return 0.0
+    return (len(times) - 1) / float(times[-1] - times[0])
 
 
 def decode_frames(path, t0, dur, size, crop=None):

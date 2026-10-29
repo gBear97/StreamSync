@@ -1079,6 +1079,21 @@ def main():
     print(f"nudge +100 ms: net {1000 * net:+.0f} ms, no seek "
           f"(set_time calls: {sum(1 for s in mp.segments if s[2] == 0.0)})")
     assert abs(net - 0.1) < 0.02, net
+    wait_done(p)
+
+    # 3b. a nudge under SETTLE_TOL is made too: close enough is for where a
+    # seek lands, and a sync's own 7.9 ms correction once moved nothing
+    time.sleep(1.5)                       # settled, the clock seeing events again
+    now = time.perf_counter()
+    before = mp.truth(now)
+    p.nudge(0.006)
+    wait_done(p)
+    time.sleep(0.3)
+    later = time.perf_counter()
+    net = mp.truth(later) - (before + (later - now))
+    print(f"nudge +6 ms (under the {1000 * players.SETTLE_TOL:.0f} ms settle tolerance): "
+          f"net {1000 * net:+.1f} ms")
+    assert abs(net - 0.006) < 0.003, net
 
     # 4. pausing mid-trim puts the rate back
     p.nudge(-0.3)

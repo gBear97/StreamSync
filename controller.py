@@ -51,6 +51,11 @@ CONFIG_PATH = Path.home() / ".streamsync.json"
 SEARCH_WINDOW = 120.0      # a hinted sync searches this far either side
 AUDIO_SYNC_SECONDS = 6.0   # manual sync recording length...
 AUDIO_RETRY_SECONDS = (12.0, 18.0)  # ...extended this far when it is weak
+REFINE_TRIES = 3           # a sync its recording could not make exact (a quiet scene)
+REFINE_LISTEN = 10.0       # ...listens again this long, up to REFINE_TRIES times,
+REFINE_FIX = 0.05          # ...and moves the film by what that finds within this (a
+                           # match is out by ~10-20 ms); more is the stream itself having
+REFINE_SAME = 0.005        # moved, so it waits for a second look that agrees this well
 AUTO_RECORD_SECONDS = 4.0  # auto-mode recording length
 AUTO_RETRY_SECONDS = 8.0   # one longer look before counting a failure
 AUTO_FAIL_GIVEUP = 3       # an auto check failing the same way this many
@@ -63,8 +68,9 @@ PAUSE_GROW_MAX = 600.0     # ...and at most this much
 SESSION_CLOSE_WAIT = 1.5   # how long quitting waits for a session to end
 # Picture timing (picture_timing.py): the stream's picture against its sound,
 # and the film window's own picture against the player's clock.
-MEASURE_FIND = 3.0         # the stream's whole window grabbed first, to find the video;
-MEASURE_SECONDS = 20.0     # ...then the video, at least this long all told,
+MEASURE_FIND = 3.0         # the stream's whole window grabbed first, to find the video
+                           # (and on a step at a time while nothing in it moves);
+MEASURE_SECONDS = 20.0     # ...then a band through the video, until this long all told
 MEASURE_MAX = 60.0         # ...and on, a step at a time, until MEASURE_CUTS clear
 MEASURE_CUTS = 5           # cuts are seen or this is reached: a film of long takes
 MEASURE_STEP = 5.0         # can go 20 s with only two
@@ -74,7 +80,6 @@ LEAD_WIDTH = 320           # ...finer: neighbouring frames of a slow scene are c
 LEAD_SETTLE = 25.0         # waiting for a sync's corrections to finish first
 LEAD_TRIES = 3             # looks before giving up for this sync: a still or dark
 LEAD_RETRY = 10.0          # ...scene names too few frames; s between them
-LEAD_BAND = (0.15, 0.60)   # the film picture's rows grabbed: clear of subtitles
 LEAD_RANGE = (-0.05, 0.2)  # a film window lead outside this is not believed
 IS_MAC = sys.platform == "darwin"
 
@@ -415,15 +420,16 @@ class SyncController:
                 if ok:
                     break
             apply = ok or first
+            exact = False
             if ok:
-                match_t = self._refine(samples, sr, match_t, "sync")
+                match_t, exact = self._refine(samples, sr, match_t, "sync")
             if apply:
                 self._say("Seeking...")
                 player.sync_seek(match_t, t0, offset,
                                  waiting=lambda: self._say(self._opening_hint()))
                 player.set_mute(mute)
                 self.q.put(("swap", False, "a sync moved the film"))
-                self._time_film_soon(self._gen)
+                self._after_sync(self._gen, refine=ok and not exact)
             msg = (f"Matched stream audio at {fmt_time(match_t)} "
                    f"(score {score:.1f}, peak z {z:.0f}).")
             if ok:
@@ -689,73 +695,52 @@ class SyncController:
         return True
 
     def _grab_stream_cuts(self, stream_rect):
-        """When the stream's video showed each cut (perf_counter times).
+        """When the stream's video showed each cut (perf_counter times),
+        and how many grabs a second saw them.
 
-        The first MEASURE_FIND seconds grab the whole window, to find the
-        video in it; then just the video - smaller, so faster grabs and
-        finer times - a step at a time, until MEASURE_SECONDS have passed
-        and MEASURE_CUTS clear cuts have been seen, or MEASURE_MAX. Only
-        each grab's change from the one before is kept, so a minute of
-        grabs costs little. Without a video found at first, the whole
-        window is grabbed until one is found in all of it."""
+        First the whole window, to find the video in it: MEASURE_FIND
+        seconds, and on a step at a time while nothing in it has moved
+        enough. Those grabs time nothing - a whole window is too slow to
+        grab at every refresh (picture_timing.band). Then a band through
+        the video, a step at a time, until MEASURE_SECONDS have passed all
+        told and MEASURE_CUTS clear cuts have been seen, or MEASURE_MAX.
+        Only each band grab's change from the one before is kept, so a
+        minute of them costs little."""
         pt = picture_timing
         rect = stream_rect()
         if rect is None:
             raise RuntimeError("the stream's window is not on screen")
-        t_a, img_a = self.grab(rect, MEASURE_FIND, GRAB_WIDTH)
-        found = pt.video_rect(img_a)
+        whole, found, spent = [], None, 0.0
+        while found is None:
+            if spent >= MEASURE_MAX:
+                raise RuntimeError("no moving picture in the stream's window")
+            step = MEASURE_STEP if whole else MEASURE_FIND
+            whole.append(self.grab(rect, step, GRAB_WIDTH)[1])
+            spent += step
+            found = pt.video_rect(np.concatenate(whole))
+        x0, y0, x1, y1 = found
+        sx, sy = rect[2] / whole[0].shape[2], rect[3] / whole[0].shape[1]
+        video = (rect[0] + int(x0 * sx), rect[1] + int(y0 * sy),
+                 int((x1 - x0) * sx), int((y1 - y0) * sy))
+        whole = None
+        area, _ = pt.band(video)
         changes, last = [], None        # (times, change) per step; the last grab seen
-
-        def feed(times, images):
-            nonlocal last
+        while True:
+            times, images = self.grab(area, MEASURE_STEP, GRAB_WIDTH)
+            spent += MEASURE_STEP
             norm = pt.normalize(images)
             if last is not None:
                 times = np.concatenate([[last[0]], times])
                 norm = np.concatenate([last[1][None], norm])
             changes.append((times[1:], pt.change(norm)))
             last = (times[-1], norm[-1])
-
-        if found is not None:
-            x0, y0, x1, y1 = found
-            sx, sy = rect[2] / img_a.shape[2], rect[3] / img_a.shape[1]
-            area = (rect[0] + int(x0 * sx), rect[1] + int(y0 * sy),
-                    int((x1 - x0) * sx), int((y1 - y0) * sy))
-            feed(t_a, img_a[:, y0:y1, x0:x1])
-            last = None                 # the video's grabs differ in size from these
-        else:
-            area, whole = rect, [(t_a, img_a)]
-        spent = MEASURE_FIND
-        while True:
-            times, images = self.grab(area, MEASURE_STEP, GRAB_WIDTH)
-            spent += MEASURE_STEP
-            if found is None:
-                whole.append((times, images))
-                if spent < MEASURE_SECONDS:
-                    continue
-                all_t = np.concatenate([t for t, _ in whole])
-                all_im = np.concatenate([im for _, im in whole])
-                found = pt.video_rect(all_im)
-                if found is None:
-                    if spent >= MEASURE_MAX:
-                        raise RuntimeError("no moving picture in the stream's window")
-                    continue
-                x0, y0, x1, y1 = found
-                feed(all_t, all_im[:, y0:y1, x0:x1])
-                whole = None
-                area = (rect[0] + int(x0 * rect[2] / all_im.shape[2]),
-                        rect[1] + int(y0 * rect[3] / all_im.shape[1]),
-                        int((x1 - x0) * rect[2] / all_im.shape[2]),
-                        int((y1 - y0) * rect[3] / all_im.shape[1]))
-                last = None
-            else:
-                feed(times, images)
             if spent < MEASURE_SECONDS:
                 continue
             t = np.concatenate([c[0] for c in changes])
             sig = np.concatenate([c[1] for c in changes])
             if (len(pt.cuts(t, sig, threshold=pt.CLEAR_CUT)) >= MEASURE_CUTS
                     or spent >= MEASURE_MAX):
-                return pt.cuts(t, sig)
+                return pt.cuts(t, sig), pt.grab_rate(t)
 
     def _measure_stream_worker(self, stream_rect, key):
         info = {"what": "stream", "ok": False, "key": key}
@@ -763,7 +748,7 @@ class SyncController:
             mon = self._loopback()
             start = mon.mark()
             began = time.perf_counter()
-            seen = self._grab_stream_cuts(stream_rect)
+            seen, rate = self._grab_stream_cuts(stream_rect)
             heard = time.perf_counter() - began
             samples, sr, t0, _ = mon.capture_span(heard, start=start, timeout=5.0)
             here = self.player.time()
@@ -775,7 +760,7 @@ class SyncController:
                 self.video_path, audio_matcher.prep_capture(samples, sr), lo, hi)
             if not trusted(score, z):
                 raise RuntimeError("the film's sound was not clear in the stream")
-            match_t = self._refine(samples, sr, match_t, "picture timing")
+            match_t, _ = self._refine(samples, sr, match_t, "picture timing")
             lag_lo, lag_hi = picture_timing.LAG_RANGE
             pts, frames = picture_timing.decode_frames(
                 self.video_path, match_t - lag_hi - 0.1, heard + lag_hi - lag_lo + 0.2, (64, 36))
@@ -793,6 +778,7 @@ class SyncController:
             diagnostics.log(f"picture: {key or 'the stream'}'s picture runs "
                             f"{res['lag'] * 1000:+.0f} ms behind its sound ({res['cuts']} of "
                             f"{res['seen']} cuts agree, spread {res['spread'] * 1000:.0f} ms; "
+                            f"grabbed {rate:.0f} times a second; "
                             f"sound matched at {match_t:.3f}, z {z:.1f})")
         except Exception as e:
             info["why"] = str(e)
@@ -802,29 +788,100 @@ class SyncController:
             self.q.put(("picture", info))
 
     def _refine(self, samples, sr, match_t, what):
-        """match_t made exact from the recording (audio_matcher.refine_match),
-        or left as it is when the recording is not clear enough for that. A
-        refinement is a line in the log (its size says how far out the
-        matcher was), and so is a refinement that failed outright."""
+        """(match_t made exact from the recording, True) - audio_matcher.
+        refine_match - or (match_t, False) when the recording is not clear
+        enough for that. A refinement is a line in the log (its size says
+        how far out the matcher was), and so is a refinement that failed
+        outright."""
         try:
             fine = audio_matcher.refine_match(samples, sr, self.video_path, match_t)
         except Exception as e:
             diagnostics.log(f"{what}: refining match {match_t:.3f} failed: {e}")
-            return match_t
+            return match_t, False
         if fine is None:
-            return match_t
+            return match_t, False
         diagnostics.log(f"{what}: match {match_t:.3f} refined to {fine:.4f} "
                         f"({(fine - match_t) * 1000:+.1f} ms)")
-        return fine
+        return fine, True
 
-    def _time_film_soon(self, gen):
-        """After a sync: time the film window's own picture against the
-        player's clock, once the sync's corrections are done, on a thread.
-        Only the built-in player's window is StreamSync's to grab."""
-        if (self.grab is None or self.film_picture_rect is None
-                or self.player is not self.embedded or self._closing):
+    def _after_sync(self, gen, refine=False):
+        """What follows a sync, on a thread: with refine, the sync made
+        exact on fresh sound (its own recording could not do it); then the
+        film window's own picture timed against the player's clock - only
+        the built-in player's window is StreamSync's to grab. One after the
+        other, as each moves the film and must not measure while the other
+        does."""
+        film = (self.grab is not None and self.film_picture_rect is not None
+                and self.player is self.embedded and not self._closing)
+        if not (refine or film):
             return
-        threading.Thread(target=self._time_film_worker, args=(gen,), daemon=True).start()
+
+        def run():
+            if refine:
+                self._refine_worker(gen)
+            if film:
+                self._time_film_worker(gen)
+        threading.Thread(target=run, daemon=True).start()
+
+    def _refine_worker(self, gen):
+        """A sync whose own recording was not clear enough to make exact (a
+        quiet scene, a voice over it, a stream still settling after a jump)
+        is only as good as the matcher's 16 ms steps - one left the film 21
+        ms off the stream. So the stream is heard again, REFINE_LISTEN s at
+        a time, up to REFINE_TRIES times, that sound made exact against
+        where the film has put it, and the film moved by the difference.
+        A difference over REFINE_FIX is the stream itself having moved
+        since the match - a stand-in VLC's sound settled 68 ms from where a
+        sync just after its seek heard it - and is followed only once a
+        second look agrees with it, so a stream still on the move is not
+        chased."""
+        player = self.player
+        moved_on = lambda: (self._gen != gen or self._closing or self.player is not player
+                            or self.session_running())
+        try:
+            mon = self._loopback()
+            seen = None                 # a big difference, waiting on a second look
+            for _ in range(REFINE_TRIES):
+                give_up = time.monotonic() + LEAD_SETTLE
+                while player.settling() and time.monotonic() < give_up:
+                    if moved_on():
+                        return
+                    time.sleep(0.1)
+                if moved_on():
+                    return
+                start = mon.mark()
+                samples, sr, t1, _ = mon.capture_span(REFINE_LISTEN, start=start,
+                                                      timeout=REFINE_LISTEN + 5.0)
+                pos = playing_position_at(player, t1)
+                if moved_on():
+                    return
+                if pos is None or player.settling():
+                    continue                # paused, or being corrected meanwhile
+                off = self.placement_offset()
+                fine = audio_matcher.refine_match(samples, sr, self.video_path, pos - off)
+                if fine is None:
+                    continue
+                drift = fine + off - pos
+                if abs(drift) > REFINE_FIX and (seen is None
+                                                or abs(drift - seen) > REFINE_SAME):
+                    seen = drift            # the stream moved: is it still moving?
+                    continue
+                diagnostics.log(f"sync: made exact on {REFINE_LISTEN:.0f} s more of the "
+                                f"stream - the film moved {drift * 1000:+.1f} ms"
+                                + (" (the stream had moved since the match; seen twice)"
+                                   if abs(drift) > REFINE_FIX else ""))
+                self._shift(drift)
+                return
+            if seen is not None:
+                diagnostics.log(f"sync: the stream's sound moved {seen * 1000:+.0f} ms from "
+                                "the match and no second look agreed; the film stays as "
+                                "matched")
+            else:
+                diagnostics.log(f"sync: not made exact - the stream's sound was not clear "
+                                f"enough in {REFINE_TRIES} more looks; the film stays as "
+                                "matched")
+        except Exception as e:
+            diagnostics.log(f"sync: making the match exact stopped: {e}")
 
     def _time_film_worker(self, gen):
         player = self.embedded
@@ -855,7 +912,8 @@ class SyncController:
             self._shift(self.placement_offset() - before)
             diagnostics.log(f"picture: the film window shows frames {res['lead'] * 1000:.1f} ms "
                             f"after the player's clock ({res['frames']} frames, spread "
-                            f"{res['spread'] * 1000:.1f} ms); allowing {self.film_lead * 1000:.1f} ms")
+                            f"{res['spread'] * 1000:.1f} ms, grabbed {res['rate']:.0f} times a "
+                            f"second); allowing {self.film_lead * 1000:.1f} ms")
             self.q.put(("picture", {"what": "film", "ok": True, "lead": self.film_lead}))
         except Exception as e:
             diagnostics.log(f"picture: timing the film window failed: {e}")
@@ -878,8 +936,7 @@ class SyncController:
             if skip:
                 diagnostics.log(f"picture: the film window was not timed: {skip}")
             return None
-        x, y, w, h = rect
-        band = (x, y + int(h * LEAD_BAND[0]), w, int(h * (LEAD_BAND[1] - LEAD_BAND[0])))
+        band, crop = picture_timing.band(rect)      # as the stream's is grabbed
         times, images = self.grab(band, LEAD_SECONDS, LEAD_WIDTH)
         pos = [playing_position_at(player, t) for t in times]
         if moved_on():
@@ -889,11 +946,12 @@ class SyncController:
         lo = min(pos) - 0.5
         pts, frames = picture_timing.decode_frames(
             self.video_path, lo, max(pos) - lo + 0.5, (images.shape[2], images.shape[1]),
-            crop=(0.0, LEAD_BAND[0], 1.0, LEAD_BAND[1]))
+            crop=crop)
         res = picture_timing.film_lead(times, picture_timing.normalize(images), pos,
                                        pts, picture_timing.normalize(frames))
         if res is None or not LEAD_RANGE[0] <= res["lead"] <= LEAD_RANGE[1]:
             return {}
+        res["rate"] = picture_timing.grab_rate(times)
         return res
 
     # ----------------------------------------------------------- sessions

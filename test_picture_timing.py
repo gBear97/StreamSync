@@ -120,6 +120,24 @@ def window_rect():
     check("a still page has no video", pt.video_rect(still) is None)
 
 
+def bands():
+    """What a timing grabs: a band through the picture's middle, cut to
+    BAND_MOST, and where it is as fractions of the picture, for the film's
+    frames to be cut alike."""
+    rect, crop = pt.band((100, 50, 1000, 500))
+    check("a band through the middle rows", rect == (100, 200, 1000, 150)
+          and np.allclose(crop, (0.0, 0.3, 1.0, 0.6)), f"{rect} {crop}")
+    rect, crop = pt.band((-2560, 0, 2560, 1440))
+    x, y, w, h = rect
+    check("a big picture's band is cut to its middle", (w, h) == pt.BAND_MOST
+          and x == -1920 and abs(y + h / 2 - 0.45 * 1440) <= 1, f"{rect}")
+    check("...and its crop says where", np.allclose(
+        crop, ((x + 2560) / 2560, y / 1440, (x + w + 2560) / 2560, (y + h) / 1440)), f"{crop}")
+    t = 7.0 + np.arange(1440) / 144.0
+    check("grabs a second", abs(pt.grab_rate(t) - 144) < 0.01
+          and abs(pt.grab_rate(t[::2]) - 72) < 0.01 and pt.grab_rate(t[:1]) == 0.0)
+
+
 def film_window():
     pts, frames, _ = film_shots(length=8.0, size=(64, 36))
     lead = 0.0123
@@ -177,6 +195,7 @@ def main():
     channel_keys()
     stream_cuts()
     window_rect()
+    bands()
     film_window()
     decoded_film()
     print("PICTURE TIMING TEST PASSED")
