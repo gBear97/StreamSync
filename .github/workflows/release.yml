@@ -426,6 +426,15 @@ jobs:
             esac
           done
 
+      # GitHub's Intel runners have dropped the HTTP/3 connection stapler
+      # opens to Apple since about 2026-10-12, and for 2.0.9 four tries
+      # over three minutes all failed. With UDP 443 refused, stapler goes
+      # over TCP, which works there (actions/runner-images#14924; see
+      # ci/block_udp_443.sh). So this comes before the first staple.
+      - name: Make stapler reach Apple over TCP (Intel runner)
+        if: runner.arch == 'X64'
+        run: ci/block_udp_443.sh
+
       # Notarize the app itself first and staple the ticket into the
       # bundle, so it still validates once dragged out of the disk image
       # and the image is gone.
@@ -462,8 +471,9 @@ jobs:
       # rather than discovered by them.
       #
       # stapler validate asks CloudKit for the ticket again, and that
-      # connection dropped here in 2.0.7, so it goes through
-      # ci/apple_retry.sh like the stapling does.
+      # connection dropped here in 2.0.7 and 2.0.9. So on the Intel
+      # runner it goes over TCP, and it goes through ci/apple_retry.sh
+      # like the stapling does.
       - name: Verify the image mounts and Gatekeeper accepts the app
         run: |
           MNT=$(mktemp -d)
@@ -474,6 +484,15 @@ jobs:
           ci/apple_retry.sh xcrun stapler validate "$MNT/StreamSync.app"
           spctl --assess --type execute --verbose=4 "$MNT/StreamSync.app"
           hdiutil detach "$MNT"
+
+      # How much UDP 443 the block turned away, so the log shows whether
+      # stapler still tries HTTP/3 there - and, once GitHub's network is
+      # fixed, that the block can go. Only a report: it never fails a
+      # build.
+      - name: Show what the UDP 443 block turned away (Intel runner)
+        if: always() && runner.arch == 'X64'
+        continue-on-error: true
+        run: ci/block_udp_443.sh --report
 
       # --clobber: a re-run replaces what an earlier, failed run attached.
       - name: Attach the disk image to the draft release
