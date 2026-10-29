@@ -491,10 +491,12 @@ class FakeWasapi:
         out, self.pending = self.pending[:numframes * nch], self.pending[numframes * nch:]
         return out.reshape(-1, nch)
 
-    def arrival_bound(self, frame, span=2.0):
-        """The tightest arrival-based bound - what stamping on arrival gives."""
+    def arrival_bound(self, frame, span=2.0, step=None):
+        """The tightest arrival-based bound - what stamping on arrival gives.
+        step: only packets ending a block of that many frames count - a
+        reader handed whole blocks sees only those packets arrive."""
         return min(t - (end - frame) / SR for end, t in self.delivered
-                   if frame <= end <= frame + span * SR)
+                   if frame <= end <= frame + span * SR and (step is None or end % step == 0))
 
 
 def fake_hook(rec, note):
@@ -578,7 +580,10 @@ def playout_tests():
         raise AttributeError("no _ppCaptureClient")
     dev = FakeWasapi()
     data, t0, lo, logs, rec = run(dev, hook=no_hook)
-    err = t0 - dev.arrival_bound(lo)
+    # record() hands over whole blocks, two packets each, so only every
+    # other packet's arrival is seen: against all of them, a macOS runner's
+    # uneven sleeps put this 2.8 ms out
+    err = t0 - dev.arrival_bound(lo, step=int(round(ac.BLOCK_S * SR)))
     assert not rec.hooked and -0.0005 < err < 0.002, err
     want = ((np.arange(lo, lo + data.size) % 1000) / 1000.0 + 0.01)
     assert np.allclose(data, want, atol=1e-4), "slice is not contiguous"
