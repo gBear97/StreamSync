@@ -8,7 +8,8 @@ name: Release
 # release whose checksums that key did not sign, so the secret
 # RELEASE_SIGNING_KEY is checked before anything is built.
 #
-# Two ways in, both requiring the tag to agree with version.py:
+# Two ways in, both requiring the tag to agree with version.py and the
+# release's notes to be in release-notes/<tag>.md:
 #   - push a tag:  git tag v1.0.1 && git push origin v1.0.1
 #   - Actions tab: Release > Run workflow > enter v1.0.1
 #
@@ -20,8 +21,8 @@ name: Release
 # account's storage quota, which once filled up and would have failed a
 # release after it had been signed and notarized. Drafts are invisible to
 # the updater (it reads /releases/latest), so users never see a release
-# until it is complete, and a failed run leaves a draft the next run
-# picks up again.
+# until it is complete, and a failed run leaves a draft the next run of
+# the same commit picks up again (a run of a newer commit starts afresh).
 
 on:
   push:
@@ -70,23 +71,63 @@ jobs:
           fi
           echo "The release signing key is present."
 
+      # What the release says is release-notes/<tag>.md, merged with the
+      # version bump. The draft used to get GitHub's generated list of
+      # pull requests instead, and the file had to be swapped in by hand
+      # with `gh release edit` before the publish job made it public -
+      # which every release needed and nothing enforced. A missing file
+      # stops the run here, before anything is built.
+      - name: Check the release notes are written
+        run: |
+          TAG="${{ inputs.version || github.ref_name }}"
+          NOTES="release-notes/$TAG.md"
+          if [ ! -s "$NOTES" ]; then
+            echo "There is no $NOTES (or it is empty) in this commit."
+            echo "Write what users get in $TAG there, merge it with the"
+            echo "version bump, and run the release again."
+            exit 1
+          fi
+          echo "The release notes are $NOTES."
+
+      # A draft an earlier run left is reused only if that run was of this
+      # same commit, and its notes are refreshed from the file. A draft
+      # opened for another commit - the release run again after a fix was
+      # merged - is deleted and opened afresh. Its builds' names carry that
+      # commit, so this run's uploads would sit beside them instead of
+      # replacing them, and the publish job, which wants exactly one of
+      # each, would fail after both Macs had been notarized. Its target
+      # would also have put the tag on a commit this run never built.
       - name: Create the draft, or reuse one an earlier run left
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ inputs.version || github.ref_name }}"
-          if draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
-                       --json isDraft -q .isDraft 2>/dev/null); then
+          NOTES="release-notes/$TAG.md"
+          # --target pins the tag to this commit; the tag itself is
+          # created when the draft is published.
+          create() {
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
+              --target "$GITHUB_SHA" --title "StreamSync $TAG" --notes-file "$NOTES"
+          }
+          if found=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+                       --json isDraft,targetCommitish \
+                       -q '"\(.isDraft) \(.targetCommitish)"' 2>/dev/null); then
+            read -r draft target <<< "$found"
             if [ "$draft" != "true" ]; then
               echo "$TAG is already published. Bump version.py and use a new tag."
               exit 1
             fi
-            echo "Reusing the draft $TAG left by an earlier run."
+            if [ "$target" = "$GITHUB_SHA" ]; then
+              gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$NOTES"
+              echo "Reusing the draft $TAG left by an earlier run of this commit, with the notes in $NOTES."
+            else
+              echo "The draft $TAG was opened for $target, not $GITHUB_SHA."
+              echo "Deleting it, and the builds that run attached, and opening a new one."
+              gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+              create
+            fi
           else
-            # --target pins the tag to this commit; the tag itself is
-            # created when the draft is published.
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
-              --target "$GITHUB_SHA" --title "StreamSync $TAG" --generate-notes
+            create
           fi
 
   build:
@@ -165,8 +206,9 @@ jobs:
           fi
           echo "All five signing secrets are present."
 
+      # The versions in constraints.txt, so what ships is what CI tested.
       - name: Install dependencies
-        run: python3 -m pip install -r requirements.txt
+        run: python3 -m pip install -r requirements.txt -c constraints.txt
 
       - name: Run tests
         run: |
@@ -257,6 +299,11 @@ jobs:
       # binary, and one unsigned executable anywhere inside the bundle is
       # enough for Apple to refuse the whole submission. Asking `file`
       # what each one is cannot go stale the way a list of suffixes does.
+      #
+      # Each signature carries a timestamp from Apple's server, which once
+      # never answered (2.0.2: "A timestamp was expected but was not
+      # found") and cost a re-run. ci/apple_retry.sh signs again when the
+      # server is what failed, and fails at once on anything else.
       - name: Sign the app
         run: |
           APP=dist/StreamSync.app
@@ -264,7 +311,7 @@ jobs:
           while IFS= read -r -d '' f; do
             case "$(file -b "$f")" in
               *Mach-O*)
-                codesign --force --timestamp --options runtime \
+                ci/apple_retry.sh codesign --force --timestamp --options runtime \
                   --keychain "$KEYCHAIN" --sign "$IDENTITY" "$f"
                 count=$((count + 1))
                 ;;
@@ -277,14 +324,14 @@ jobs:
           # entitlements cover only the app's process, so the helper gets
           # its own (mac/sstap.entitlements) - signed again, after the loop
           # above signed it plain, and before the bundle seals it.
-          codesign --force --timestamp --options runtime \
+          ci/apple_retry.sh codesign --force --timestamp --options runtime \
             --entitlements mac/sstap.entitlements \
             --keychain "$KEYCHAIN" --sign "$IDENTITY" "$APP/Contents/MacOS/sstap"
           codesign -d --entitlements - --xml "$APP/Contents/MacOS/sstap" 2>/dev/null \
             | grep -q "com.apple.security.device.audio-input" \
             || { echo "sstap lacks the audio-input entitlement"; exit 1; }
 
-          codesign --force --timestamp --options runtime \
+          ci/apple_retry.sh codesign --force --timestamp --options runtime \
             --entitlements entitlements.plist \
             --keychain "$KEYCHAIN" --sign "$IDENTITY" "$APP"
 
@@ -405,7 +452,7 @@ jobs:
           NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
           NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
         run: |
-          codesign --force --timestamp --keychain "$KEYCHAIN" \
+          ci/apple_retry.sh codesign --force --timestamp --keychain "$KEYCHAIN" \
             --sign "$IDENTITY" "$DMG"
           NOTARY_KEY_FILE="$RUNNER_TEMP/notary.p8" \
             ci/notarize.sh "$DMG" "$DMG"
@@ -413,6 +460,10 @@ jobs:
 
       # What a user's Mac will conclude on first launch, asserted here
       # rather than discovered by them.
+      #
+      # stapler validate asks CloudKit for the ticket again, and that
+      # connection dropped here in 2.0.7, so it goes through
+      # ci/apple_retry.sh like the stapling does.
       - name: Verify the image mounts and Gatekeeper accepts the app
         run: |
           MNT=$(mktemp -d)
@@ -420,7 +471,7 @@ jobs:
           test -x "$MNT/StreamSync.app/Contents/MacOS/StreamSync" \
             || { echo "main binary missing or not executable"; exit 1; }
           codesign --verify --strict --deep --verbose=2 "$MNT/StreamSync.app"
-          xcrun stapler validate "$MNT/StreamSync.app"
+          ci/apple_retry.sh xcrun stapler validate "$MNT/StreamSync.app"
           spctl --assess --type execute --verbose=4 "$MNT/StreamSync.app"
           hdiutil detach "$MNT"
 

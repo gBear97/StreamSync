@@ -2,7 +2,8 @@
 # Output: dist\StreamSync\StreamSync.exe
 # VLC must still be installed on the machine that runs the exe.
 
-pip install --disable-pip-version-check pyinstaller
+# constraints.txt: the exact versions CI and the releases are built with.
+pip install --disable-pip-version-check -c constraints.txt pyinstaller
 if (-not $?) { exit 1 }
 
 # invoked as a module: pip's user-install Scripts dir may not be on PATH

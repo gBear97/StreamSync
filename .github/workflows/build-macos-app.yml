@@ -57,7 +57,7 @@ jobs:
         run: python3 -c "import tkinter; print('Tk', tkinter.TkVersion)"
 
       - name: Install dependencies
-        run: python3 -m pip install -r requirements.txt
+        run: python3 -m pip install -r requirements.txt -c constraints.txt
 
       # The no-UI, no-VLC, no-permissions engine tests from MAC_FIRST_RUN.md:
       # prove the sync brain works on this macOS/arch before packaging it.

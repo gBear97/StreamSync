@@ -96,20 +96,49 @@ jobs:
           echo "SETUP=$BASE.exe" >> "$GITHUB_ENV"
           echo "Building StreamSync $FILE from $(git rev-parse --short HEAD)"
 
+      # The versions in constraints.txt, so what ships is what CI tested. A
+      # tag from before that file is rebuilt the way it was built then,
+      # with whatever PyPI has.
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        run: |
+          if [ -f constraints.txt ]; then
+            python -m pip install -r requirements.txt -c constraints.txt
+          else
+            python -m pip install -r requirements.txt
+          fi
 
       - name: Build StreamSync.exe
         shell: pwsh
         run: ./build_exe.ps1
 
+      # The runner image comes with Inno Setup 6. An image without it gets
+      # 6.7.3, the last 6.x, from Inno Setup's own GitHub release, checked
+      # against the SHA-256 that release and its .issig file both give.
+      # This used to be `choco install innosetup`, which would fail with
+      # Chocolatey's feed down, and which now installs Inno Setup 7, into a
+      # folder this step does not look in.
       - name: Build the installer
         shell: pwsh
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) {
-            choco install innosetup --no-progress -y
-            if (-not $?) { exit 1 }
+            $url = 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe'
+            $sha256 = '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732'
+            $exe = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+            for ($try = 1; ; $try++) {
+              curl.exe --fail --silent --show-error --location --connect-timeout 30 `
+                --max-time 300 --output $exe $url
+              if ($LASTEXITCODE -eq 0 -and
+                  (Get-FileHash $exe -Algorithm SHA256).Hash -eq $sha256) { break }
+              if ($try -ge 4) { throw "No good copy of Inno Setup 6.7.3 in 4 tries." }
+              "Download $try of 4 failed or did not match; trying again."
+              Start-Sleep -Seconds (15 * $try)
+            }
+            $p = Start-Process $exe -Wait -PassThru -ArgumentList '/VERYSILENT',
+                   '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=`"$(Split-Path $iscc)`""
+            if ($p.ExitCode -ne 0) { throw "Inno Setup's installer exited $($p.ExitCode)" }
+            if (-not (Test-Path $iscc)) { throw "Inno Setup installed, but there is no $iscc" }
+            "Installed Inno Setup 6.7.3"
           }
           & $iscc /Q "/DAppVersion=$env:VERSION" "/DOutputBase=$env:SETUP_BASE" installer\StreamSync.iss
           if ($LASTEXITCODE -ne 0) { exit 1 }

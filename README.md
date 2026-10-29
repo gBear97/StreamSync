@@ -595,6 +595,11 @@ python streamsync.py          # the first-run check, then the app
 python -m ui.shell            # the app without the first-run check
 ```
 
+`requirements.txt` takes the newest release of each package. CI, the
+release builds and both build scripts add `-c constraints.txt`, which
+holds them to the exact versions a release ships with; add it to the
+`pip install` above to run what the releases run.
+
 `python streamsync.py --selftest` opens the app, tours every dialog and
 closes it again, with a throwaway settings file; it exits 0 when it
 worked.
@@ -682,36 +687,32 @@ or **Actions > Release > Run workflow**, entering `v2.0.0`. The manual
 route creates the tag as part of publishing, so a release can be cut
 without a local clone.
 
-Then put the notes on the release. The workflow opens the draft with
-GitHub's generated list of merged pull requests as its text, and
-publishing keeps whatever text the draft has by then. The release page
-is what the Update window's **What's new** link and the site's download
-buttons open, so once the run's first job has opened the draft (a
-minute or two in), and while the Macs build and notarize:
-
-```
-gh release edit v2.0.0 --notes-file release-notes/v2.0.0.md
-```
-
-or paste the notes into the draft on the Releases page. Running the same
-command after publishing also works, but until then the release shows
-the generated list.
+The workflow puts that file on the release as its text, which is what
+the Update window's **What's new** link and the site's download buttons
+open, so there is nothing to paste in by hand. To change the notes after
+the release is out, edit the file and run
+`gh release edit v2.0.0 --notes-file release-notes/v2.0.0.md`.
 
 The Release workflow:
 
 1. refuses to start if the tag and `version.py` disagree - otherwise an
    update would install a build that reports a different version and be
-   offered again forever - or if the `RELEASE_SIGNING_KEY` secret is
-   missing;
-2. opens a draft release (drafts are invisible to the updater, which
-   reads `/releases/latest`; a failed run leaves a draft the next run
-   picks up);
+   offered again forever - if `release-notes/<tag>.md` is missing, or if
+   the `RELEASE_SIGNING_KEY` secret is missing;
+2. opens a draft release with those notes (drafts are invisible to the
+   updater, which reads `/releases/latest`). A failed run leaves its draft
+   for the next run of the same commit, which gives it the file's current
+   text; a run of a newer commit, say after a fix, deletes that draft and
+   its builds and opens a new one;
 3. builds one `.dmg` per Mac architecture: signs the app with a Developer
    ID, proves the signed bundle can make a verified HTTPS request
    (`--netcheck`) and report its diagnostics, has Apple notarize it,
    staples the ticket into both the app and the disk image, and checks
    `spctl` accepts the result - so a release that would trip Gatekeeper
-   fails the build rather than reaching anyone;
+   fails the build rather than reaching anyone. Signing, notarizing and
+   stapling all talk to Apple's servers, and a dropped connection there
+   is tried again a few times (`ci/apple_retry.sh`) instead of failing
+   the run; anything Apple actually refuses still fails it at once;
 4. builds the Windows installer (`build-windows.yml`): the PyInstaller
    app, packed by Inno Setup, then installed silently on the runner, run
    once (`--netcheck`) and uninstalled again before it is attached;
