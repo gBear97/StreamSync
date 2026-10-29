@@ -11,6 +11,7 @@ matching need no more, and 20 s of grabs then fit in a few tens of MB.
 """
 
 import ctypes
+import sys
 import time
 from ctypes import wintypes
 
@@ -40,23 +41,26 @@ def _proto(name, restype, *argtypes, dll):
     return ctypes.WINFUNCTYPE(restype, *argtypes)((name, dll))
 
 
-_user32 = ctypes.windll.user32
-_gdi32 = ctypes.windll.gdi32
-_GetDC = _proto("GetDC", wintypes.HDC, wintypes.HWND, dll=_user32)
-_ReleaseDC = _proto("ReleaseDC", ctypes.c_int, wintypes.HWND, wintypes.HDC, dll=_user32)
-_CreateCompatibleDC = _proto("CreateCompatibleDC", wintypes.HDC, wintypes.HDC, dll=_gdi32)
-_DeleteDC = _proto("DeleteDC", wintypes.BOOL, wintypes.HDC, dll=_gdi32)
-_CreateDIBSection = _proto("CreateDIBSection", wintypes.HBITMAP, wintypes.HDC,
-                           ctypes.POINTER(BITMAPINFO), wintypes.UINT,
-                           ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE,
-                           wintypes.DWORD, dll=_gdi32)
-_SelectObject = _proto("SelectObject", wintypes.HGDIOBJ, wintypes.HDC, wintypes.HGDIOBJ,
-                       dll=_gdi32)
-_DeleteObject = _proto("DeleteObject", wintypes.BOOL, wintypes.HGDIOBJ, dll=_gdi32)
-_BitBlt = _proto("BitBlt", wintypes.BOOL, wintypes.HDC, ctypes.c_int, ctypes.c_int,
-                 ctypes.c_int, ctypes.c_int, wintypes.HDC, ctypes.c_int, ctypes.c_int,
-                 wintypes.DWORD, dll=_gdi32)
-_GdiFlush = _proto("GdiFlush", wintypes.BOOL, dll=_gdi32)
+# Bound only on Windows, so this module imports anywhere: the Windows
+# shell imports it, and its tests (test_winswap) run on every system.
+if sys.platform == "win32":
+    _user32 = ctypes.windll.user32
+    _gdi32 = ctypes.windll.gdi32
+    _GetDC = _proto("GetDC", wintypes.HDC, wintypes.HWND, dll=_user32)
+    _ReleaseDC = _proto("ReleaseDC", ctypes.c_int, wintypes.HWND, wintypes.HDC, dll=_user32)
+    _CreateCompatibleDC = _proto("CreateCompatibleDC", wintypes.HDC, wintypes.HDC, dll=_gdi32)
+    _DeleteDC = _proto("DeleteDC", wintypes.BOOL, wintypes.HDC, dll=_gdi32)
+    _CreateDIBSection = _proto("CreateDIBSection", wintypes.HBITMAP, wintypes.HDC,
+                               ctypes.POINTER(BITMAPINFO), wintypes.UINT,
+                               ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE,
+                               wintypes.DWORD, dll=_gdi32)
+    _SelectObject = _proto("SelectObject", wintypes.HGDIOBJ, wintypes.HDC, wintypes.HGDIOBJ,
+                           dll=_gdi32)
+    _DeleteObject = _proto("DeleteObject", wintypes.BOOL, wintypes.HGDIOBJ, dll=_gdi32)
+    _BitBlt = _proto("BitBlt", wintypes.BOOL, wintypes.HDC, ctypes.c_int, ctypes.c_int,
+                     ctypes.c_int, ctypes.c_int, wintypes.HDC, ctypes.c_int, ctypes.c_int,
+                     wintypes.DWORD, dll=_gdi32)
+    _GdiFlush = _proto("GdiFlush", wintypes.BOOL, dll=_gdi32)
 
 
 def grab(rect, seconds, width=160, stop=None):
@@ -67,6 +71,8 @@ def grab(rect, seconds, width=160, stop=None):
     w'], the green channel shrunk by the whole factor that brings w nearest
     `width` (green carries most of the brightness, and matching needs no
     more)."""
+    if sys.platform != "win32":
+        raise OSError("Grabbing the screen needs Windows.")
     x, y, w, h = (int(v) for v in rect)
     f = max(1, int(round(w / float(width))))
     cw, ch = (w // f) * f, (h // f) * f
