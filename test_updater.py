@@ -872,6 +872,109 @@ check("the temp folder's downloads, only listed", [
     p for p in updater.old_downloads()
     if os.path.dirname(p) != tempfile.gettempdir()
     or not os.path.basename(p).startswith(updater.DOWNLOAD_PREFIX)], [])
+check("the temp folder's swap scripts, only listed", [
+    p for p in updater.old_swap_scripts()
+    if os.path.dirname(p) != tempfile.gettempdir()
+    or not os.path.basename(p).startswith(updater.SWAP_PREFIX)], [])
+
+# --- the Mac's swap script: it swaps, relaunches, and leaves nothing ----
+# Every in-app update on the Mac left its 290-byte streamsync-swap-*.sh in
+# $TMPDIR (six on the test Mac by 2026-10-23): nothing removed it. It now
+# deletes itself, and a launch's sweep clears what older versions left.
+# The real script, run by sh where there is one, on a stand-in app in a
+# folder of the test's own: it waits on a process that has already
+# exited, and `open` is a stand-in that only notes what it was asked.
+import time
+
+
+def _swap(staged=True):
+    """swap_and_relaunch on a stand-in app. Returns (folder, app, the
+    script's exit code, what open was asked, or None)."""
+    folder = tempfile.mkdtemp(prefix="swap-test-")
+    _roots.append(folder)
+    app = os.path.join(folder, "Applications", "StreamSync.app")
+    new = os.path.join(folder, "staged", "StreamSync.app")
+    _write(os.path.join(app, "Contents", "Info.plist"), 1)       # the old app: 1 byte
+    if staged:
+        _write(os.path.join(new, "Contents", "Info.plist"), 2)   # the new one: 2
+    bin_dir = os.path.join(folder, "bin")
+    os.makedirs(bin_dir)
+    asked = os.path.join(folder, "asked")
+    with open(os.path.join(bin_dir, "open"), "w") as f:
+        f.write(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{asked}"\n')
+    os.chmod(os.path.join(bin_dir, "open"), 0o755)
+    gone = _sp.Popen([sys.executable, "-c", "pass"])
+    gone.wait()
+    started = []
+    real = os.getpid, tempfile.tempdir, os.environ["PATH"], _sp.Popen
+    os.getpid = lambda: gone.pid             # the app it waits on has quit
+    tempfile.tempdir = folder                # the script is written here
+    os.environ["PATH"] = bin_dir + os.pathsep + real[2]
+    _sp.Popen = lambda *a, **kw: started.append(real[3](*a, **kw)) or started[-1]
+    try:
+        updater.swap_and_relaunch(app, new)
+    finally:
+        os.getpid, tempfile.tempdir, os.environ["PATH"], _sp.Popen = real
+    code = started[0].wait(30)
+    said = None
+    if os.path.exists(asked):
+        with open(asked) as f:
+            said = f.read().splitlines()
+    return folder, app, code, said
+
+
+def _plist(app):
+    return os.path.getsize(os.path.join(app, "Contents", "Info.plist"))
+
+
+if sys.platform == "win32" or not os.path.exists("/bin/sh"):
+    print("  swap script checks SKIPPED: the Mac's script needs sh")
+else:
+    folder, app, code, said = _swap()
+    check("swap: done", code, 0)
+    check("swap: the new app in place, the old one and the staged copy gone",
+          (_plist(app), os.path.exists(app + ".old"),
+           os.path.exists(os.path.join(folder, "staged", "StreamSync.app"))),
+          (2, False, False))
+    check("swap: the new app opened", said, ["-a", app])
+    check("swap: its script gone with it", updater.old_swap_scripts(folder), [])
+    folder, app, code, said = _swap(staged=False)
+    check("failed swap: says so, the old app back, nothing opened",
+          (code, _plist(app), os.path.exists(app + ".old"), said), (1, 1, False, None))
+    check("failed swap: its script gone too", updater.old_swap_scripts(folder), [])
+
+# The scripts older versions left are cleared by a launch's sweep: plain
+# files named streamsync-swap-*.sh, directly in the temp folder - not a
+# folder or a link of that name, nor another app's.
+root = tempfile.mkdtemp(prefix="sweep-test-")
+outside = tempfile.mkdtemp(prefix="sweep-test-outside-")
+_roots += [root, outside]
+_write(os.path.join(root, "streamsync-swap-6m_jk9l1.sh"), 290)
+_write(os.path.join(root, "streamsync-swap-9xe5wv26.sh"), 290)
+_write(os.path.join(root, "streamsync-swap-folder.sh", "inside.sh"), 10)
+_write(os.path.join(root, "otherapp-swap-a1.sh"), 10)
+_write(os.path.join(root, "streamsync-swap-b2.txt"), 10)
+_write(os.path.join(root, "streamsync-dl-c3", "streamsync-swap-d4.sh"), 10)
+_write(os.path.join(outside, "keep.sh"), 10)
+kept = ["otherapp-swap-a1.sh", "streamsync-dl-c3", "streamsync-swap-b2.txt",
+        "streamsync-swap-folder.sh"]
+try:
+    os.symlink(os.path.join(outside, "keep.sh"),
+               os.path.join(root, "streamsync-swap-link.sh"))
+    kept.append("streamsync-swap-link.sh")
+except (OSError, NotImplementedError) as e:
+    print(f"  swap script link check SKIPPED: {e}")
+check("scripts: listed as swap scripts, nothing else",
+      _names(updater.old_swap_scripts(root)),
+      ["streamsync-swap-6m_jk9l1.sh", "streamsync-swap-9xe5wv26.sh"])
+removed, size, left = updater.sweep_downloads(root, sleep=lambda s: None)
+check("scripts: the two removed, with the download beside them",
+      (_names(removed), size, left),
+      (["streamsync-dl-c3", "streamsync-swap-6m_jk9l1.sh", "streamsync-swap-9xe5wv26.sh"],
+       590, []))
+check("scripts: the rest left as it was", sorted(os.listdir(root)),
+      sorted(k for k in kept if k != "streamsync-dl-c3"))
+check("scripts: what a link points at untouched", os.listdir(outside), ["keep.sh"])
 
 
 # --- what a launch's sweep says, from a thread of its own ---------------
@@ -901,6 +1004,17 @@ check("log: and one for what would not", _sweep_log(root, tries=2,
                                                      remove=remove)[1],
       ["removed 2 old update downloads (0 MB)",
        "could not remove 1 old update download; the next launch tries again"])
+
+# swap scripts are named as what they are, and a few hundred bytes are no size
+root = tempfile.mkdtemp(prefix="sweep-test-")
+_roots.append(root)
+for name in ("streamsync-swap-aa.sh", "streamsync-swap-bb.sh"):
+    _write(os.path.join(root, name), 290)
+check("log: scripts alone", _sweep_log(root)[1], ["removed 2 old swap scripts"])
+_write(os.path.join(root, "streamsync-swap-cc.sh"), 290)
+_write(os.path.join(root, "streamsync-dl-big", "setup.exe"), 3 * MiB)
+check("log: a script and a download", _sweep_log(root)[1],
+      ["removed 1 old update download and 1 old swap script (3 MB)"])
 
 
 def _broken(path):

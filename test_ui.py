@@ -910,6 +910,27 @@ def main_synced(env, root, app):
         check("auto_var set by code draws the Switch on", switch_is_on(sw))
     shot(root, root, "02-main-synced")
 
+    # A status that comes, wraps to two lines and goes leaves the timeline
+    # where it is. On the PC a pause's two-line "Couldn't find the stream
+    # window..." moved it 9-12 px down just as a jump was clicked there,
+    # and the click landed above it.
+    from ui import mainwin, theme
+    swap = ("Couldn't find the stream window - pick it in Settings > Stream window "
+            "(Refresh lists what's open).")
+    wraps = (int(root.tk.call("font", "measure", theme.font(12), swap))
+             > theme.px(mainwin.CARD_INNER_W))
+    check("the swap's message is two lines long on Main", wraps)
+    at = {}
+    for label, text in (("none", ""), ("one line", "Session ABCD-EFGH - 1 viewer(s) connected."),
+                        ("two lines", swap), ("none again", "")):
+        app._set_status(text)
+        pump(root, 0.1)
+        at[label] = (app.timeline.winfo_rooty(), app.play_btn.winfo_rooty())
+    check("the timeline and the play button stay put as the status comes, wraps and goes",
+          len(set(at.values())), 1)
+    if len(set(at.values())) != 1:
+        print("  timeline and play button y by status:", at)
+
 
 def keys_and_film_window(env, root, app):
     # item 9: the six keys on the three windows that take them
@@ -1338,6 +1359,238 @@ def watch_party(env, root, app):
     check("Close unregisters Watch party", app._party, None)
 
 
+REFUSAL = ("Verification failed: your file's audio doesn't match the host's (bit error "
+           "0.41 at 12 min in). Sync would be wrong, so it won't start.")
+RELAY_LOST = "Relay connection lost (could not reach the relay). Session ended."
+
+
+def party_leftovers(env, root, app):
+    """What the live tests of 2026-10-22 and 23 left open after 2.0.8, in
+    the Watch party window: why a session ended showed only in the main
+    window (item 3); closing the window after a failed join lost the code
+    typed (item 4); Film position from went back to What this computer
+    hears (item 5). Sessions here are stand-ins that end by themselves as
+    the engine's do: their line said (last_said set first), then the stop
+    flag."""
+    import session as engine
+    from ui import widgets
+
+    class Party(SimpleNamespace):
+        ending = None              # the line it ends with by itself, if any
+        queued = True              # whether that line goes through the queue too
+
+        def start(self):
+            if type(self).ending is None:
+                return
+            def end():
+                self.last_said = type(self).ending
+                if type(self).queued:
+                    app.q.put(("session", self.last_said))
+                self.stop_flag.set()
+            threading.Timer(0.2, end).start()   # after the window shows it running
+
+        def stop(self):
+            self.stop_flag.set()
+
+    class Viewer(Party):
+        def __init__(self, relay_url, code, *a, **kw):
+            super().__init__(code=code, stop_flag=threading.Event(), last_said="")
+
+    class Host(Party):
+        def __init__(self, relay_url, video_path, events, **kw):
+            super().__init__(code=None, stop_flag=threading.Event(), last_said="",
+                             from_player=kw.get("position_source") is not None)
+
+    def window():
+        app._open_watch_party()
+        pump(root, 0.3)
+        return app._party
+
+    def relay(d, text):
+        d.relay_field.entry.delete(0, "end")
+        d.relay_field.entry.insert(0, text)
+
+    def under(lbl):
+        return lbl.cget("text"), bool(lbl.winfo_ismapped())
+
+    def ended(d):
+        """Pump until the window is back on its idle view - the session
+        ended, and a 700-ms tick saw it - or 5 s pass; then a little more
+        for the queue's line."""
+        end = time.monotonic() + 5.0
+        while not d.idle.winfo_ismapped() and time.monotonic() < end:
+            pump(root, 0.05)
+        pump(root, 0.2)
+
+    def radio(d, value):
+        return find(d.win, lambda w: isinstance(w, widgets.Radio) and w._value == value)
+
+    real = engine.ViewerSession, engine.HostSession
+    engine.ViewerSession, engine.HostSession = Viewer, Host
+    try:
+        d = window()
+        d.tunnel_var.set(False)               # the relay field's way, no tunnel to fake
+        relay(d, "ws://127.0.0.1:8765")
+
+        # item 5: Film position from stays as picked - through Leave, in a
+        # window made again, and in the saved settings
+        d.src_var.set("player")
+        d._host()
+        pump(root, 0.2)
+        check("Host takes the film's position from the player",
+              getattr(app.ctl.session, "from_player", None), True)
+        app._leave_session()
+        pump(root, 0.3)
+        check("after Leave, Film position from is still This app's player",
+              (d.src_var.get(), radio_is_on(radio(d, "player"))), ("player", True))
+        d.close()
+        pump(root, 0.1)
+        d = window()
+        check("a Watch party window made again has it too",
+              (d.src_var.get(), radio_is_on(radio(d, "player")),
+               radio_is_on(radio(d, "listen"))), ("player", True, False))
+        app._save_config()
+        check("it is saved", json.loads(env.config.read_text()).get("position_from"),
+              "player")
+        app.ctl.position_from = "listen"
+        app.ctl.load_config()
+        check("and read back", app.ctl.position_from, "player")
+        d.src_var.set("listen")
+        check("a pick goes to the controller as it is made", app.ctl.position_from, "listen")
+
+        # item 3: why a join failed, in this window as well as the main one
+        Viewer.ending = REFUSAL
+        relay(d, "ws://127.0.0.1:8765")
+        d.join_code.set("ABCD-EFGH")
+        d._join()
+        pump(root, 0.1)
+        check("the join shows running at first", d.running.winfo_ismapped(), 1)
+        ended(d)
+        check("a refused copy says why under Join", under(d.join_err), (REFUSAL, True))
+        check("with Join and the code back in view",
+              (d.idle.winfo_ismapped(), d.join_code.get()), (1, "ABCD-EFGH"))
+        check("and the main window says it too", app.status_lbl.cget("text"), REFUSAL)
+        shot(root, d.win, "05-watch-party-refused")
+
+        # item 4: the code typed survives the window - and so does why
+        d.close()
+        pump(root, 0.1)
+        d = window()
+        check("the code typed is still there in a new window", d.join_code.get(),
+              "ABCD-EFGH")
+        check("and why the join failed", under(d.join_err), (REFUSAL, True))
+
+        # said once: a press after it says its own thing, and keeps it
+        relay(d, "localhost:8765")
+        d._join()
+        app._film_loaded(app.ctl.video_path)  # a refresh, as opening a film makes
+        pump(root, 0.1)
+        check("a later press's message is not covered by it",
+              under(d.join_err), ("The relay server needs ws:// or wss://", True))
+
+        # read from the session, not the queue: a line still on its way
+        # when the tick sees the flag is not missed
+        Viewer.ending, Viewer.queued = REFUSAL.replace("0.41", "0.38"), False
+        relay(d, "ws://127.0.0.1:8765")
+        d._join()
+        pump(root, 0.1)
+        ended(d)
+        check("why shows even before the queue brings the line",
+              under(d.join_err), (Viewer.ending, True))
+
+        # a party that runs clears old lines, and a Leave adds none
+        Viewer.ending, Viewer.queued = None, True
+        d._join()
+        pump(root, 0.3)
+        check("a running join hides the idle view", d.idle.winfo_ismapped(), 0)
+        app._leave_session()
+        pump(root, 0.3)
+        check("after Leave nothing is left under Join", under(d.join_err)[1], False)
+
+        # a host's party that ends by itself says why under Host
+        Host.ending = RELAY_LOST
+        d._host()
+        pump(root, 0.1)
+        ended(d)
+        check("a host's lost relay says why under Host", under(d.host_err), (RELAY_LOST, True))
+        Host.ending = None
+        app._leave_session()
+        pump(root, 0.3)
+
+        # Hosting again through the tunnel after a party that ended by
+        # itself, without Leave. The ended session stayed on ctl.session,
+        # so Start hosting never turned into Cancel, its progress was
+        # dropped and Join stayed on - and the old party's tunnel was left
+        # running. A ready from an older start must not use up this one's
+        # params either.
+        import hosting
+        ctl = app.ctl
+        public = "wss://fake-able-mind-words.trycloudflare.com"
+        released = threading.Event()
+
+        def quick_open(h, exe, download, say):
+            h.public_url = public
+            return "ws://127.0.0.1:9", public
+
+        def slow_open(h, exe, download, say):
+            say("Opening a free Cloudflare tunnel - a few seconds...")
+            end = time.monotonic() + 10
+            while not (h.cancelled or released.is_set()) and time.monotonic() < end:
+                time.sleep(0.02)
+            if h.cancelled:
+                raise hosting.Cancelled()
+            h.public_url = public
+            return "ws://127.0.0.1:9", public
+
+        ctl.find_cloudflared = lambda: ("/fake/cloudflared", "2026.10.3", False)
+        d.tunnel_var.set(True)
+        try:
+            ctl.open_tunnel, Host.ending = quick_open, RELAY_LOST
+            d._host()
+            end = time.monotonic() + 5               # it opens, starts, and ends by itself
+            while time.monotonic() < end and not (
+                    ctl.session is not None and not ctl.session_running()
+                    and d.idle.winfo_ismapped() and d.host_err.winfo_ismapped()):
+                pump(root, 0.05)
+            old = ctl.hosting
+            check("a tunnel party that ended keeps its tunnel until something ends it",
+                  (old is not None, getattr(old, "cancelled", None),
+                   under(d.host_err)), (True, False, (RELAY_LOST, True)))
+            ctl.open_tunnel, Host.ending = slow_open, None
+            d._host()
+            pump(root, 0.3)
+            check("hosting again: Start hosting turns into Cancel, and Join waits",
+                  (d.host_btn.cget("text"), d.join_btn.cget("state")), ("Cancel", "disabled"))
+            check("the tunnel's progress shows", under(d.host_note),
+                  ("Opening a free Cloudflare tunnel - a few seconds...", True))
+            check("the last party's tunnel is stopped, and ended at quit",
+                  (old.cancelled, old in ctl._ended_hosting), (True, True))
+            app._on_hosting_ready("ws://127.0.0.1:8", "wss://an-older-start.trycloudflare.com")
+            released.set()
+            end = time.monotonic() + 5
+            while not d.running.winfo_ismapped() and time.monotonic() < end:
+                pump(root, 0.05)
+            check("an older start's ready left this one's party to start",
+                  (d.running.winfo_ismapped(), app.ctl.public_relay), (1, public))
+            app._leave_session()
+            pump(root, 0.3)
+        finally:
+            released.set()
+            Host.ending = None
+            del ctl.find_cloudflared, ctl.open_tunnel
+            d.tunnel_var.set(False)
+
+        d.close()
+        pump(root, 0.1)
+    finally:
+        engine.ViewerSession, engine.HostSession = real
+        app.ctl.session = None
+        if app._party is not None:
+            app._party.close()
+        app._present_root()
+        pump(root, 0.2)
+
+
 def update_views(env, root, app):
     """item 7: through the queue, as the update flow drives them."""
     from version import __version__
@@ -1525,6 +1778,7 @@ def with_display(env):
         phase("auto off", auto_off, env, root, app)
         phase("Settings", settings, env, root, app)
         phase("Watch party", watch_party, env, root, app)
+        phase("Watch party leftovers", party_leftovers, env, root, app)
         phase("Update", update_views, env, root, app)
         phase("the fullscreen bar", bar_shot, env, root, app)
         phase("config written", config_written, env, root, app)

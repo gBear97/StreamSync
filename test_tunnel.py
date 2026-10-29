@@ -529,6 +529,108 @@ def controller_part():
           "and quit end cloudflared; the tunnel choice is saved")
 
 
+class ViewerStub(HostStub):
+    def __init__(self, relay_url, code, *a, **kw):
+        super().__init__(relay_url)
+        self.code = code
+
+
+class MutePlayer(Player):
+    def set_mute(self, mute):
+        pass
+
+
+def outcome(fn):
+    try:
+        return fn()
+    except BaseException as e:
+        return e
+
+
+def a_new_party_ends_the_last():
+    """A party that ended by itself - a lost relay, a refused join - stays
+    on ctl.session until Leave, and a tunnel host's tunnel and relay stay
+    with it. Starting another party without Leave left them running:
+    begin_hosting() replaced ctl.hosting without stopping the old one, and
+    the old cloudflared outlived StreamSync, since quitting ends only the
+    tunnels it stopped. A new party - through a tunnel or a relay, or a
+    join - now ends what is left of the last one first, and so does a
+    second press while a tunnel is still opening."""
+    real = (hosting.wait_for_name, session.HostSession, session.ViewerSession,
+            controller.CONFIG_PATH, controller.diagnostics)
+    hosting.wait_for_name = lambda *a, **k: True
+    session.HostSession, session.ViewerSession = HostStub, ViewerStub
+    controller.CONFIG_PATH = type(controller.CONFIG_PATH)(os.path.join(TMP, "config2.json"))
+    controller.diagnostics = Log()
+    try:
+        mode("ok")
+        ctl = controller.SyncController(queue.Queue(), MutePlayer())
+        ctl.video_path = "film.mkv"
+
+        def tunnel_party_that_ended():
+            local, public = ctl.open_tunnel(ctl.begin_hosting(), FAKE_EXE, False,
+                                            lambda text: None)
+            ctl.host(local, None, False, None, 10.0, "film", remember_relay=False)
+            ctl.public_relay = public
+            ctl.session.stop_flag.set()      # it ends by itself: its relay lost, say
+            h = ctl.hosting
+            assert h.alive() and not ctl.session_running()
+            return h
+
+        def stopped(h, what):
+            wait(lambda: not h.alive() and refused(h.relay.port), 10,
+                 f"{what}: the last party's tunnel and relay to stop")
+            assert h in ctl._ended_hosting, f"{what}: quitting would not end the old tunnel"
+
+        for start in ("hosting through a tunnel", "hosting through a relay", "joining"):
+            old = tunnel_party_that_ended()
+            if start == "hosting through a tunnel":
+                local, public = ctl.open_tunnel(ctl.begin_hosting(), FAKE_EXE, False,
+                                                lambda text: None)
+                ctl.host(local, None, False, None, 10.0, "film", remember_relay=False)
+                assert ctl.hosting is not old and ctl.hosting.alive(), \
+                    "the new party's own tunnel was stopped"
+            elif start == "hosting through a relay":
+                ctl.host("wss://my-own-relay.example", None, False, None, 10.0, "film")
+                assert ctl.hosting is None
+            else:
+                ctl.join("wss://my-own-relay.example", "ABCD-EFGH", None, True)
+                assert ctl.hosting is None
+            stopped(old, start)
+            assert ctl.session_running(), f"{start}: the new party itself was ended"
+            ctl.leave()
+
+        # a second press while the first tunnel is still opening
+        mode("slow")
+        first = ctl.begin_hosting()
+        out = []
+        opening = threading.Thread(target=lambda: out.append(outcome(
+            lambda: ctl.open_tunnel(first, FAKE_EXE, False, lambda text: None))))
+        opening.start()
+        wait(lambda: first.tunnel is not None and first.tunnel.proc is not None, 10,
+             "the first cloudflared")
+        second = ctl.begin_hosting()
+        opening.join(10)
+        assert out and isinstance(out[0], hosting.Cancelled), out
+        stopped(first, "a second press")
+        assert ctl.hosting is second
+        ctl.stop_hosting()
+
+        # and quitting after a restart leaves no cloudflared running
+        mode("ok")
+        old = tunnel_party_that_ended()
+        ctl.open_tunnel(ctl.begin_hosting(), FAKE_EXE, False, lambda text: None)
+        new = ctl.hosting
+        ctl.close()
+        wait(lambda: not old.alive() and not new.alive(), 2,
+             "quitting to end every cloudflared")
+    finally:
+        (hosting.wait_for_name, session.HostSession, session.ViewerSession,
+         controller.CONFIG_PATH, controller.diagnostics) = real
+    print("restart: a new party - tunnel, relay or join - ends the last one's tunnel and "
+          "relay; so does a second press; quitting leaves no cloudflared")
+
+
 def invites():
     text = hosting.invite(FAKE_WSS, "QSC9-X832")
     assert hosting.parse_invite(text) == (FAKE_WSS, "QSC9-X832"), "the tunnel's words are no code"
@@ -551,6 +653,7 @@ def main():
         tunnels()
         hostings()
         controller_part()
+        a_new_party_ends_the_last()
         invites()
     finally:
         shutil.rmtree(TMP, ignore_errors=True)

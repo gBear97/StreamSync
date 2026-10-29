@@ -71,6 +71,7 @@ class Shell(adapter.PlatformAdapter):
         self._synced_at = None       # monotonic time of the last sync that moved the film
         self._party_live = False
         self._session_text = ""
+        self._party_code = ""        # Join's session code, kept while Watch party is closed
         self._hosting_params = None  # ctl.host's arguments while the tunnel opens
         self._film_length = None
         self._pos = (None, None)     # the time and length the last tick read
@@ -504,10 +505,12 @@ class Shell(adapter.PlatformAdapter):
             self._party.set_host_note(text)
 
     def _on_hosting_ready(self, local, public):
-        params, self._hosting_params = self._hosting_params, None
         h = self.ctl.hosting
-        if params is None or h is None or h.public_url != public:
-            return                   # cancelled while it opened
+        if self._hosting_params is None or h is None or h.public_url != public:
+            # cancelled while it opened, or an older start's tunnel: the
+            # start that is still opening keeps its params
+            return
+        params, self._hosting_params = self._hosting_params, None
         try:
             self.ctl.host(local, remember_relay=False, **params)
         except Exception as e:

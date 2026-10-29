@@ -11,6 +11,14 @@ the Mac following:
   played to its end) left the viewer silent, "Following the session"
   while it stood still.
 
+Still open after 2.0.8, and checked here with the real EmbeddedPlayer over
+test_players' fake of libvlc 3 as measured:
+- a host whose film had not played yet sent no state at all, so viewers
+  got nothing until the host's first Play;
+- a viewer whose film had not played showed 0:00 for a paused host, and
+  for every jump it made while paused: libvlc 3 ignores a seek until a
+  film has played.
+
 The host's _state_loop and the viewer's _follow_loop run in threads over
 fakes on this machine's clock (UTC = perf_counter here).
 """
@@ -19,7 +27,9 @@ import queue
 import threading
 import time
 
+import players
 import session
+import test_players
 
 
 class Clock:
@@ -121,17 +131,10 @@ class Player:
         with self.lock:
             self.anchor, self.playing = (match_t + (now - t0) + offset, now), True
 
-    def pause(self):
-        self._note("pause")
-        now = time.perf_counter()
-        p = self.pos_at(now)
+    def pause_at(self, t, waiting=None):
+        self._note("pause_at", t)
         with self.lock:
-            self.anchor, self.playing = (p, now), False
-
-    def seek(self, t):
-        self._note("seek", t)
-        with self.lock:
-            self.anchor = (t, time.perf_counter())
+            self.anchor, self.playing = (t, time.perf_counter()), False
 
     def called(self, name):
         with self.lock:
@@ -243,12 +246,12 @@ def pause_lands_when_it_reaches_the_viewer():
         wait(lambda: v.player.called("sync_seek"), 2, "the film to play")
         pause_utc = time.perf_counter() + 0.3
         arrives(v, 100.0 + (pause_utc - (start - 5.0)), pause_utc, False)
-        wait(lambda: v.player.called("pause"), 4, "the pause")
-        late = v.player.called("pause")[0][0] - (pause_utc + 1.3)
+        wait(lambda: v.player.called("pause_at"), 4, "the pause")
+        at, frame = v.player.called("pause_at")[0]
+        late = at - (pause_utc + 1.3)
         print(f"viewer: paused {late * 1000:+.0f} ms from when it reached them")
         assert -0.05 < late < 0.15, late
-        wait(lambda: v.player.called("seek"), 1, "the paused frame")
-        assert abs(v.player.called("seek")[0][1] - (pause_utc - start + 105.0)) < 1e-6
+        assert abs(frame - (pause_utc - start + 105.0)) < 1e-6, frame
     finally:
         end(v)
 
@@ -257,17 +260,17 @@ def paused_jump_reaches_the_viewer():
     now = time.perf_counter()
     v = viewer(0.5, {"pos": 100.0, "utc": now - 5.0, "playing": False})
     try:
-        wait(lambda: v.player.called("seek"), 2, "the paused frame")
+        wait(lambda: v.player.called("pause_at"), 2, "the paused frame")
         # this viewer's own nudge: the player has made it, and the loop
         # leaves it be - the host has not moved
         v.offset = 0.5
         time.sleep(1.2)
-        assert [a for _, a in v.player.called("seek")] == [100.0], v.player.calls
+        assert [a for _, a in v.player.called("pause_at")] == [100.0], v.player.calls
 
         jump = time.perf_counter()
         arrives(v, 500.0, jump, False)
-        wait(lambda: len(v.player.called("seek")) == 2, 3, "the jump")
-        at, to = v.player.called("seek")[1]
+        wait(lambda: len(v.player.called("pause_at")) == 2, 3, "the jump")
+        at, to = v.player.called("pause_at")[1]
         assert abs(to - 500.5) < 1e-6, to
         assert abs(at - (jump + 0.5)) < 0.15, at - jump
         assert not v.player.called("sync_seek"), "it played the film to move it"
@@ -275,6 +278,97 @@ def paused_jump_reaches_the_viewer():
               "nudge kept, as it reaches them")
     finally:
         end(v)
+
+
+def libvlc3_film(**kw):
+    """The real EmbeddedPlayer over test_players' libvlc 3, a film loaded
+    and not played. players.vlc must be the fake's while it is used."""
+    mp = test_players.Libvlc3MP(**kw)
+    film = players.EmbeddedPlayer._around(None, mp)
+    film.has_media = True
+    return film, mp
+
+
+def host_sends_its_start_before_play():
+    """A host whose film has not played yet: libvlc has no time for it,
+    and the host sent viewers nothing at all until its first Play. The
+    film is at its start, paused, and that goes out at once; the Play
+    goes out as it lands."""
+    saved = players.vlc
+    players.vlc = test_players.FAKE_VLC
+    film, _mp = libvlc3_film(opens_after=0.1)
+    host = session.HostSession("ws://unused", None, queue.Queue(),
+                               position_source=film.clock_state)
+    host.clock = Clock()
+    host.link = link = Link()
+    began = time.perf_counter()
+    threading.Thread(target=host._state_loop, daemon=True).start()
+    try:
+        first, m = link.first_after(0, lambda m: True)
+        assert (m["pos"], m["playing"]) == (0.0, False), m
+        assert first - began < 0.3, first - began
+        t = time.perf_counter()
+        film.ensure_playing()
+        _at, m = link.first_after(t, lambda m: m["playing"])
+        assert 0.0 <= m["pos"] < 0.5, m
+        print(f"host: a film not played yet goes out at 0:00, paused, "
+              f"{(first - began) * 1000:.0f} ms in; its first Play as it lands")
+    finally:
+        host.stop_flag.set()
+        players.vlc = saved
+
+
+def unplayed_viewer_meets_a_paused_host():
+    """A viewer whose film had never played showed 0:00 for a paused host,
+    and for each jump the host made while paused, until the host played:
+    libvlc 3 ignores a seek until a film has played. The film now shows
+    the host's paused frame - started for a moment to get there, muted -
+    and a paused jump moves it."""
+    S = test_players.FAKE_VLC.State
+    saved = players.vlc
+    players.vlc = test_players.FAKE_VLC
+    film, mp = libvlc3_film(opens_after=0.15)
+    film.set_mute(False)                 # this viewer has the film's sound on
+    v = viewer(0.5, {"pos": 100.0, "utc": time.perf_counter() - 5.0, "playing": False},
+               player=film)
+    try:
+        wait(lambda: mp.get_time() == 100000, 3, "the host's paused frame")
+        assert mp.get_state() == S.Paused and not mp.heard(), mp.log
+        arrives(v, 500.0, time.perf_counter(), False)
+        wait(lambda: mp.get_time() == 500000, 3, "the paused jump")
+        assert mp.get_state() == S.Paused and mp.muted is False, mp.log
+        assert mp.calls("play") == [("play", S.NothingSpecial)], mp.log
+        assert said(v) == [], "the viewer reported trouble"
+        print("viewer: a film that never played shows a paused host's frame and "
+              "its paused jumps, started once, muted till paused")
+    finally:
+        end(v)
+        players.vlc = saved
+
+
+def why_it_ended_is_kept():
+    """The Watch party window shows why a session ended from last_said,
+    read once the stop flag is up. A line a loop says while it winds down
+    after that - a stream delay measured just then - must not replace it;
+    the main window's status still gets every line."""
+    v = viewer(0.5)
+    try:
+        v._say("Verified (bit error 0.11, file offset +1.12s). Following the session.")
+        v.inbox.put({"type": "ended"})
+        wait(lambda: v.stop_flag.is_set(), 2, "the end")
+        v._say("Your stream delay: 2.00s (updated).")
+        assert v.last_said == "The host ended the session.", v.last_said
+        seen = said(v)
+        assert seen[-2:] == ["The host ended the session.",
+                             "Your stream delay: 2.00s (updated)."], seen
+    finally:
+        end(v)
+    host = session.HostSession("ws://unused", None, queue.Queue())
+    host._say("Relay connection lost (could not reach the relay). Session ended.")
+    host.stop_flag.set()
+    host._say("A viewer verified their copy (2 connected).")
+    assert host.last_said.startswith("Relay connection lost"), host.last_said
+    print("why a session ended: kept for the window, whatever is said after the end")
 
 
 def failures_are_said_once():
@@ -308,8 +402,11 @@ def failures_are_said_once():
 def main():
     changed()
     host_sends_changes_at_once()
+    host_sends_its_start_before_play()
     pause_lands_when_it_reaches_the_viewer()
     paused_jump_reaches_the_viewer()
+    unplayed_viewer_meets_a_paused_host()
+    why_it_ended_is_kept()
     failures_are_said_once()
     print("FOLLOW TEST PASSED")
 

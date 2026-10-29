@@ -323,7 +323,8 @@ it reachable from anywhere (see [Relay server](#relay-server)).
 
 **Host**: choose where the film's position comes from - *What this
 computer hears* (play the film in any player; StreamSync follows it by
-listening) or *This app's player*. Pick your microphone: it is
+listening) or *This app's player*; StreamSync remembers which. Pick your
+microphone: it is
 fingerprinted continuously so viewers can measure their personal stream
 delay against your voice. A password is optional; the **Delay hint for
 viewers** (10 s by default, 2 to 45 s) stands until each viewer has
@@ -335,11 +336,12 @@ with the host's relay under **Relay server** - and the password if there
 is one, then **Join**. Your file is
 verified against the host's hashes first - different bitrates and
 releases are fine (a constant offset is detected and absorbed); a
-different cut or the wrong film is refused with a clear message rather
-than synced wrong. Then playback follows the host's timeline, delayed by
-*your* measured stream delay, so the film on your screen matches the
-commentary in your ears - and when the host pauses, your copy pauses at
-the moment the commentary about it reaches you.
+different cut or the wrong film is refused with a clear message, shown
+under **Join**, rather than synced wrong. Then playback follows the
+host's timeline, delayed by *your* measured stream delay, so the film on
+your screen matches the commentary in your ears - and when the host
+pauses, your copy pauses at the moment the commentary about it reaches
+you, on the host's frame, even if your copy has not played yet.
 
 While a session runs, the Watch party window shows its code, the address
 viewers come in at with **Copy invite**, its latest status, and **Leave
