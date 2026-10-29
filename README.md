@@ -714,7 +714,10 @@ The Release workflow:
    fails the build rather than reaching anyone. Signing, notarizing and
    stapling all talk to Apple's servers, and a dropped connection there
    is tried again a few times (`ci/apple_retry.sh`) instead of failing
-   the run; anything Apple actually refuses still fails it at once;
+   the run; anything Apple actually refuses still fails it at once. On
+   the Intel runner, whose network drops stapler's HTTP/3 connections,
+   outgoing UDP 443 is refused first so that stapler uses TCP
+   (`ci/block_udp_443.sh`);
 4. builds the Windows installer (`build-windows.yml`): the PyInstaller
    app, packed by Inno Setup, then installed silently on the runner, run
    once (`--netcheck`) and uninstalled again before it is attached;

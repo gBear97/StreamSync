@@ -15,6 +15,11 @@
 # to Apple's timestamp server instead ("A timestamp was expected but was
 # not found"). Each time, the same command worked on the next run.
 #
+# On the Intel runner those dropped connections turned out to be
+# stapler's HTTP/3 (UDP 443), which GitHub's network there loses;
+# ci/block_udp_443.sh now makes stapler use TCP instead. The retries stay
+# for any other drop.
+#
 # So a failure that reads as the network - a dropped or refused
 # connection, a timeout, a server error, stapler's Error 68 (EX_NOHOST:
 # CloudKit never answered) - is tried again, up to four times in all,
