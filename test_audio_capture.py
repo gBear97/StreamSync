@@ -535,7 +535,13 @@ def playout_tests():
     assert np.allclose(data, want, atol=1e-4), "slice is not contiguous"
     old = dev.arrival_bound(lo) - dev.play_time(lo)
     assert old < -0.02, f"arrival stamping should read early here ({old * 1e3:+.1f} ms)"
-    assert rec.hooked and rec.stamped > 50 and not rec.unstamped
+    # every packet's own stamp is believed - except one read so long after
+    # it played that its stamp is not plausible, which a stalled CI runner
+    # can make happen (a macOS one did); only those may go unstamped
+    late = sum(1 for end, t in dev.delivered
+               if dev.play_time(end) - t < ac.PLAYOUT_LEAD[0] + 0.01)
+    assert rec.hooked and rec.stamped > 50 and rec.unstamped <= late, \
+        (rec.hooked, rec.stamped, rec.unstamped, late)
     assert any("dated by when WASAPI plays it" in m for m in logs), logs
     print(f"playout stamps: {err * 1e6:+.2f} us off the play time "
           f"(arrival stamping read {old * 1e3:+.1f} ms)")

@@ -1093,7 +1093,10 @@ def main():
     net = mp.truth(later) - (before + (later - now))
     print(f"nudge +6 ms (under the {1000 * players.SETTLE_TOL:.0f} ms settle tolerance): "
           f"net {1000 * net:+.1f} ms")
-    assert abs(net - 0.006) < 0.003, net
+    # made, not dropped (that netted 0). A trim can only run long - a sleep
+    # that overshoots by 60 ms, as a macOS runner's did, adds 3 ms at 5% -
+    # so more is allowed than less
+    assert 0.0045 < net < 0.015, net
 
     # 4. pausing mid-trim puts the rate back
     p.nudge(-0.3)
