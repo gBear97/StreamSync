@@ -192,6 +192,57 @@ def resample(x, sr_in, sr_out=SR):
     return (np.fft.irfft(spec, n_out) * (n_out / x.size)).astype(np.float32)
 
 
+REFINE_WINDOW = 2.0    # s of recording per cross-correlation
+REFINE_SEARCH = 0.25   # s either side of the matcher's answer searched
+REFINE_AGREE = 0.002   # s: windows this close to their median agree
+REFINE_PEAK = 12.0     # a window's peak must stand this far above its noise
+
+
+def refine_match(samples, sr, path, t, search=REFINE_SEARCH):
+    """The film time of samples[0] to a fraction of a millisecond, near t.
+
+    find_match_audio works on 16 ms feature steps, and its answer can be
+    10 ms out - half a film frame, too coarse to line a picture up by. So
+    the recording itself is cross-correlated with the film's own sound,
+    window by window, phase-transform weighted (GCC-PHAT) so that a voice
+    over the film counts for little. The windows that agree within
+    REFINE_AGREE give the answer; None if fewer than two do, or not half
+    of them (a quiet scene, a voice drowning the film), and the caller
+    keeps t."""
+    x = resample(samples, sr, SR) if sr != SR else np.asarray(samples, np.float32)
+    n = int(REFINE_WINDOW * SR)
+    if x.ndim != 1 or x.size < 2 * n:
+        return None
+    pad = int(search * SR)
+    ref = decode_audio(path, t - search, x.size / SR + 2 * search).astype(np.float64)
+    found = []
+    for i0 in range(0, x.size - n + 1, n):
+        w = x[i0:i0 + n].astype(np.float64)
+        seg = ref[i0:i0 + n + 2 * pad]
+        if seg.size < n + 2 * pad:
+            break
+        size = 1 << int(np.ceil(np.log2(seg.size + n)))
+        cross = np.fft.rfft(seg, size) * np.conj(np.fft.rfft(w, size))
+        freqs = np.fft.rfftfreq(size, 1.0 / SR)
+        cross[(freqs < 150) | (freqs > 6000)] = 0
+        cc = np.fft.irfft(cross / (np.abs(cross) + 1e-12), size)[:seg.size - n + 1]
+        k = int(np.argmax(cc))
+        noise = np.median(np.abs(cc)) * 1.4826 + 1e-12
+        if cc[k] / noise < REFINE_PEAK or k == 0 or k == cc.size - 1:
+            continue
+        a, b, c = cc[k - 1], cc[k], cc[k + 1]
+        d = 0.5 * (a - c) / (a - 2 * b + c)
+        # this window is at film time (t - search) + (i0 + k + d) / SR
+        found.append(t - search + (k + d) / SR)
+    if len(found) < 2:
+        return None
+    found = np.array(found)
+    agree = found[np.abs(found - np.median(found)) <= REFINE_AGREE]
+    if agree.size < 2 or agree.size < found.size / 2:
+        return None
+    return float(np.median(agree))
+
+
 def voice_weights(bm):
     """Per-frame weights (0..1) for a capture's band magnitudes (T, B).
 

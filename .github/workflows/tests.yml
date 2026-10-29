@@ -85,7 +85,7 @@ jobs:
           STREAMSYNC_SCREENSHOTS: ${{ runner.temp }}/ui-shots
         run: |
           set -e
-          for t in test_audio_capture test_players test_controller \
+          for t in test_audio_capture test_picture_timing test_players test_controller \
                    test_audio_matcher test_fingerprint test_relay \
                    test_relay_tls test_session test_follow test_tunnel test_updater test_netcerts \
                    test_diagnostics test_singleinstance test_macswap \

@@ -57,7 +57,10 @@ START_TIMEOUT = 60.0
 SLOW_START = 3.0
 TRIM_RATE = 0.05            # trims run at 1 +- this
 TRIM_MAX = 0.6              # errors up to this are trimmed; beyond, re-seeked
-SETTLE_TOL = 0.02           # close enough - leave it
+# Close enough - leave it. A fifth of a film frame: at 20 ms a sync could
+# land half a frame out and stay there, and a correction smaller than that
+# (the film window's own delay, 13 ms on a 144 Hz screen) was never made.
+SETTLE_TOL = 0.008
 RATE_SETTLE = 1.3           # libvlc applies a rate change ~1 s late
 CLOCK_EVENTS = 4
 EXT_PORT = 9723
@@ -195,6 +198,11 @@ class _ClosedLoop:
             self._seek_line(guess)
         threading.Thread(target=self._correct, args=(gen, guess, err),
                          daemon=True).start()
+
+    def settling(self):
+        """A goto's corrections are still running: the position is on its
+        way to the line, not on it."""
+        return self._working
 
     def _current(self, gen):
         return self._gen == gen

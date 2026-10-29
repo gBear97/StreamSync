@@ -1,7 +1,8 @@
 numpy
 imageio-ffmpeg
 python-vlc
-# pinned: its WASAPI loopback fills idle time with zeros, so stream dead air reads as silence
+# pinned: its WASAPI loopback fills idle time with zeros, so stream dead air reads as silence;
+# and audio_capture._wasapi_hook reaches into its recorder for each packet's playout time
 soundcard==0.4.6
 websockets
 certifi

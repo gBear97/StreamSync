@@ -69,6 +69,10 @@ class PlatformAdapter:
     LISTEN_HELP = ""                   # Settings: the help under "Listen to"
     DEFAULT_DEVICE_NOTE = ""           # "(default) X" reads "X (<note>)"
     UPDATE_UNAVAILABLE = ""            # why this copy can't update itself
+    # Settings' Measure: the stream's picture timed off the screen. Windows
+    # only for now (a Mac would need Screen Recording permission and a
+    # helper to grab with).
+    CAN_MEASURE_PICTURE = False
 
     # --- process and windows ---------------------------------------------
 
@@ -194,6 +198,34 @@ class PlatformAdapter:
         Each step it takes is a "swap: ..." line in the log, the first
         naming `why` - what asked for it ("" when nothing said)."""
         raise NotImplementedError("_stream_swap")
+
+    # --- seam 3b: picture timing -------------------------------------------
+
+    def _picture_tools(self):
+        """(grab, film_picture_rect) for ctl: grab(rect, seconds, width) ->
+        (times, images) of a screen area, and film_picture_rect() -> (x, y,
+        w, h) of the film's picture on screen, or None while it is not
+        showing. Both run on worker threads. Called once, on the Tk thread,
+        after the film window exists. Default: (None, None), nothing to
+        grab with."""
+        return None, None
+
+    def _stream_for_measure(self):
+        """Bring the stream's window into view to time its picture:
+        (stream_rect, key, why). stream_rect() gives the window's inside on
+        screen, on a worker thread (None once it is gone or hidden); key
+        names the stream (picture_timing.channel_key); why says what is
+        wrong instead, with stream_rect None. Default: not here."""
+        return None, "", "Timing the stream's picture needs Windows for now."
+
+    def _measure_done(self):
+        """A stream timing finished: put its window back as it was.
+        Default: nothing."""
+
+    def _note_stream(self):
+        """Tell ctl which stream is playing (ctl.set_stream_key), so its
+        measured picture lag applies; called before each sync. Default:
+        nothing."""
 
     # --- seam 4: installing an update (worker thread) ---------------------
 

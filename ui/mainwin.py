@@ -325,7 +325,9 @@ class MainWindow:
         fine.pack(fill="x", pady=(px(12), 0))
         tk.Label(fine, text="Fine-tune", font=font(13), bg=card_bg,
                  fg=theme.MUTED, **_TIGHT).pack(side="left", padx=(0, px(6)))
-        for delta in (-0.5, -0.1, None, 0.1, 0.5):
+        # half a second, and one of the film's frames (a picture that runs a
+        # frame early or late is what a side-by-side look catches)
+        for delta in (-0.5, "-1", None, "+1", 0.5):
             if delta is None:
                 # The board's 64 px at least, with room for "+10.00 s", so
                 # the chips do not shift as the offset changes. A label's
@@ -340,10 +342,14 @@ class MainWindow:
                     self.offset_lbl.config(width=8)     # a stand-in Tk (tests) has no fonts
                 self.offset_lbl.pack(side="left", padx=(px(6), 0))
                 continue
-            label = f"{delta:+.1f}".replace("-", "−")
+            if isinstance(delta, str):
+                label = f"{delta} frame".replace("-", "−")
+                command = lambda s=int(delta): self._nudge(s / self._film_fps())
+            else:
+                label = f"{delta:+.1f}".replace("-", "−")
+                command = lambda d=delta: self._nudge(d)
             widgets.FlatButton(fine, label, kind="chip", height=30, font=font(13),
-                               command=lambda d=delta: self._nudge(d)).pack(side="left",
-                                                                            padx=(px(6), 0))
+                               command=command).pack(side="left", padx=(px(6), 0))
         widgets.FlatButton(fine, "Reset", kind="link", height=30, font=font(13), padx=8,
                            command=lambda: self._reset_offset()).pack(side="right")
 
@@ -642,6 +648,9 @@ class _Gallery(MainWindow):
     def _nudge(self, delta):
         self._offset += delta
         self._show_offset(self._offset)
+
+    def _film_fps(self):
+        return 24000 / 1001
 
     def _reset_offset(self):
         self._offset = 0.0

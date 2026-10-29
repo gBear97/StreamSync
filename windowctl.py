@@ -90,6 +90,10 @@ _QueryFullProcessImageNameW = _proto(
     dll=kernel32)
 _CloseHandle = _proto("CloseHandle", wintypes.BOOL, wintypes.HANDLE,
                       dll=kernel32)
+_GetClientRect = _proto("GetClientRect", wintypes.BOOL, wintypes.HWND,
+                        ctypes.POINTER(wintypes.RECT))
+_ClientToScreen = _proto("ClientToScreen", wintypes.BOOL, wintypes.HWND,
+                         ctypes.POINTER(wintypes.POINT))
 
 
 def monitor_rect(hwnd):
@@ -278,6 +282,43 @@ def window_class(hwnd):
     buf = ctypes.create_unicode_buffer(256)
     user32.GetClassNameW(wintypes.HWND(hwnd), buf, len(buf))
     return buf.value
+
+
+def is_visible(hwnd):
+    """Shown, with every window above it in its family shown too: False for
+    a withdrawn Tk toplevel and anything inside it."""
+    return bool(hwnd) and bool(user32.IsWindowVisible(wintypes.HWND(hwnd)))
+
+
+def client_rect(hwnd):
+    """(x, y, w, h) of a window's inside - no frame or title bar - in
+    screen pixels."""
+    rc = wintypes.RECT()
+    _GetClientRect(wintypes.HWND(hwnd), ctypes.byref(rc))
+    pt = wintypes.POINT(0, 0)
+    _ClientToScreen(wintypes.HWND(hwnd), ctypes.byref(pt))
+    return (pt.x, pt.y, rc.right - rc.left, rc.bottom - rc.top)
+
+
+def child_rect(hwnd, class_prefix):
+    """(x, y, w, h) on screen of the first visible window inside `hwnd`
+    whose class name starts with class_prefix, or None. libvlc draws the
+    film in such a child ("VLC video output ..."), sized to the picture
+    itself, without the black bars around it."""
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def cb(child, _lparam):
+        if user32.IsWindowVisible(child) and window_class(child).startswith(class_prefix):
+            found.append(int(child))
+            return False
+        return True
+
+    user32.EnumChildWindows(wintypes.HWND(hwnd), cb, 0)
+    if not found:
+        return None
+    x, y, w, h = window_rect(found[0])
+    return (x, y, w, h) if w > 0 and h > 0 else None
 
 
 def find_by_pid(pid):

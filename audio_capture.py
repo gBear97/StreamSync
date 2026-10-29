@@ -1,7 +1,8 @@
 """System-audio capture.
 
 Windows: WASAPI loopback via the `soundcard` package - records whatever is
-playing on a speaker/headphone device, no setup needed.
+playing on a speaker/headphone device, no setup needed - with each packet
+dated by WASAPI's own timestamp of when it plays (PlayoutRecorder).
 
 macOS 14.2+: "This Mac's sound" - a Core Audio process tap, run by a small
 Swift helper (mac/sstap.swift, built into the app as sstap). It records
@@ -170,7 +171,7 @@ def _open_source(kind, name):
                 break
     if spk is None:
         spk = sc.default_speaker()
-    return (sc.get_microphone(spk.name, include_loopback=True),
+    return (LoopbackSource(sc.get_microphone(spk.name, include_loopback=True)),
             f"Captured only silence from '{spk.name}' - is the stream "
             "audible on that device?")
 
@@ -367,6 +368,183 @@ class SystemAudioRecorder:
         return np.interp(tout, tin, x).astype(np.float32), float(tout[0])
 
 
+TIMESTAMP_ERROR = 0x4          # AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR
+PLAYOUT_LEAD = (-0.05, 1.0)    # plausible "plays at" minus "arrived at", s
+LEAD_MEMORY = 50               # stamped packets (~0.5 s) a fallback leans on
+
+
+def _log(message):
+    try:
+        import diagnostics
+        diagnostics.log(message, echo=False)
+    except Exception:
+        pass
+
+
+def _wasapi_hook(rec, note):
+    """Have soundcard's WASAPI recorder keep each packet's timestamp.
+
+    soundcard (pinned at 0.4.6) gets every packet from
+    IAudioCaptureClient::GetBuffer but passes NULL where WASAPI would put
+    the packet's time. This swaps that one call for one that keeps it and
+    hands note(qpc, flags) each packet: qpc is when the packet's first
+    frame plays, in 100 ns QueryPerformanceCounter units. It reaches into
+    soundcard's private parts, so anything amiss raises here, or - if the
+    call itself will not bind - goes back to soundcard's own call and
+    reports every packet unstamped. Either way blocks are then dated by
+    arrival, as before."""
+    from soundcard import mediafoundation as mf
+    ffi, check = mf._ffi, mf._com.check_error
+    client = rec._ppCaptureClient
+    get_buffer = client[0][0].lpVtbl.GetBuffer
+    original = rec._capture_buffer
+    if not callable(getattr(rec, "_record_chunk", None)):
+        raise AttributeError("soundcard's recorder has no _record_chunk")
+    binding = (TypeError, AttributeError, getattr(ffi, "error", TypeError))
+    broken = []
+
+    def capture_buffer():
+        if not broken:
+            try:
+                data = ffi.new("BYTE**")
+                frames = ffi.new("UINT32*")
+                flags = ffi.new("DWORD*")
+                position = ffi.new("UINT64*")
+                qpc = ffi.new("UINT64*")
+                hr = get_buffer(client[0], data, frames, flags, position, qpc)
+            except binding as e:      # the binding, not the device
+                broken.append(e)
+            else:
+                check(hr)
+                note(int(qpc[0]), int(flags[0]))
+                return data[0], frames[0], flags[0]
+        note(0, TIMESTAMP_ERROR)
+        return original()
+
+    rec._capture_buffer = capture_buffer
+
+
+class LoopbackSource:
+    """A speaker's loopback (Windows), in the shape soundcard gives a
+    microphone: a name and a recorder() whose blocks are dated by when
+    they play."""
+
+    def __init__(self, mic, hook=None, log=None):
+        self.mic = mic
+        self.name = mic.name
+        self._hook = hook
+        self._log = log
+
+    def recorder(self, samplerate=CAPTURE_SR):
+        return PlayoutRecorder(self.mic.recorder(samplerate=samplerate),
+                               samplerate, name=self.name, hook=self._hook,
+                               log=self._log)
+
+
+class PlayoutRecorder:
+    """soundcard's WASAPI loopback recorder, plus record_stamped(): each
+    block dated by when it plays, from WASAPI's own packet timestamp.
+
+    A loopback packet reaches us before the speakers play it - about 10 ms
+    before its first frame on a 10 ms device period (measured on Windows
+    11, Realtek) - so stamping blocks on arrival dated the stream's sound
+    about 20 ms early, and every sync put the film that far ahead of the
+    sound it was matched to. macOS was already on it (CoreAudio's capture
+    time plus the output's own delay). WASAPI states when each packet's
+    first frame plays, on QueryPerformanceCounter's clock - the clock
+    perf_counter() reads - to a hundredth of a millisecond.
+
+    A block with no usable stamp (flagged, not plausible, or soundcard's
+    zeros while the device is quiet) is dated by the later of its arrival
+    plus the largest lead recent stamped packets showed, and the last
+    stamped packet's time carried on by the samples since. Each errs late
+    more readily than early, so the later of the two is safe, and
+    AudioMonitor keeps the tightest bound - the stamped packets'. If no
+    stamp can be had at all, blocks are dated by arrival, exactly as
+    before."""
+
+    def __init__(self, rec, samplerate, name="", hook=None, log=None):
+        self.rec = rec
+        self.sr = samplerate
+        self.name = name
+        self._hook = hook or _wasapi_hook
+        self._log = log or _log
+        self.hooked = False
+        self._packet = None
+        self._leads = collections.deque(maxlen=LEAD_MEMORY)
+        self._anchor = None       # end time of the last stamped packet...
+        self._since = 0           # ...and the frames delivered after it
+        self.stamped = 0          # packets dated by their own stamp
+        self.unstamped = 0        # packets dated by arrival + lead
+        self._said = set()
+
+    def __enter__(self):
+        self.rec.__enter__()
+        try:
+            self._hook(self.rec, self._note)
+            self.hooked = True
+        except Exception as e:
+            self._say("none", f"listening to {self.name}: WASAPI gives no "
+                              f"packet times here ({e}); sound dated by arrival")
+        return self
+
+    def __exit__(self, *exc):
+        return self.rec.__exit__(*exc)
+
+    def _note(self, qpc, flags):
+        self._packet = (qpc, flags)
+
+    def _say(self, key, message):
+        if key not in self._said:
+            self._said.add(key)
+            self._log(message)
+
+    def record(self, numframes=None):
+        return self.record_stamped(numframes)[0]
+
+    def record_stamped(self, numframes=None):
+        """(block, perf_counter time just after its last sample plays).
+        Blocks are WASAPI's packets (or soundcard's zeros for a silent
+        device), not numframes."""
+        if not self.hooked:
+            return self.rec.record(numframes=numframes), time.perf_counter()
+        self._packet = None
+        chunk = self.rec._record_chunk()
+        now = time.perf_counter()
+        channels = self.rec.channelmap
+        data = np.reshape(chunk, (-1, len(set(channels))))[:, channels]
+        if data.shape[0] == 0:
+            return data, now
+        end = None
+        if self._packet is not None:
+            qpc, flags = self._packet
+            t = qpc * 1e-7 + data.shape[0] / self.sr
+            if (qpc > 0 and not flags & TIMESTAMP_ERROR
+                    and PLAYOUT_LEAD[0] <= t - now <= PLAYOUT_LEAD[1]):
+                end = t
+            self.stamped += end is not None
+            self.unstamped += end is None
+        if end is not None:
+            self._leads.append(end - now)
+            self._anchor, self._since = end, 0
+            if self.stamped == LEAD_MEMORY:
+                lead = 1000 * float(np.median(self._leads))
+                self._say("ok", f"listening to {self.name}: sound dated by "
+                                f"when WASAPI plays it ({lead:.1f} ms after "
+                                "it arrives)")
+            return data, end
+        if self.unstamped == 100 and not self.stamped:
+            self._say("bad", f"listening to {self.name}: WASAPI's packet "
+                             "times are not usable here; sound dated by "
+                             "arrival")
+        guess = now + (max(self._leads) if self._leads else 0.0)
+        if self._anchor is not None:
+            self._since += data.shape[0]
+            if self._since <= STAMP_SPAN * self.sr:
+                guess = max(guess, self._anchor + self._since / self.sr)
+        return data, guess
+
+
 class AudioMonitor:
     """A capture device kept open, with every sample dated.
 
@@ -380,8 +558,10 @@ class AudioMonitor:
     amount every time.
 
     A recorder that knows better says so: record_stamped() returns each
-    block with the time just after its last sample (this Mac's sound uses
-    CoreAudio's own capture times), and the same bound then holds exactly.
+    block with the time just after its last sample is heard (this Mac's
+    sound uses CoreAudio's own capture times plus the output's delay; a
+    Windows loopback, WASAPI's playout times), and the same bound then
+    holds exactly.
 
     `source` is a callable returning (recorder_context, silence_hint);
     tests pass a fake, the app passes nothing and gets soundcard. The hint
@@ -499,10 +679,16 @@ class AudioMonitor:
 
     def mark(self):
         """Frame index of the next sample to arrive - a start point for
-        capture() that guarantees audio recorded after this moment."""
+        capture() that guarantees audio recorded after this moment.
+
+        It counts as a use. A caller that marks and then works a while
+        before capturing - a picture timing grabs the screen for 20 s
+        first - found the device closed for idleness meanwhile, and the
+        audio since its mark gone with it."""
         if not self.running():
             self.start()
         with self._cond:
+            self._last_use = time.monotonic()
             return self._total
 
     def stamp(self, frame):

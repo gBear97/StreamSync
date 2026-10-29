@@ -45,7 +45,7 @@ class Shell(adapter.PlatformAdapter):
         "status": "_set_status", "session": "_on_session_text", "swap": "_stream_swap",
         "swapdone": "_swap_done", "devices": "_apply_devices", "apps": "_apply_stream_list",
         "mics": "_on_mics", "film_info": "_on_film_info", "busy_off": "_on_busy_off",
-        "auto_off": "_on_auto_off", "synced": "_on_synced",
+        "auto_off": "_on_auto_off", "synced": "_on_synced", "picture": "_on_picture",
         "update": "_on_update", "update_none": "_on_update_none", "update_err": "_on_update_err",
         "update_progress": "_on_update_progress", "update_step": "_on_update_step",
         "update_installing": "_on_update_installing", "update_ready": "_on_update_ready",
@@ -112,6 +112,7 @@ class Shell(adapter.PlatformAdapter):
             messagebox.showerror("StreamSync - VLC problem", str(e))
             raise SystemExit(1)
         self.ctl = controller.SyncController(self.q, self.embedded)
+        self.ctl.grab, self.ctl.film_picture_rect = self._picture_tools()
 
         self._load_config()
         self._populate_audio_devices()
@@ -143,6 +144,7 @@ class Shell(adapter.PlatformAdapter):
         self.stream_var = tk.StringVar(r, value="")
         self.hint_var = tk.StringVar(r, value="")
         self.check_updates_var = tk.BooleanVar(r, value=True)
+        self.line_up_var = tk.StringVar(r, value="sound")
 
     # --- players and the film ---------------------------------------------
 
@@ -256,6 +258,10 @@ class Shell(adapter.PlatformAdapter):
             return False
         if not self._ready():
             return False
+        try:
+            self._note_stream()              # whose picture lag applies
+        except Exception as e:               # a nicety: never what stops a sync
+            diagnostics.log(f"picture: could not tell which stream is playing: {e}")
         run = self.ctl.resync if resync else self.ctl.sync
         hint = "" if whole else self.hint_var.get()   # blank: the whole film
         try:
@@ -328,6 +334,80 @@ class Shell(adapter.PlatformAdapter):
         self.auto_var.set(False)
         self._on_auto_toggle()
         self._set_status(text)
+
+    # --- picture timing ------------------------------------------------------
+
+    def _on_line_up(self):
+        """Settings changed line_up_var: the film moves onto the stream's
+        sound or its picture now, and stays there."""
+        self.ctl.set_line_up(self.line_up_var.get())
+        self._save_config()
+        self._show_picture_lines()
+
+    def _measure_picture(self):
+        """Settings' Measure: time the stream's picture against its sound,
+        about 20 s on a thread, with the stream's window brought up."""
+        if self.ctl.measuring or not self._ready():
+            return
+        stream_rect, key, why = self._stream_for_measure()
+        if stream_rect is None:
+            self._set_status(why)
+            self._show_picture_lines(why)
+            return
+        self.ctl.set_stream_key(key)
+        if not self.ctl.measure_stream_picture(stream_rect, key):
+            self._measure_done()
+            return
+        self._set_status("Timing the stream's picture - keep its window in view "
+                         f"({controller.MEASURE_SECONDS:.0f} s, up to a minute in a film "
+                         "of long takes)...")
+        self._show_picture_lines()
+
+    def _on_picture(self, info):
+        """queue: a picture timing finished. A stream's: its window goes back
+        as it was, and the result is the status. The film window's: saved
+        quietly."""
+        if info["what"] == "stream":
+            self._measure_done()
+            if info["ok"]:
+                ms = round(info["lag"] * 1000)
+                self._set_status(f"The stream's picture runs {ms} ms behind its sound "
+                                 + ("- the film now lines up with it."
+                                    if self.ctl.line_up == "picture" else
+                                    "(Settings > Picture to line the film up with it)."))
+            else:
+                self._set_status(f"Couldn't time the stream's picture: {info['why']}.")
+        self._save_config()
+        self._show_picture_lines(None if info["ok"] else
+                                 f"Couldn't time it: {info.get('why', '')}.")
+
+    def _picture_lines(self):
+        """(stream line, film line): what Settings' Picture section says."""
+        ctl = self.ctl
+        rec = ctl.picture_lags.get(ctl.stream_key)
+        name = ctl.stream_key or "The stream"
+        if ctl.measuring:
+            stream = "Timing the stream's picture... keep its window in view."
+        elif rec:
+            stream = (f"{name}: the picture runs {round(rec['lag'] * 1000)} ms behind the "
+                      f"sound (measured {rec.get('when', '')}).")
+        elif self.CAN_MEASURE_PICTURE:
+            stream = f"{name}: not measured yet. Measure while the film plays on it."
+        else:
+            stream = "Timing the stream's picture needs Windows for now."
+        if ctl.film_lead is None:
+            film = "This screen's own delay is measured after each sync."
+        else:
+            film = (f"This screen shows the film {ctl.film_lead * 1000:.0f} ms after its "
+                    "clock; StreamSync allows for that.")
+        return stream, film
+
+    def _show_picture_lines(self, note=None):
+        """Settings' Picture lines, if Settings is open; `note` replaces the
+        stream line (why a timing failed)."""
+        if self._settings is not None:
+            stream, film = self._picture_lines()
+            self._settings.set_picture_lines(note or stream, film, self.ctl.measuring)
 
     # --- playback ------------------------------------------------------------
 
@@ -740,6 +820,7 @@ class Shell(adapter.PlatformAdapter):
             self.hint_var.set(cfg["hint"])
         self.interval_var.set(self.ctl.auto_interval)
         self.follow_var.set(self.ctl.auto_follow)
+        self.line_up_var.set(self.ctl.line_up)
         self.swap_var.set(bool(cfg.get("swap", True)))
         self.check_updates_var.set(bool(cfg.get("check_updates", True)))
         # 1.x saved the pick under its platform's own key; read it once -

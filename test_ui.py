@@ -1030,6 +1030,25 @@ def settings(env, root, app):
               "Check now", "Space", "Play / pause", "Back / forward 5 s", "Fullscreen",
               "Esc", "Leave fullscreen", "Done", app.LISTEN_HELP):
         check_in("Settings text", s, shown)
+    for s in ("PICTURE", "Line up the film with", "The stream's sound",
+              "Lips match the voices you hear. Best with the film muted.",
+              "The stream's picture", "This screen's own delay is measured after each sync."):
+        check_in("Settings picture text", s, shown)
+    check("Measure shows where the screen can be grabbed",
+          bool(d.measure_btn.winfo_ismapped()), bool(app.CAN_MEASURE_PICTURE))
+    want = "not measured yet" if app.CAN_MEASURE_PICTURE else "needs Windows for now"
+    check(f"the stream line says {want!r}", want in d.picture_lbl.cget("text"))
+    radios = {r.cget("text"): r for r in descendants(d.win) if isinstance(r, widgets.Radio)}
+    picture = radios.get("The stream's picture")
+    check("Settings has the picture Radio", picture is not None)
+    if picture is not None:
+        saves = len(env.saves) if hasattr(env, "saves") else None
+        picture.invoke()
+        pump(root, 0.1)
+        check("the picture Radio reaches the engine", app.ctl.line_up, "picture")
+        radios["The stream's sound"].invoke()
+        pump(root, 0.1)
+        check("and the sound Radio back", app.ctl.line_up, "sound")
     check_in("Settings device", "Speakers (", shown)
     check("Settings interval field shows the interval", d.interval_field.get(), "30")
     check("dialogs carry no app keys", str(app.root) in d.win.bindtags(), False)
