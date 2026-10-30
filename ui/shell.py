@@ -395,11 +395,17 @@ class Shell(adapter.PlatformAdapter):
             stream = f"{name}: not measured yet. Measure while the film plays on it."
         else:
             stream = "Timing the stream's picture needs Windows for now."
-        if ctl.film_lead is None:
-            film = "This screen's own delay is measured after each sync."
-        else:
+        if ctl.film_lead is not None:
             film = (f"This screen shows the film {ctl.film_lead * 1000:.0f} ms after its "
                     "clock; StreamSync allows for that.")
+        elif ctl.grab is None:
+            # nothing grabs the screen here (a Mac), so the film window's
+            # delay is never timed
+            film = "Timing this screen's own delay needs Windows for now."
+        else:
+            # only the built-in player's window is StreamSync's to grab
+            film = ("With the built-in player, this screen's own delay is measured after "
+                    "each sync.")
         return stream, film
 
     def _show_picture_lines(self, note=None):
