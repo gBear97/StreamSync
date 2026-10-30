@@ -31,8 +31,8 @@ on both.
 - **Video sync** (screen capture, capture region, facecam ignore zones,
   mirror toggle). Syncing is audio-only. The Mac no longer asks for
   Screen Recording permission.
-- **The ±2 s nudge buttons** and **F11**. Fine-tune now steps by 0.1 s and
-  0.5 s; **F** toggles fullscreen.
+- **The ±2 s nudge buttons** and **F11**. Fine-tune now steps by a frame
+  and by 0.5 s; **F** toggles fullscreen.
 - **The Search ± box** beside the position hint. A sync with a hint always
   searches 2 minutes either side of it, 1.x's default; a different width
   set in 1.x is not kept.
@@ -210,12 +210,47 @@ Under **Settings > Player**:
 
 ### Fine-tune
 
-The **Fine-tune** row nudges the film against the stream: **−0.5**,
-**−0.1**, **+0.1**, **+0.5** seconds, with the total shown in between and
-**Reset** to clear it. While playing, a nudge runs the film 5% fast or
-slow until it has moved by exactly that much - smooth, no seek, no
-freeze; while paused, it steps exactly. Nudges add up to an offset that
-every later sync keeps, so a nudge is not "corrected" away.
+The **Fine-tune** row nudges the film against the stream: **−0.5** and
+**+0.5** seconds, and **−1 frame** and **+1 frame** (one of the film's
+frames, 42 ms at 24 fps), with the total shown in between and **Reset**
+to clear it. While playing, a nudge runs the film 5% fast or slow until
+it has moved by exactly that much - smooth, no seek, no freeze; while
+paused, it steps exactly. Nudges add up to an offset that every later
+sync keeps, so a nudge is not "corrected" away.
+
+### Line up with the sound or the picture
+
+**Settings > Picture** sets what the film lines up with:
+
+- *The stream's sound* (the default): the film's lips match the voices
+  you hear. Best with the film muted.
+- *The stream's picture*: the film matches the stream's window side by
+  side. A stream's picture can run behind its own sound - by 142 ms
+  on one Twitch stream, the same on every computer watching, as it
+  happens before the stream reaches you - and this choice puts the film
+  that much later, so its lips trail the voices you hear by as much.
+
+How far a stream's picture runs behind is measured, not guessed: while
+the stream shows the film, press **Measure** under Picture (Windows only
+for now). StreamSync brings up the stream's window - the one picked
+under **Settings > Stream window** - and times the film's scene cuts in
+it against the stream's sound, for 20 s or, in a film of long takes, up
+to a minute. Keep the window uncovered meanwhile; if it was minimized,
+it is minimized again after. Each stream's figure is kept, by its
+window's title (such as `somechannel - Twitch`), and shown under
+Picture.
+
+The film window has a delay of its own: the screen shows each frame a
+little after the player's clock reaches it - about 13 ms on a 144 Hz
+screen. On Windows, after each sync with the built-in player, StreamSync
+times its own window against the film's frames and runs the clock that
+much ahead; Picture shows the figure.
+
+The grabs these timings take stay in memory, and only the results are
+kept: no picture is saved or sent. The Mac does neither timing yet -
+grabbing the screen there takes Screen Recording permission, which
+StreamSync no longer asks for - so on a Mac the picture choice has
+nothing to go by, and the film stays on the sound.
 
 ## Keep in sync automatically
 
@@ -513,8 +548,15 @@ Step by step, with a first sync test: [MAC_FIRST_RUN.md](MAC_FIRST_RUN.md).
   line up best. Every match reports how far it stands above everything
   else in the search (peak z) and above the best other candidate
   (score), both in standard deviations; weak matches are flagged rather
-  than trusted. Files whose timestamps do not start at zero (.m2ts, .ts,
-  some MP4s) are handled.
+  than trusted. After a sync, its match is made exact: the recording is
+  cross-correlated with the film's own sound around it, in 2 s windows
+  weighted so that a voice over the film counts for little (GCC-PHAT),
+  which places it to a fraction of a millisecond rather than the
+  search's 16 ms steps. When the recording was not clear enough for that,
+  StreamSync listens 10 s more, up to three times, and moves the film by
+  what it finds - by over 50 ms only once a second look agrees, as that
+  means the stream itself moved. Files whose timestamps do not start at
+  zero (.m2ts, .ts, some MP4s) are handled.
 - **Timing**: stream audio is recorded continuously and every sample is
   dated by its position in the recording, not by when a recording was
   asked for - so the matched moment is corrected by exactly how long ago
@@ -522,9 +564,13 @@ Step by step, with a first sync test: [MAC_FIRST_RUN.md](MAC_FIRST_RUN.md).
   offset. On the Mac every block arrives with the moment macOS captured
   it, and StreamSync adds the output device's own reported delay - a few
   ms on built-in speakers, a good deal more on Bluetooth headphones - so
-  the film lines up with what you hear. VLC's own position only updates every 250-500 ms, so
-  StreamSync dates each update as it arrives (within ~1 ms of the frame
-  on screen). A seek stalls playback for an amount that depends on the
+  the film lines up with what you hear. On Windows, sound recorded from
+  the speakers is dated by when WASAPI plays it, about 20 ms after
+  StreamSync receives it, so the same holds there. VLC's own position
+  only updates every 250-500 ms, so StreamSync dates each update as it
+  arrives; the screen shows the frame a little after that (see
+  [Line up with the sound or the picture](#line-up-with-the-sound-or-the-picture)).
+  A seek stalls playback for an amount that depends on the
   file and the CPU (75 ms to over half a second), so after every seek
   StreamSync measures where playback really landed, trims the rest with a
   5% speed change, and learns the stall for next time: syncs land within
@@ -585,7 +631,8 @@ was already installed. The report names the mismatch instead.
   syncing to what you *hear*), but it means your copy will be "behind
   live" too - as it should be.
 - Settings (film, position hint, listening device, auto options, stream
-  window, relay server, update check) persist in `~/.streamsync.json`.
+  window, picture line-up and timings, relay server, update check)
+  persist in `~/.streamsync.json`.
 
 ## Run from source
 
@@ -647,6 +694,7 @@ right-click > **Open** the first time. For an ordinary install take a
 ```
 python -m ui.contract         # which ui/ module owns each shared method (no Tk needed)
 python test_audio_matcher.py  # audio: commentary noise, quiet scenes, offset files
+python test_picture_timing.py # pictures: scene cuts, a stream's lag, the film window's delay
 python test_controller.py     # sync decisions against a simulated stream
 python test_session.py        # a whole watch party on localhost
 python test_updater.py        # versions, assets, signed checksums
@@ -655,13 +703,14 @@ python test_ui.py             # every screen under real Tk
 ```
 
 The Tests workflow runs the full set on Windows, macOS and Linux for
-each pull request: `test_audio_capture`, `test_players`,
-`test_controller`, `test_audio_matcher`, `test_fingerprint`,
-`test_relay`, `test_relay_tls`, `test_session`, `test_updater`,
-`test_netcerts`, `test_diagnostics`, `test_singleinstance`,
-`test_macswap`, `test_winswap`, `test_windowctl`,
-`test_videomouse`, `test_widgets`, `test_updateflow` and `test_ui`. Tests that drive real
-windows skip themselves where they cannot run. Set `STREAMSYNC_SHOTS` to
+each pull request: `test_audio_capture`, `test_picture_timing`,
+`test_players`, `test_controller`, `test_audio_matcher`,
+`test_fingerprint`, `test_relay`, `test_relay_tls`, `test_session`,
+`test_follow`, `test_tunnel`, `test_updater`, `test_netcerts`,
+`test_diagnostics`, `test_singleinstance`, `test_macswap`,
+`test_winswap`, `test_windowctl`, `test_videomouse`, `test_widgets`,
+`test_updateflow` and `test_ui`. Tests that drive real windows skip
+themselves where they cannot run. Set `STREAMSYNC_SHOTS` to
 a folder and `test_ui` saves each screen there as a PNG. Those tests
 guard against regressions; for how well the audio matcher does on real
 film audio under real commentary, see `bench_audio.py`.
