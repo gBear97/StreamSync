@@ -172,8 +172,29 @@ def main():
     finally:
         mon.stop()
 
+    # 4c. a mark counts as a use: marked, then busy a while (a picture
+    # timing grabs the screen for 20 s), the audio since the mark is
+    # still there, though the device had been idle nearly its limit
+    dev = FakeDevice(jitter=0.005)
+    mon = AudioMonitor("loopback", sr=SR, keep=30, idle_timeout=1.0,
+                       source=lambda: (dev, "hint"))
+    try:
+        mon.capture(0.2, start=mon.mark())
+        time.sleep(0.7)
+        mark = mon.mark()
+        time.sleep(0.7)                   # past the idle limit, counted from the capture
+        data, _, _, lo = mon.capture_span(0.5, start=mark, timeout=2.0)
+        # closed and reopened, the monitor would hand back audio from the
+        # reopening instead - not what was asked for
+        assert lo == mark and data.size == int(0.5 * SR), (lo, mark)
+        print("a mark keeps the device open: the audio after it is kept")
+    finally:
+        mon.stop()
+
     system_audio_tests()
     source_choice_tests()
+    playout_tests()
+    windows_source_tests()
     print("AUDIO CAPTURE TEST PASSED")
 
 
@@ -407,6 +428,206 @@ def source_choice_tests():
         ac.IS_MAC, ac.macos_version, ac.helper_path = saved[1:]
     print("listen-to choices: tap first on 14.2+, BlackHole before it, "
           "never a silent mic")
+
+
+# --- Windows loopback: WASAPI's playout stamps -----------------------------
+
+class FakeWasapi:
+    """soundcard's WASAPI loopback recorder, as PlayoutRecorder uses it:
+    one 10 ms packet per _record_chunk(), fetched through _capture_buffer().
+    Packet k's first frame plays at play_time(k * N); the packet is handed
+    over LEAD before that, late by a random scheduling delay, the way a
+    loopback packet reaches StreamSync before the speakers play it. Its
+    stamp is that play time in 100 ns units, or what stamp(k, t) says."""
+
+    N = 80                          # 10 ms at SR
+    LEAD = 0.030
+
+    def __init__(self, jitter=0.004, stamp=None, silent=None, channels=2, seed=2):
+        self.rng = np.random.default_rng(seed)
+        self.jitter = jitter
+        self.stamp = stamp or (lambda k, t: (int(round(t * 1e7)), 0))
+        self.silent = silent or (lambda k: False)   # soundcard's zero-fill
+        self.channelmap = list(range(channels))
+        self.k = 0
+        self.t_play = None
+        self.pending = np.zeros(0, np.float32)
+        self.delivered = []         # (end_frame, perf_counter at return)
+
+    def play_time(self, frame):
+        return self.t_play + frame / SR
+
+    def __enter__(self):
+        self.t_play = time.perf_counter() + 0.05
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def _capture_buffer(self):      # soundcard's own: no timestamp asked for
+        return None, self.N, 0
+
+    def _record_chunk(self):
+        k = self.k
+        t_first = self.play_time(k * self.N)
+        wait = t_first - self.LEAD - time.perf_counter() + self.rng.uniform(0, self.jitter)
+        if wait > 0:
+            time.sleep(wait)
+        frames = np.arange(k * self.N, (k + 1) * self.N)
+        mono = ((frames % 1000) / 1000.0 + 0.01).astype(np.float32)
+        if self.silent(k):
+            mono[:] = 0                # no packet: nothing to ask WASAPI about
+        else:
+            self.current = self.stamp(k, t_first)
+            self._capture_buffer()
+        self.k += 1
+        self.delivered.append(((k + 1) * self.N, time.perf_counter()))
+        return np.repeat(mono, len(self.channelmap))      # interleaved
+
+    def record(self, numframes):    # soundcard's record(), for the unhooked path
+        nch = len(self.channelmap)
+        while self.pending.size < numframes * nch:
+            self.pending = np.concatenate([self.pending, self._record_chunk()])
+        out, self.pending = self.pending[:numframes * nch], self.pending[numframes * nch:]
+        return out.reshape(-1, nch)
+
+    def arrival_bound(self, frame, span=2.0, step=None):
+        """The tightest arrival-based bound - what stamping on arrival gives.
+        step: only packets ending a block of that many frames count - a
+        reader handed whole blocks sees only those packets arrive."""
+        return min(t - (end - frame) / SR for end, t in self.delivered
+                   if frame <= end <= frame + span * SR and (step is None or end % step == 0))
+
+
+def fake_hook(rec, note):
+    def capture_buffer():
+        note(*rec.current)
+        return None, rec.N, rec.current[1]
+    rec._capture_buffer = capture_buffer
+
+
+def playout_tests():
+    import audio_capture as ac
+
+    def run(dev, hook=fake_hook, seconds=0.6):
+        logs = []
+        recs = []
+
+        def source():
+            recs.append(ac.PlayoutRecorder(dev, SR, name="Speakers (fake)",
+                                           hook=hook, log=logs.append))
+            return recs[-1], "hint"
+        mon = AudioMonitor("loopback", sr=SR, keep=30, source=source)
+        try:
+            data, sr, t0, lo = mon.capture_span(seconds, start=mon.mark(), allow_silence=True)
+            time.sleep(0.6)               # later packets tighten the bound
+            t0 = mon.stamp(lo)
+        finally:
+            mon.stop()
+        run.blocks = [(end, t) for end, t, _ in mon._blocks]
+        return data, t0, lo, logs, recs[-1]
+
+    # 11. every packet stamped: dated by when it plays - exactly, not by
+    # when it happened to arrive (which is LEAD + a packet early)
+    dev = FakeWasapi()
+    data, t0, lo, logs, rec = run(dev)
+    err = t0 - dev.play_time(lo)
+    assert abs(err) < 2e-6, f"stamped {err * 1e3:+.4f} ms off the play time"
+    want = ((np.arange(lo, lo + data.size) % 1000) / 1000.0 + 0.01)
+    assert np.allclose(data, want, atol=1e-4), "slice is not contiguous"
+    old = dev.arrival_bound(lo) - dev.play_time(lo)
+    assert old < -0.02, f"arrival stamping should read early here ({old * 1e3:+.1f} ms)"
+    # every packet's own stamp is believed - except one read so long after
+    # it played that its stamp is not plausible, which a stalled CI runner
+    # can make happen (a macOS one did); only those may go unstamped
+    late = sum(1 for end, t in dev.delivered
+               if dev.play_time(end) - t < ac.PLAYOUT_LEAD[0] + 0.01)
+    assert rec.hooked and rec.stamped > 50 and rec.unstamped <= late, \
+        (rec.hooked, rec.stamped, rec.unstamped, late)
+    assert any("dated by when WASAPI plays it" in m for m in logs), logs
+    print(f"playout stamps: {err * 1e6:+.2f} us off the play time "
+          f"(arrival stamping read {old * 1e3:+.1f} ms)")
+
+    # 12. flagged, bogus and missing stamps among good ones: never early,
+    # and the good ones keep the dating tight
+    def mixed(k, t):
+        if k % 4 == 1:
+            return 0, 0                                  # no stamp
+        if k % 4 == 2:
+            return int(round(t * 1e7)), ac.TIMESTAMP_ERROR
+        if k % 4 == 3:
+            return int(round((t + 5.0) * 1e7)), 0        # not plausible
+        return int(round(t * 1e7)), 0
+    dev = FakeWasapi(stamp=mixed, silent=lambda k: k % 13 == 5)
+    data, t0, lo, logs, rec = run(dev)
+    err = t0 - dev.play_time(lo)
+    early = min(t - dev.play_time(end) for end, t in run.blocks)
+    assert early > -2e-6, f"a block was dated {early * 1e3:+.3f} ms early"
+    assert abs(err) < 2e-6, f"mixed stamps dated {err * 1e3:+.4f} ms off"
+    assert rec.stamped and rec.unstamped
+    print(f"playout stamps: {err * 1e6:+.2f} us with three in four packets "
+          "flagged, bogus or missing; no block early")
+
+    # 13. no usable stamps at all: dated by arrival, exactly as before
+    dev = FakeWasapi(stamp=lambda k, t: (0, 0))
+    data, t0, lo, logs, rec = run(dev, seconds=1.2)
+    err = t0 - dev.arrival_bound(lo)
+    assert -0.0005 < err < 0.002, f"fallback dated {err * 1e3:+.3f} ms off arrival"
+    assert any("not usable" in m for m in logs), logs
+
+    # 14. a soundcard the hook cannot reach: its own record(), dated by arrival
+    def no_hook(rec, note):
+        raise AttributeError("no _ppCaptureClient")
+    dev = FakeWasapi()
+    data, t0, lo, logs, rec = run(dev, hook=no_hook)
+    # record() hands over whole blocks, two packets each, so only every
+    # other packet's arrival is seen: against all of them, a macOS runner's
+    # uneven sleeps put this 2.8 ms out
+    err = t0 - dev.arrival_bound(lo, step=int(round(ac.BLOCK_S * SR)))
+    assert not rec.hooked and -0.0005 < err < 0.002, err
+    want = ((np.arange(lo, lo + data.size) % 1000) / 1000.0 + 0.01)
+    assert np.allclose(data, want, atol=1e-4), "slice is not contiguous"
+    assert any("no packet times" in m for m in logs), logs
+    print("playout stamps: no stamps, or no hook - dated by arrival as before")
+
+
+def windows_source_tests():
+    """Listen to on Windows opens a speaker's loopback through
+    PlayoutRecorder; the host's microphone is opened as before."""
+    import sys
+    import types
+
+    import audio_capture as ac
+
+    class Dev:
+        def __init__(self, name, loopback=False):
+            self.name, self.loopback = name, loopback
+
+    speakers = [Dev("Speakers (Realtek(R) Audio)"), Dev("Headphones (Razer Nari)")]
+    mics = [Dev("Microphone (Razer Nari)")]
+    fake_sc = types.SimpleNamespace(
+        all_speakers=lambda: list(speakers), default_speaker=lambda: speakers[0],
+        all_microphones=lambda: list(mics), default_microphone=lambda: mics[0],
+        get_microphone=lambda name, include_loopback=False: Dev(name, include_loopback))
+    saved = sys.modules.get("soundcard"), ac.IS_MAC
+    sys.modules["soundcard"] = fake_sc
+    ac.IS_MAC = False
+    try:
+        src, hint = ac._open_source("loopback", "")
+        assert isinstance(src, ac.LoopbackSource), src
+        assert src.mic.loopback and src.name == "Speakers (Realtek(R) Audio)"
+        assert "Realtek" in hint
+        src, _ = ac._open_source("loopback", "nari")
+        assert isinstance(src, ac.LoopbackSource) and src.name == "Headphones (Razer Nari)"
+        src, _ = ac._open_source("mic", "")
+        assert not isinstance(src, ac.LoopbackSource) and src.name.startswith("Microphone")
+    finally:
+        if saved[0] is not None:
+            sys.modules["soundcard"] = saved[0]
+        else:
+            sys.modules.pop("soundcard", None)
+        ac.IS_MAC = saved[1]
+    print("listen-to on Windows: loopbacks dated by playout, the mic as before")
 
 
 if __name__ == "__main__":

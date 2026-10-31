@@ -20,6 +20,8 @@ Windows-only tests); elsewhere it is read with ast.
 import traceback
 
 import diagnostics
+import picture_timing
+import screencap
 import windowctl
 import updater
 from players import EmbeddedPlayer
@@ -55,6 +57,7 @@ class Adapter(adapter.PlatformAdapter):
     DEFAULT_DEVICE_NOTE = "system default"
     UPDATE_UNAVAILABLE = ("This copy wasn't installed by the StreamSync installer, so it can't "
                           "update itself. Download the new version from the Releases page.")
+    CAN_MEASURE_PICTURE = True
 
     # --- process and windows ----------------------------------------------
 
@@ -74,6 +77,7 @@ class Adapter(adapter.PlatformAdapter):
         self._ext_hwnd = None
         self._fs_saved = None        # frame style + rect fullscreen replaced
         self._film_placement = None  # where the swap hid the film window from
+        self._measure_restore = False  # minimize the stream again after timing it
 
     def _init_root(self):
         pass                         # no app menu or application hooks here
@@ -226,6 +230,50 @@ class Adapter(adapter.PlatformAdapter):
         self.stream_hwnd = self._win_map.get(title)
         self.stream_window = title
         self._save_config()
+
+    # --- seam 3b: picture timing -------------------------------------------
+
+    def _picture_tools(self):
+        # libvlc draws the film in a child of the frame, sized to the
+        # picture; the frame is the fallback. Win32 only from here on, so
+        # the controller's threads may call it.
+        frame = self.video_frame.winfo_id()
+
+        def film_picture_rect():
+            if not windowctl.is_visible(frame):
+                return None
+            return (windowctl.child_rect(frame, "VLC video output")
+                    or windowctl.client_rect(frame))
+        return screencap.grab, film_picture_rect
+
+    def _stream_for_measure(self):
+        hwnd = windowctl.find_stream_window(self.stream_hwnd, self.stream_window)
+        if hwnd is None:
+            return None, "", ("Couldn't find the stream window - pick it in Settings > "
+                              "Stream window (Refresh lists what's open).")
+        self.stream_hwnd = hwnd
+        # A browser draws nothing while minimized or covered, so it comes up
+        # for the measurement; minimized before, it goes back after.
+        self._measure_restore = windowctl.is_minimized(hwnd)
+        windowctl.bring_forward(hwnd)
+        diagnostics.log(f"picture: timing the stream window {_named(hwnd)}")
+
+        def stream_rect():
+            if (not windowctl.is_valid(hwnd) or windowctl.is_minimized(hwnd)
+                    or not windowctl.is_visible(hwnd)):
+                return None
+            return windowctl.client_rect(hwnd)
+        return stream_rect, picture_timing.channel_key(windowctl.window_title(hwnd)), ""
+
+    def _measure_done(self):
+        hwnd, self._measure_restore = self.stream_hwnd if self._measure_restore else None, False
+        if hwnd and windowctl.is_valid(hwnd) and not self._swapped:
+            windowctl.minimize(hwnd)
+
+    def _note_stream(self):
+        hwnd = windowctl.find_stream_window(self.stream_hwnd, self.stream_window)
+        if hwnd:
+            self.ctl.set_stream_key(picture_timing.channel_key(windowctl.window_title(hwnd)))
 
     def _stream_swap(self, show, why=""):
         """Show the stream's browser window during pauses; hide it again after."""

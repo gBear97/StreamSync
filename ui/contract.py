@@ -94,6 +94,20 @@ CONTRACT = {
                         "would, then the text as the status",
         "_on_synced": "(info); queue: a sync result {match, at, trusted, applied, source} for "
                       "the sync-state row, the status line and the bar",
+        # picture timing: the film on the stream's sound or its picture
+        "_on_line_up": "(); Settings changed line_up_var: ctl.set_line_up (the film moves now), "
+                       "a save, then _show_picture_lines()",
+        "_measure_picture": "(); Settings' Measure: _stream_for_measure() brings the stream's "
+                            "window up, then ctl.measure_stream_picture on a thread (20 s to a "
+                            "minute); what is wrong instead goes to the status line and "
+                            "Settings",
+        "_on_picture": "(info); queue: a picture timing finished ({what: 'stream' or 'film', ok, "
+                       "...}): a stream's puts its window back (_measure_done) and says the "
+                       "result; both save and refresh Settings' Picture lines",
+        "_picture_lines": "() -> tuple; (stream line, film line) for Settings' Picture section, "
+                          "from ctl",
+        "_show_picture_lines": "(note=None); Settings' Picture lines if Settings is open, note "
+                               "in place of the stream line",
         # playback
         "_nudge": "(delta); self._show_offset(self.ctl.nudge(delta))",
         "_reset_offset": "(); ctl.reset_offset(), then _show_offset(0.0)",
@@ -223,6 +237,8 @@ CONTRACT = {
                          "hold released",
         "_step_volume": "(step); the built-in player's volume by step (0-125, never unmuting), "
                         "shown on the OSD",
+        "_film_fps": "(); the built-in player's frame rate, or DEFAULT_FPS while it cannot "
+                     "say: one Fine-tune frame is 1 / this",
         "_flash_osd": "(text, ms=900); the OSD at the film's top-right, for ms",
     },
     "ui/update.py": {
@@ -262,6 +278,9 @@ CONTRACT = {
         "SettingsDialog.set_update_line": "(text, action); the Updates row's text, and its "
                                           "button: 'check' (Check now), 'update' (Update...) "
                                           "or None (disabled while a check runs)",
+        "SettingsDialog.set_picture_lines": "(stream_text, film_text, measuring=False); the "
+                                            "Picture section's two lines, and Measure "
+                                            "disabled while a timing runs",
         "SettingsDialog.apply": "() -> bool; validates and applies the fields; False keeps the "
                                 "dialog open on the field in error",
         "SettingsDialog.close": "(); releases the grab, destroys the window, app._settings = "
@@ -311,7 +330,7 @@ STATE = {
         "_sync_state", "_synced_at", "_party_live", "_session_text", "_party_code",
         "_film_length", "_pos", "_settings", "_party", "_update_dialog",
         "player_var", "mute_var", "auto_var", "follow_var", "interval_var", "swap_var",
-        "device_var", "stream_var", "hint_var", "check_updates_var",
+        "device_var", "stream_var", "hint_var", "check_updates_var", "line_up_var",
     ),
     "ui/mainwin.py": (
         "file_lbl", "status_lbl", "sync_btn", "resync_btn", "offset_lbl", "timeline",

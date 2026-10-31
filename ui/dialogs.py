@@ -248,6 +248,7 @@ class SettingsDialog(_Dialog):
         self._section(body, "Listening", 8, self._build_listening, inner_w)
         self._section(body, "Player", 10, self._build_player, inner_w)
         self._section(body, "Syncing", 12, self._build_syncing, inner_w)
+        self._section(body, "Picture", 10, self._build_picture, inner_w)
         self._section(body, "Updates", 10, self._build_updates, inner_w)
         self._section(body, "Keys", 10, self._build_keys, inner_w, last=True)
         # Made first so that pack keeps it at the bottom, the footer would
@@ -353,6 +354,35 @@ class SettingsDialog(_Dialog):
         # reached after it, where it sits
         widgets.tab_last(self.refresh_btn)
         self._sync_stream_row()
+
+    def _build_picture(self, sec, gap, inner_w):
+        app, px = self.app, theme.px
+        _label(sec, "Line up the film with", 14, True).pack(anchor="w", pady=(px(gap), 0))
+        for text, value, sub in (
+                ("The stream's sound", "sound",
+                 "Lips match the voices you hear. Best with the film muted."),
+                ("The stream's picture", "picture",
+                 "Matches the stream's window side by side, even where a stream's "
+                 "picture runs behind its sound.")):
+            widgets.Radio(sec, text, app.line_up_var, value, sub=sub,
+                          command=app._on_line_up).pack(anchor="w", pady=(px(gap), 0))
+        row = _frame(sec)
+        row.pack(fill="x", pady=(px(gap), 0))
+        self.measure_btn = widgets.FlatButton(row, "Measure", height=34,
+                                              command=app._measure_picture)
+        if app.CAN_MEASURE_PICTURE:
+            self.measure_btn.pack(side="right", padx=(px(12), 0))
+        self.picture_lbl = _label(row, "", fg=theme.MUTED, wrap=inner_w - 130)
+        self.picture_lbl.pack(side="left", fill="x")
+        self.lead_lbl = _label(sec, "", 12, fg=theme.MUTED, wrap=inner_w)
+        self.lead_lbl.pack(anchor="w", pady=(px(gap), 0))
+        lines = app._picture_lines() or ("", "")
+        self.set_picture_lines(lines[0], lines[1], bool(getattr(app.ctl, "measuring", False)))
+
+    def set_picture_lines(self, stream_text, film_text, measuring=False):
+        self.picture_lbl.config(text=stream_text)
+        self.lead_lbl.config(text=film_text)
+        self.measure_btn.config(state="disabled" if measuring else "normal")
 
     def _build_updates(self, sec, gap, inner_w):
         app, px = self.app, theme.px
@@ -1337,7 +1367,7 @@ def _gallery(argv=None):
             self.ctl = Ctl()
             for name in ("NAME", "STREAM_LABEL", "STREAM_AUTO_LABEL", "LISTEN_HELP",
                          "DEFAULT_DEVICE_NOTE", "UPDATE_UNAVAILABLE",
-                         "REFRESH_STREAMS_ON_SETTINGS"):
+                         "REFRESH_STREAMS_ON_SETTINGS", "CAN_MEASURE_PICTURE"):
                 setattr(self, name, getattr(A, name))
             self._settings = self._party = self._update_dialog = None
             self._party_code = ""
@@ -1356,6 +1386,13 @@ def _gallery(argv=None):
             self.stream_var = tk.StringVar(root, "")
             self.hint_var = tk.StringVar(root, "")
             self.check_updates_var = tk.BooleanVar(root, True)
+            self.line_up_var = tk.StringVar(root, "sound")
+
+        def _picture_lines(self):
+            return ("willneff - Twitch: the picture runs 142 ms behind the sound "
+                    "(measured 2026-10-28 22:15).",
+                    "This screen shows the film 12 ms after its clock; StreamSync "
+                    "allows for that.")
 
         def __getattr__(self, name):
             if not name.startswith("_") or name.startswith("__"):

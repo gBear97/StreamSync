@@ -1303,6 +1303,11 @@ def overlays_per_fullscreen(root, a):
 
 
 def main():
+    # what the shell logs goes to a log of the test's own, not the user's
+    import diagnostics
+    work = tempfile.mkdtemp()
+    diagnostics.LOG_DIR = work
+    diagnostics.LOG_FILE = os.path.join(work, "streamsync.log")
     wheel_steps()
     if sys.platform == "win32":
         from ui import platform_win as platform

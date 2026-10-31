@@ -1030,6 +1030,37 @@ def settings(env, root, app):
               "Check now", "Space", "Play / pause", "Back / forward 5 s", "Fullscreen",
               "Esc", "Leave fullscreen", "Done", app.LISTEN_HELP):
         check_in("Settings text", s, shown)
+    for s in ("PICTURE", "Line up the film with", "The stream's sound",
+              "Lips match the voices you hear. Best with the film muted.",
+              "The stream's picture"):
+        check_in("Settings picture text", s, shown)
+    check("Measure shows where the screen can be grabbed",
+          bool(d.measure_btn.winfo_ismapped()), bool(app.CAN_MEASURE_PICTURE))
+    want = "not measured yet" if app.CAN_MEASURE_PICTURE else "needs Windows for now"
+    check(f"the stream line says {want!r}", want in d.picture_lbl.cget("text"))
+    # The film window is timed only where the screen can be grabbed - not on
+    # a Mac - and then only the built-in player's. Once timed, the line says
+    # by how much, everywhere.
+    check("the film line says where this screen is timed", d.lead_lbl.cget("text"),
+          "Timing this screen's own delay needs Windows for now." if env.mac_adapter else
+          "With the built-in player, this screen's own delay is measured after each sync.")
+    app.ctl.film_lead = 0.0123
+    app._show_picture_lines()
+    check("the film line says the timed delay", d.lead_lbl.cget("text"),
+          "This screen shows the film 12 ms after its clock; StreamSync allows for that.")
+    app.ctl.film_lead = None
+    app._show_picture_lines()
+    radios = {r.cget("text"): r for r in descendants(d.win) if isinstance(r, widgets.Radio)}
+    picture = radios.get("The stream's picture")
+    check("Settings has the picture Radio", picture is not None)
+    if picture is not None:
+        saves = len(env.saves) if hasattr(env, "saves") else None
+        picture.invoke()
+        pump(root, 0.1)
+        check("the picture Radio reaches the engine", app.ctl.line_up, "picture")
+        radios["The stream's sound"].invoke()
+        pump(root, 0.1)
+        check("and the sound Radio back", app.ctl.line_up, "sound")
     check_in("Settings device", "Speakers (", shown)
     check("Settings interval field shows the interval", d.interval_field.get(), "30")
     check("dialogs carry no app keys", str(app.root) in d.win.bindtags(), False)

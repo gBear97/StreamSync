@@ -125,6 +125,25 @@ def main():
         # AAC priming puts the container start ~64 ms before the audio
         assert err < 0.12, f"{name}: start time mishandled, err {err:.3f}s"
 
+    # refine_match: the matcher's answer made exact, from the recording
+    # itself - a 48 kHz loopback with a louder voice over it
+    rec = audio_matcher.decode_audio(clip, start + TRUTH, CAPTURE_S)
+    voice = np.convolve(rng.standard_normal(rec.size), np.hamming(65), "same")
+    voice *= 1.2 * np.sqrt((rec * rec).mean()) / (np.sqrt((voice * voice).mean()) + 1e-12)
+    rec48 = audio_matcher.resample(rec + voice.astype(np.float32), audio_matcher.SR, 48000)
+    for off in (0.011, -0.007, 0.0):
+        fine = audio_matcher.refine_match(rec48, 48000, clip, TRUTH + off)
+        err = None if fine is None else (fine - TRUTH) * 1000
+        print(f"refine from {off * 1000:+.0f} ms out: "
+              + ("nothing" if fine is None else f"{err:+.2f} ms"))
+        assert fine is not None and abs(err) < 0.5, f"refined to {err} ms"
+    noise_only = rng.standard_normal(rec48.size).astype(np.float32)
+    assert audio_matcher.refine_match(noise_only, 48000, clip, TRUTH) is None, \
+        "a recording with no film in it was refined"
+    assert audio_matcher.refine_match(rec48[:48000], 48000, clip, TRUTH) is None, \
+        "one second is too little to refine"
+    print("refine: within half a millisecond; nothing from noise or too little")
+
     quiet_scene(tmp)
     dts_core(tmp, clip, feats)
     chunk_boundary(clip)
