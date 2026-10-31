@@ -264,20 +264,63 @@ every**, 10 s at the least):
   you want it even lighter.
 - Drift beyond 0.35 s is corrected automatically. Your fine-tune offset
   is part of where the film *should* be, so it is kept.
-- With **Settings > Follow the stream's pauses** on: when the film's
-  audio disappears from the stream for two consecutive checks (streamer
-  paused, or is talking over a black screen), your copy pauses too. When
-  the film's audio comes back, it resyncs and resumes automatically.
-  Fully hands-free. If the stream was actually still playing (a stretch
-  too quiet to hear), the resume search widens with every check until it
-  finds it again.
 - If checks keep failing the same way, auto mode turns itself off and
   says why.
+
+Following the stream's pauses is no longer part of this: that is
+**Pause with the stream**, below, which listens all the time rather than
+every 30 s.
+
+## Pause with the stream
+
+**Pause with the stream**, the switch under *Keep in sync automatically*,
+pauses your copy when the stream pauses and plays it again when the
+stream does, usually within a second either way. It is on by default and
+starts working after your first sync.
+
+It listens all the time: every tenth of a second it compares the
+stream's last 0.6 s with your film at the one place the stream should be.
+Only the film's own soundtrack decides, and the line under the switch
+says what it hears:
+
+- where the film's track is quiet, there is nothing to listen for, and
+  nothing is decided (**Film is quiet here**);
+- where the film has sound and the stream carries it, the film plays on
+  (**Hearing the film**). If that sound arrives more than 0.35 s early
+  or late, the film is moved onto it;
+- where the film has sound and the stream does not carry it, the film
+  pauses (**Stream paused**), whatever the streamer is saying.
+
+When the film's sound comes back, the film plays from exactly where the
+stream is, typically 0.6 to 1 s later. If it comes back somewhere else -
+Twitch rejoining the live stream after an ad, or the streamer jumping to
+another scene - StreamSync searches outward from where it stopped, and
+in time the whole film, and plays from there. Press Play yourself while
+the stream is paused and the film plays on; StreamSync follows again once
+it hears the film on the stream, or after your next sync.
+
+**Settings > Pause with the stream** sets how soon it pauses. A streamer
+talking over the film can hide its sound from a short listen while it is
+still playing, so the faster rules also pause for a moment now and then
+while they talk. Measured on simulated streams (real film soundtracks and
+read speech, with ducking, compression and streaming codecs):
+
+| Rule | Notices a pause after (typical, slow cases) | False pauses a minute while the streamer talks |
+|---|---|---|
+| Steady | about 1 s on silence, 1.2-1.6 s with talk; up to ~4 s | 0.3 to 3 |
+| **Balanced** (the default) | about 1 s; up to ~1.7 s | 1 to 7 |
+| Fast | 0.7-0.8 s; up to ~1.1 s | 4 to 17 |
+| Instant | 0.3-0.6 s; up to 0.8 s | 29 to 75 |
+
+The false pauses go from a streamer 5 dB quieter than the film to one
+10 dB louder. With nobody talking over the film, none of the rules paused
+by mistake. A stream you mute sounds the same as a paused one, so the
+film pauses then too.
 
 ## See the streamer during pauses
 
 With **Settings > Show the stream while the film is paused** on, a
-detected pause (auto mode, or you pausing yourself) brings the stream's
+pause (Pause with the stream, or you pausing yourself) brings the stream's
 browser forward so you see the facecam while the streamer talks, and
 tucks your film window out of the way. When the film starts again, the
 browser goes back and the film comes back where it was: the same place
@@ -557,6 +600,16 @@ Step by step, with a first sync test: [MAC_FIRST_RUN.md](MAC_FIRST_RUN.md).
   what it finds - by over 50 ms only once a second look agrees, as that
   means the stream itself moved. Files whose timestamps do not start at
   zero (.m2ts, .ts, some MP4s) are handled.
+- **Pause with the stream**: each look compares the stream's last 0.6 s
+  with the film's own sound only where the stream should be (0.4 s either
+  side, for drift), from the film's audio decoded ahead in 60 s blocks,
+  so a look costs a few milliseconds. The film's own level there says
+  whether there is anything to hear; how many looks in a row may miss the
+  film before it pauses is the rule chosen in Settings. While paused it
+  listens for the film where the stream stopped, and where it would be had
+  it played on (a "pause" that was talk-over it could not hear through),
+  and a full match runs every few seconds over a widening stretch of the
+  film for a stream that comes back somewhere else.
 - **Timing**: stream audio is recorded continuously and every sample is
   dated by its position in the recording, not by when a recording was
   asked for - so the matched moment is corrected by exactly how long ago
@@ -693,7 +746,7 @@ right-click > **Open** the first time. For an ordinary install take a
 
 ```
 python -m ui.contract         # which ui/ module owns each shared method (no Tk needed)
-python test_audio_matcher.py  # audio: commentary noise, quiet scenes, offset files
+python test_audio_matcher.py  # audio: commentary noise, quiet scenes, offset files, presence
 python test_picture_timing.py # pictures: scene cuts, a stream's lag, the film window's delay
 python test_controller.py     # sync decisions against a simulated stream
 python test_session.py        # a whole watch party on localhost

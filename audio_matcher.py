@@ -438,6 +438,191 @@ def _score_curve(W, C, w):
                 + VOICE_MIX * _std(_corr_scores(W, C, w)))
 
 
+# ------------------------------------------------------------- presence
+#
+# "Pause with the stream" asks, several times a second, one narrow
+# question: is the film's own sound in the stream right now, where the
+# film says the stream should be? The stream's last fraction of a second
+# is compared with the film at that one place (PRESENCE_SEARCH either
+# side, for drift), not searched for across the film, so each look costs
+# a few milliseconds. The film's sound comes from blocks decoded once
+# (PRESENCE_BLOCK_S long, one starting every PRESENCE_STEP_S, so any
+# stretch shorter than the step fits one) - a look never waits on ffmpeg
+# unless playback has moved into a block not decoded yet.
+#
+# What the film's track says decides: where it is quiet there is nothing
+# to listen for ("quiet"); where it has sound, the stream either carries
+# it ("heard", with how early or late) or does not ("missing") - whatever
+# the streamer is saying over it.
+
+PRESENCE_BLOCK_S = 60.0
+PRESENCE_STEP_S = 30.0
+PRESENCE_BLOCKS = 4        # blocks kept: the one playing, the next, two spare
+PRESENCE_SEARCH = 0.4      # s either side of where the stream should be
+PRESENCE_LIVE_DB = 70.0    # a block's frames this far under its loudest are silence
+PRESENCE_QUIET_DB = 30.0   # film frames this far under its typical level carry nothing to hear
+PRESENCE_LOUD_FRAC = 0.5   # ...and a window needs this share of frames above that to be checked
+PRESENCE_HEARD = 0.30      # a look's correlation at or above this hears the film,
+PRESENCE_MISSING = 0.15    # under this misses it, and between is unsure (the
+                           # caller's rule may set its own: controller.WATCH_RULES)
+
+Presence = collections.namedtuple("Presence", "state shift ncc level_db loud_frac")
+Presence.__doc__ = """film_presence's answer.
+
+state      "quiet" (the film's track has nothing to hear here), or how the
+           stream's sound compares with it: "heard", "unsure" or "missing"
+           (the stream is digitally silent, or correlates too little);
+shift      how far into the film the stream's sound really is against
+           where the film placed it, in seconds, at the best correlation:
+           + the stream is ahead (the film should move forward), - behind.
+           None when quiet or silent; only to be acted on when heard;
+ncc        that best correlation (-1..1);
+level_db   the film's level over the window against the film's typical
+           level (dB, median frame);
+loud_frac  share of the window's film frames within PRESENCE_QUIET_DB of
+           that typical level."""
+
+
+class _FilmBlock:
+    """One decoded stretch of a film: features z-scored over the block (as
+    _file_features makes them) and each frame's level in dB."""
+
+    __slots__ = ("start", "feats", "level_db", "frames")
+
+    def __init__(self, start, x):
+        bm = _band_mags(x, SR)
+        X = _shape(bm)
+        X -= X.mean(axis=0, keepdims=True)
+        X /= (X.std(axis=0, keepdims=True) + 1e-6)
+        self.start = start
+        self.feats = X
+        self.level_db = 10.0 * np.log10((bm.astype(np.float64) ** 2).sum(axis=1) + 1e-20)
+        self.frames = len(X)
+
+
+_blocks = collections.OrderedDict()
+_blocks_lock = threading.Lock()
+_typical = {}          # (path, stamp) -> the film's typical frame level, dB
+
+
+def _block_key(path, start):
+    try:
+        stamp = os.path.getmtime(path)
+    except OSError:
+        stamp = None
+    return (path, stamp, round(start, 3))
+
+
+def presence_block_start(t):
+    """Where the block holding a look that starts at film time t begins."""
+    return max(0.0, math.floor((t - PRESENCE_SEARCH) / PRESENCE_STEP_S) * PRESENCE_STEP_S)
+
+
+def film_block(path, start):
+    """The decoded block of `path` starting at `start` (a multiple of
+    PRESENCE_STEP_S), cached. Safe to call from a prefetching thread."""
+    key = _block_key(path, start)
+    with _blocks_lock:
+        if key in _blocks:
+            _blocks.move_to_end(key)
+            return _blocks[key]
+    try:
+        x = decode_audio(path, start, PRESENCE_BLOCK_S)
+    except MatchError:
+        x = np.zeros(0, np.float32)     # past the film's end: no sound to hear
+    block = _FilmBlock(start, x) if x.size >= SR else None
+    with _blocks_lock:
+        _blocks[key] = block
+        while len(_blocks) > PRESENCE_BLOCKS:
+            _blocks.popitem(last=False)
+    if block is not None:
+        _note_typical(path, block)
+    return block
+
+
+def presence_cached(path, start):
+    """True when the block at `start` is decoded already (or known empty)."""
+    with _blocks_lock:
+        return _block_key(path, start) in _blocks
+
+
+def _note_typical(path, block):
+    """The film's typical level: the median frame level of the blocks seen
+    so far (silence left out), each counted once. It starts from the first
+    block played and settles as more of the film goes by - a quiet opening
+    scene judged against itself alone would pass for typical."""
+    lv = block.level_db
+    live = lv[lv > lv.max() - PRESENCE_LIVE_DB]
+    if live.size < 16:
+        return
+    key = _block_key(path, 0.0)[:2]
+    with _blocks_lock:
+        seen = _typical.setdefault(key, {})
+        seen[round(block.start, 3)] = float(np.median(live))
+
+
+def typical_level(path):
+    """The film's typical frame level in dB, from the blocks seen so far
+    (None before any). The median of the blocks' medians: a long quiet
+    scene moves it less than a mean would."""
+    key = _block_key(path, 0.0)[:2]
+    with _blocks_lock:
+        seen = _typical.get(key)
+        if not seen:
+            return None
+        return float(np.median(list(seen.values())))
+
+
+def film_presence(path, samples, sr, at, lo=-PRESENCE_SEARCH, hi=PRESENCE_SEARCH,
+                  heard=PRESENCE_HEARD, missing=PRESENCE_MISSING):
+    """Is the film's sound in `samples` (a stream recording) where the film
+    says it should be? `at` is the film time samples[0] would carry if the
+    stream were exactly where the film places it; the stream's sound is
+    looked for from lo to hi seconds off that. Returns a Presence.
+
+    Measured on realistic streams (bench_audio's films and speech, with
+    ducking, compression and codecs): film sound with nobody talking over
+    it correlated 0.69 or more in 95% of 0.6 s looks, and a stream without
+    it - paused under a voice, or an ad - under 0.30 in 92%. A streamer
+    talking as loud as the film drags 13% of looks under 0.30 even though
+    the film plays on: a single look cannot tell those apart, so the
+    caller decides from a run of them."""
+    block = film_block(path, presence_block_start(at + lo + PRESENCE_SEARCH))
+    if block is None or at + lo < 0:
+        return Presence("quiet", None, 0.0, -math.inf, 0.0)
+    s_lo = int(round(-lo / HOP_S))
+    s_hi = int(round(hi / HOP_S))
+    i0 = int(round((at - block.start) / HOP_S))
+    C = prep_capture(samples, sr)
+    L = len(C)
+    if i0 - s_lo < 0 or i0 + L + s_hi > block.frames:
+        # off the block's edge: the film is ending, or the look moved into
+        # the next block between choosing it and getting here - nothing
+        # sure either way
+        return Presence("quiet", None, 0.0, -math.inf, 0.0)
+    typical = typical_level(path)
+    if typical is None:          # every block so far was silence
+        return Presence("quiet", None, 0.0, -math.inf, 0.0)
+    window = block.level_db[i0:i0 + L]
+    level = float(np.median(window)) - typical
+    loud = float(np.mean(window > typical - PRESENCE_QUIET_DB))
+    if loud < PRESENCE_LOUD_FRAC:
+        return Presence("quiet", None, 0.0, level, loud)
+    if float(np.abs(samples).max(initial=0.0)) <= 1e-5:
+        return Presence("missing", None, 0.0, level, loud)   # digital silence
+    ncc = _corr_scores(block.feats[i0 - s_lo:i0 + L + s_hi], C.feats, C.weights)
+    k = int(np.argmax(ncc))
+    best = float(ncc[k])
+    d = 0.0
+    if 0 < k < len(ncc) - 1:
+        a, b, c = ncc[k - 1], ncc[k], ncc[k + 1]
+        den = a - 2 * b + c
+        if abs(den) > 1e-12:
+            d = float(np.clip(0.5 * (a - c) / den, -1.0, 1.0))
+    state = "heard" if best >= heard else ("missing" if best < missing else "unsure")
+    return Presence(state, (k + d - s_lo) * HOP_S, best, level, loud)
+
+
 def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None):
     """Locate the recording inside `path`'s audio track.
 
