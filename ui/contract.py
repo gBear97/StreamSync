@@ -88,8 +88,14 @@ CONTRACT = {
                      "sets _sync_state 'syncing' and shows it",
         "_on_busy_off": "(); queue: _set_busy(False), _fs_sync_done(), then 'failed' if the "
                         "state is still 'syncing'",
-        "_on_auto_toggle": "(); auto_var, follow_var or interval_var changed: applied to ctl and "
+        "_on_auto_toggle": "(); auto_var or interval_var changed: applied to ctl and "
                            "saved, then _show_auto_sub()",
+        "_on_watch_toggle": "(); watch_var (Pause with the stream) changed: ctl.set_watch, "
+                            "and a save",
+        "_on_watch_rule": "(_event=None); Settings changed watch_rule_var (how soon it "
+                          "pauses): ctl.set_watch_rule, and a save",
+        "_on_watch": "(key, text); queue: the watcher's state changed: text goes on the "
+                     "line under the switch (_show_watch_line)",
         "_on_auto_off": "(text); queue: auto mode gave up: auto_var off as a manual switch-off "
                         "would, then the text as the status",
         "_on_synced": "(info); queue: a sync result {match, at, trusted, applied, source} for "
@@ -202,8 +208,9 @@ CONTRACT = {
                             "synced, weak, missed, failed or moved (at: the stream position "
                             "matched); returns the headline as plain text",
         "_show_ago": "(text); the sync-state row's 'N s ago' ('' for none)",
-        "_show_auto_sub": "(); the line under 'Keep in sync automatically', from interval_var "
-                          "and follow_var",
+        "_show_auto_sub": "(); the line under 'Keep in sync automatically', from interval_var",
+        "_show_watch_line": "(text); the line under 'Pause with the stream': what the watcher "
+                            "hears now",
         "_show_position": "(t, n, playing); the timeline, both times and the play button (t "
                           "None: 0:00, the knob at 0)",
         "_preview_position": "(frac); while the timeline is dragged: the time label only",
@@ -329,7 +336,8 @@ STATE = {
         "_closing", "_exit_hard", "stream_window", "_stream_choices", "_device_items",
         "_sync_state", "_synced_at", "_party_live", "_session_text", "_party_code",
         "_film_length", "_pos", "_settings", "_party", "_update_dialog",
-        "player_var", "mute_var", "auto_var", "follow_var", "interval_var", "swap_var",
+        "player_var", "mute_var", "auto_var", "watch_var", "watch_rule_var", "interval_var",
+        "swap_var",
         "device_var", "stream_var", "hint_var", "check_updates_var", "line_up_var",
     ),
     "ui/mainwin.py": (

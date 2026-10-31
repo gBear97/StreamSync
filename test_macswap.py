@@ -325,7 +325,8 @@ class Ctl:
         self.busy = False
         self.audio_device = ""
         self.auto_interval = 30
-        self.auto_follow = True
+        self.watch_enabled = True
+        self.watch_rule = "balanced"
         self.relay_url = "ws://localhost:8765"
         self.closed = False
         self.worker = None

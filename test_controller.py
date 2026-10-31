@@ -14,20 +14,20 @@ to leave playback alone:
   still uses its best guess;
 - a weak first look listens longer before giving up;
 - auto mode checks every interval, timed from the start of each pass,
-  and while it holds a pause it listens again as soon as a look ends;
-- a pause auto mode made survives a manual sync that was not applied
-  (the film once stayed paused for good), and is handed back when the
-  interruption plays the film, loads another or switches player;
-- a false pause (a stretch the matcher cannot hear while the stream keeps
-  playing) recovers, because the resume search grows with time - in
-  steps, and only so far, so a long real pause does not decode ever more
-  of the film at every look;
+  and no longer pauses the film: a silent stream is a miss, tried again;
 - a film that cannot be read (its drive unplugged) is not taken for a
   paused stream: the same failure three times running is reported once
-  and switches auto mode off - whether the film was playing or auto mode
-  had paused it and was waiting for the stream - while failures that
-  differ, in type or in message, are not a run, and a silent capture is
-  still a pause;
+  and switches auto mode off, while failures that differ, in type or in
+  message, are not a run;
+- Pause with the stream (the watcher) waits for a sync; pauses the film
+  when the stream stops carrying its sound and plays it from the exact
+  spot when it comes back; leaves a quiet stretch of film alone; under
+  talk-over, pauses as each rule says, and recovers from a false pause
+  where the stream really is; obeys a hand on Play until it hears the
+  film again; corrects a steady drift; finds a stream that comes back far
+  away with a wide search; keeps its pause across a weak Resync, lets it
+  go for another film, stands aside for a watch party; and its switch
+  and rule are saved, the old Follow setting carried over;
 - nudges during a watch party go to the session, which would otherwise
   undo them, and a session that takes the playhead while auto mode is
   listening is not overruled by what auto mode then finds;
@@ -73,6 +73,10 @@ class Stream:
         self.weak_until = 0.0     # recordings shorter than this are weak
         self.coarse = 0.0         # how far out the matcher's answer is (its steps)
         self.unclear = 0          # refinements that come back unclear before one doesn't
+        self.quiet = False        # the film's track is quiet here: nothing to listen for
+        self.talk_ncc = 0.2       # what a look scores while talk-over hides the film
+        self.echo = False         # a recording that began before a pause hears the film in it
+        self.paused_since = None
 
     def pos(self, at=None):
         at = self.clock() if at is None else at
@@ -82,6 +86,7 @@ class Stream:
     def pause(self):
         self.anchor = (self.pos(), self.clock())
         self.playing = False
+        self.paused_since = self.clock()
 
     def play(self):
         self.anchor = (self.pos(), self.clock())
@@ -185,7 +190,11 @@ def install_fakes(stream):
         t0, seconds = feats
         true = stream.pos(t0)
         inside = (lo is None or lo <= true) and (hi is None or true <= hi)
-        if (path != stream.film or not stream.audible or not stream.playing
+        # with echo on, a recording that began before a pause still holds
+        # the film it heard then, and matches it there
+        heard = stream.playing or (stream.echo and stream.paused_since is not None
+                                   and t0 < stream.paused_since)
+        if (path != stream.film or not stream.audible or not heard
                 or not inside):
             return (lo or 0.0) + 7.0, 0.2 * S, 0.6 * Z    # noise
         if seconds < stream.weak_until:
@@ -202,9 +211,33 @@ def install_fakes(stream):
             stream.unclear -= 1
             return None
         return true
+    def presence(path, samples, sr, at, lo=-controller.audio_matcher.PRESENCE_SEARCH,
+                 hi=controller.audio_matcher.PRESENCE_SEARCH,
+                 heard=controller.audio_matcher.PRESENCE_HEARD,
+                 missing=controller.audio_matcher.PRESENCE_MISSING):
+        # a look at the stream against the film where it should be: heard
+        # where the stream carries that stretch of film, missing where it
+        # carries none (paused, another film), quiet where the film has
+        # nothing to hear, and talk_ncc while talk-over hides it
+        t0, seconds = samples
+        P = controller.audio_matcher.Presence
+        if stream.quiet:
+            return P("quiet", None, 0.0, -40.0, 0.0)
+        if path != stream.film or not stream.playing:
+            return P("missing", None, 0.05, 0.0, 1.0)
+        if not stream.audible:
+            ncc = stream.talk_ncc
+            state = "heard" if ncc >= heard else ("missing" if ncc < missing else "unsure")
+            return P(state, 0.0, ncc, 0.0, 1.0)
+        shift = stream.pos(t0) - at
+        if lo <= shift <= hi:
+            return P("heard", shift, 0.8, 0.0, 1.0)
+        return P("missing", None, 0.05, 0.0, 1.0)
     controller.audio_matcher.prep_capture = prep
     controller.audio_matcher.find_match_audio = find
     controller.audio_matcher.refine_match = refine
+    controller.audio_matcher.film_presence = presence
+    controller.audio_matcher.presence_cached = lambda path, start: True
 
 
 def failing_matcher(errors):
@@ -252,8 +285,7 @@ def make(offset=0.0):
 
 
 def new_state():
-    return {"mode": "normal", "failures": 0, "pause_point": None,
-            "paused_at": None}
+    return {"failures": 0, "fail_sig": None, "fail_n": 0}
 
 
 def run_sync(ctl, fn, *args):
@@ -391,166 +423,9 @@ def test_weak_first_look_listens_longer():
     print("weak first look: extended to 12 s and matched")
 
 
-def test_false_pause_recovers():
-    ctl, stream, player, clock, q = make()
-    ctl.auto_enabled = True
-    run_sync(ctl, ctl.sync, "")
-    state = new_state()
-    stream.audible = False            # a long stretch the matcher can't hear...
-    for _ in range(3):
-        clock.now += ctl.auto_step(state)
-    assert state["mode"] == "probe" and not player.playing, "pause not followed"
-    for _ in range(12):               # ...while the stream keeps playing
-        clock.now += ctl.auto_step(state)
-    assert stream.pos() > state["pause_point"] + controller.PAUSE_LOOK_AHEAD, \
-        "test setup: the stream should have left the old fixed window"
-    stream.audible = True
-    for _ in range(3):
-        clock.now += ctl.auto_step(state)
-        if state["mode"] == "normal":
-            break
-    assert state["mode"] == "normal", "never recovered from a false pause"
-    assert abs(player.pos() - stream.pos()) < 1e-6
-    print("false pause: resume search grew with time and found the stream "
-          f"{stream.pos() - state['pause_point']:.0f} s past the pause point")
-
-
-def test_long_pause_window_bounded():
-    ctl, stream, player, clock, q = make()
-    run_sync(ctl, ctl.sync, "")
-    windows = []
-    hear = controller.audio_matcher.find_match_audio
-
-    def spy(path, feats, lo=None, hi=None, progress=None):
-        windows.append((lo, hi))
-        return hear(path, feats, lo, hi, progress)
-    controller.audio_matcher.find_match_audio = spy
-    state = new_state()
-    stream.pause()                    # the streamer steps away for an hour
-    for _ in range(3):
-        clock.now += ctl.auto_step(state)
-    assert state["mode"] == "probe" and not player.playing
-    del windows[:]
-    start = clock.now
-    while clock.now - start < 3600:
-        clock.now += ctl.auto_step(state)
-    shapes = set(windows)
-    assert len(shapes) <= 12, \
-        f"{len(windows)} looks asked for {len(shapes)} different windows"
-    reach = max(hi for lo, hi in windows) - state["pause_point"]
-    limit = controller.PAUSE_LOOK_AHEAD + controller.PAUSE_GROW_MAX
-    assert reach <= limit, f"an hour in, the search reaches {reach:.0f} s ahead"
-    stream.play()
-    clock.now += ctl.auto_step(state)
-    assert state["mode"] == "normal" and abs(player.pos() - stream.pos()) < 1e-6
-    print(f"long pause: {len(windows)} looks in an hour used {len(shapes)} "
-          f"windows reaching {reach:.0f} s ahead, then resumed in place")
-
-
-def test_auto_pause_survives_weak_resync():
-    ctl, stream, player, clock, q = make()
-    ctl.auto_enabled = True
-    run_sync(ctl, ctl.sync, "")
-    seen = {}
-    sync = []
-
-    def paused():
-        assert not player.playing, "auto mode did not follow the pause"
-        seen["seeks"] = len(player.seeks)
-
-    def still_paused():
-        # the stream is still paused, so the Resync was weak: not applied
-        assert any("NOT applied" in m for m in statuses(q))
-        assert not player.playing and len(player.seeks) == seen["seeks"]
-
-    def resumed():
-        assert player.playing, "the film auto mode paused was never resumed"
-        assert abs(player.pos() - stream.pos()) < 1e-6
-
-    def resynced_by_hand():
-        sync.pop()()            # the stream is back, so this one applies
-        assert player.playing
-        seen["seeks"] = len(player.seeks)
-
-    def handed_back():
-        assert len(player.seeks) == seen["seeks"], \
-            "auto mode 'resumed' a film a manual sync had already resumed"
-    run_loop(ctl, clock, 330, [
-        (0, stream.pause),
-        (60, paused),
-        (60, lambda: sync.append(press(ctl, ctl.resync, ""))),
-        (70, lambda: sync.pop()()),
-        (75, still_paused),
-        (100, stream.play),
-        (140, resumed),
-        # paused again, and this time Resync is pressed as the stream
-        # comes back, so it is the manual sync that resumes the film
-        (150, stream.pause),
-        (230, paused),
-        (240, lambda: sync.append(press(ctl, ctl.resync, ""))),
-        (240, stream.play),
-        (255, resynced_by_hand),
-        (330, handed_back)])
-    assert player.playing and abs(player.pos() - stream.pos()) < 1e-6
-    print("auto pause: kept across a weak Resync and resumed with the "
-          "stream; handed back when a Resync resumed it")
-
-
-def test_held_pause_is_only_that_films():
-    # auto mode paused the film for a stream pause; Auto is unticked and
-    # something else goes up - another film, or this one on the other
-    # player - before it is ticked again and the stream plays. What is up
-    # now was never paused by auto mode, so it must not look for the
-    # stream in it around the old pause point, nor "resume" it
-    def run(swap, on_external=False):
-        ctl, stream, player, clock, q = make()
-        ctl.auto_enabled = True
-        if on_external:
-            ctl.external = Player(clock)
-            run_sync(ctl, ctl.use_external, True)
-        run_sync(ctl, ctl.sync, "")
-        was = ctl.player
-        looks = []
-        hear = controller.audio_matcher.find_match_audio
-
-        def find(path, feats, lo=None, hi=None, progress=None):
-            looks.append((path, lo, hi))
-            return hear(path, feats, lo, hi, progress)
-        controller.audio_matcher.find_match_audio = find
-        seen = {}
-
-        def paused():
-            assert not was.playing, "auto mode did not follow the pause"
-            seen["seeks"] = len(was.seeks)
-
-        def rearm():
-            ctl.auto_enabled = True
-            del looks[:]
-        run_loop(ctl, clock, 200, [
-            (0, stream.pause),
-            (60, paused),
-            (61, lambda: setattr(ctl, "auto_enabled", False)),
-            (62, lambda: swap(ctl)),
-            (63, rearm),
-            (100, stream.play)])
-        assert not looks, \
-            f"auto mode looked for a pause it did not make: {looks[:2]}"
-        now = ctl.player
-        assert not now.playing and (now is was or not now.seeks), \
-            "auto mode 'resumed' a film it never paused"
-        assert not was.playing and len(was.seeks) == seen["seeks"]
-
-    run(lambda ctl: ctl.load_file("other.mkv"))
-    run(lambda ctl: ctl.use_embedded(), on_external=True)
-    print("auto pause: let go once another film, or the other player, is up")
-
-
 def test_auto_passes_timed_from_their_start():
-    # "checking every 30 s" means every 30 s, and while auto mode holds a
-    # pause it listens again as soon as a look ends, so a stream that
-    # resumes is heard at the next look. Timing each pass from its end
-    # added the listen to every interval, and left a paused film deaf for
-    # 8 s after every 8 s of listening
+    # "checking every 30 s" means every 30 s: timing each pass from its end
+    # added the listen to every interval
     ctl, stream, player, clock, q = make()
     ctl.auto_enabled = True
     run_sync(ctl, ctl.sync, "")
@@ -563,41 +438,13 @@ def test_auto_passes_timed_from_their_start():
             passes.append(t0)             # a pass's first look starts it
         return hear(path, feats, lo, hi, progress)
     controller.audio_matcher.find_match_audio = find
-
-    def gaps(a, b):
-        ts = [t - start for t in passes if a <= t - start < b]
-        return [round(y - x, 1) for x, y in zip(ts, ts[1:])]
-
-    def followed():
-        assert not player.playing, "auto mode did not follow the pause"
     start = clock.now
-    run_loop(ctl, clock, 380, [
-        (200, stream.pause),
-        (260, followed)])                 # then watching for the resume
-    tracking, watching = gaps(0, 200), gaps(260, 380)
-    assert tracking and all(g <= ctl.auto_interval + 0.5 for g in tracking), \
-        f"checking every {ctl.auto_interval} s took {tracking}"
-    listen = controller.AUTO_RETRY_SECONDS
-    assert watching and all(g <= listen + 1 for g in watching), \
-        f"a paused film listened for {listen:.0f} s every {watching} s"
-    print(f"auto cadence: checks every {max(tracking):.0f} s, and a held "
-          f"pause listens again within {max(watching) - listen:.1f} s")
-
-
-def test_real_pause_and_resume():
-    ctl, stream, player, clock, q = make()
-    run_sync(ctl, ctl.sync, "")
-    state = new_state()
-    stream.pause()
-    for _ in range(3):
-        clock.now += ctl.auto_step(state)
-    assert state["mode"] == "probe" and not player.playing
-    clock.now += 30
-    stream.play()
-    clock.now += ctl.auto_step(state)
-    assert state["mode"] == "normal" and abs(player.pos() - stream.pos()) < 1e-6
-    print("real pause: followed, then resumed in place")
-
+    run_loop(ctl, clock, 200)
+    ts = [t - start for t in passes]
+    gaps = [round(y - x, 1) for x, y in zip(ts, ts[1:])]
+    assert gaps and all(g <= ctl.auto_interval + 0.5 for g in gaps), \
+        f"checking every {ctl.auto_interval} s took {gaps}"
+    print(f"auto cadence: checks every {max(gaps):.0f} s")
 
 def test_vanished_film_gives_up():
     ctl, stream, player, clock, q = make()
@@ -622,62 +469,6 @@ def test_vanished_film_gives_up():
         "want one traceback per failure streak"
     assert len(log.lines) == 2, log.lines     # one repeat, then giving up
     print("vanished film: one report, one traceback, then auto re-sync off")
-
-
-def test_vanished_paused_film_gives_up():
-    # the likelier way to meet it: the film is paused, auto mode waiting
-    # for the stream to come back, when its drive goes (a player whose file
-    # vanished mid-play tends to stop, and a stopped film is left alone)
-    ctl, stream, player, clock, q = make()
-    ctl.auto_enabled = True
-    run_sync(ctl, ctl.sync, "")
-    drain(q)
-    controller.diagnostics = Log()      # what the failures log, not the sync
-    hear = controller.audio_matcher.find_match_audio
-    gone = []
-    seen = {}
-
-    def find(path, feats, lo=None, hi=None, progress=None):
-        if gone:
-            raise controller.matcher.MatchError(
-                "ffmpeg could not read this file as a video.")
-        return hear(path, feats, lo, hi, progress)
-    controller.audio_matcher.find_match_audio = find
-
-    def unplug():
-        assert not player.playing, "auto mode did not follow the pause"
-        seen["seeks"] = len(player.seeks)
-        gone.append(True)
-
-    def gave_up():
-        got = drain(q)
-        offs = [e[1] for e in got if e[0] == "auto_off"]
-        assert offs, "auto mode kept waiting on a film it could not read"
-        assert len(offs) == 1 and "still available" in offs[0], offs
-        assert not ctl.auto_enabled
-        assert not player.playing and len(player.seeks) == seen["seeks"], \
-            "the unreadable film was moved"
-        failed = [e for e in got if e[0] == "status" and "check failed" in e[1]]
-        assert len(failed) == 1, failed
-        log = controller.diagnostics
-        assert len(log.blocks) == 1 and "MatchError" in log.blocks[0][1]
-        assert len(log.lines) == 2, log.lines
-
-    def replug_and_retick():
-        del gone[:]
-        ctl.auto_enabled = True
-    run_loop(ctl, clock, 330, [
-        (0, stream.pause),
-        (60, unplug),
-        (190, gave_up),
-        (200, replug_and_retick),
-        (250, stream.play)])
-    # the pause was auto mode's, so with the film back it is still its to lift
-    assert player.playing and abs(player.pos() - stream.pos()) < 1e-6, \
-        "the film auto mode paused was not resumed once Auto was re-ticked"
-    assert not any(e[0] == "auto_off" for e in drain(q))
-    print("vanished film while paused: auto re-sync off once, the film left "
-          "paused; re-ticked, it resumes with the stream")
 
 
 def test_give_up_needs_a_run():
@@ -721,6 +512,8 @@ def test_give_up_needs_a_run():
 
 
 def test_silent_capture_is_a_miss():
+    # auto mode no longer pauses for a silent stream (the watcher does):
+    # silence is a miss, tried again - never a failure that gives up
     ctl, stream, player, clock, q = make()
     ctl.auto_enabled = True
     run_sync(ctl, ctl.sync, "")
@@ -731,11 +524,10 @@ def test_silent_capture_is_a_miss():
     ctl._loopback().on_capture = silence
     run_loop(ctl, clock, 120)
     got = drain(q)
-    assert not player.playing, "a silent stream was not followed as a pause"
+    assert player.playing, "auto mode paused the film - that is the watcher's to do"
     assert not any(e[0] == "auto_off" for e in got)
     assert not any("check failed" in e[1] for e in got if e[0] == "status")
-    print("silent capture: a stream pause, not a failure")
-
+    print("silent capture: a miss, tried again, the film left playing")
 
 def test_viewer_nudge_goes_to_session():
     ctl, stream, player, clock, q = make()
@@ -764,25 +556,6 @@ def test_session_start_mid_listen_wins():
     clock.now += ctl.auto_step(new_state())
     assert len(player.seeks) == n, "auto mode corrected drift under a session"
 
-    # a resume found while a watch party starts: the party has the film
-    ctl.session, mon.on_capture = None, None
-    state = new_state()
-    stream.pause()
-    for _ in range(3):
-        clock.now += ctl.auto_step(state)
-    assert state["mode"] == "probe" and not player.playing
-    stream.play()
-    n = len(player.seeks)
-    mon.on_capture = party_starts
-    clock.now += ctl.auto_step(state)
-    assert len(player.seeks) == n and not player.playing, \
-        "auto mode resumed the film under a session"
-    assert state["mode"] == "probe"
-
-    # the party over, the pause auto mode made is still its to lift
-    ctl.session, mon.on_capture = None, None
-    clock.now += ctl.auto_step(state)
-    assert state["mode"] == "normal" and abs(player.pos() - stream.pos()) < 1e-6
     print("watch party: a session started mid-listen keeps the playhead")
 
 
@@ -1024,17 +797,13 @@ def test_synced_events():
     assert not synced(got), got
     ctl._loopback().on_capture = None
 
-    # a resume after a pause auto mode followed
-    ctl, stream, player, clock, q = make()
-    run_sync(ctl, ctl.sync, "")
-    state = new_state()
+    # a resume after a pause the watcher followed
+    ctl, stream, player, clock, q, state = watching()
     stream.pause()
-    for _ in range(3):
-        clock.now += ctl.auto_step(state)
+    watch(ctl, clock, 1.0, state=state)
     drain(q)
-    clock.now += 30
     stream.play()
-    clock.now += ctl.auto_step(state)
+    watch(ctl, clock, 0.5, state=state)
     info, = synced(drain(q))
     assert (info["trusted"], info["applied"], info["source"]) == (True, True, "resume"), info
     print("synced events: one per decided match - sync (trusted, weak, not "
@@ -1391,20 +1160,305 @@ def test_inexact_sync_made_exact_later():
           "when never clear, while the stream keeps moving, or after a new sync")
 
 
+
+# ------------------------------------------------- pause with the stream
+
+def watch(ctl, clock, seconds, events=(), state=None):
+    """Run watch_step for `seconds` of simulated time, wide searches and
+    prefetches in place; `events` are (after, fn) pairs. Returns the
+    watcher state, to go on from."""
+    state = state if state is not None else ctl.watch_state()
+    ctl._spawn = lambda fn, *a: fn(*a)
+    start = clock.now
+    todo = sorted(events, key=lambda e: e[0])
+    while clock.now - start < seconds:
+        while todo and clock.now - start >= todo[0][0]:
+            todo.pop(0)[1]()
+        clock.now += ctl.watch_step(state)
+    for _, fn in todo:
+        fn()
+    return state
+
+
+def lines(q):
+    return [e[2] for e in drain(q) if e[0] == "watch"]
+
+
+def watching(rule="balanced"):
+    """A synced film with the watcher on, watched for 2 s."""
+    ctl, stream, player, clock, q = make()
+    ctl.watch_enabled, ctl.watch_rule = True, rule
+    run_sync(ctl, ctl.sync, "")
+    state = watch(ctl, clock, 2.0)
+    assert state["mode"] == "playing" and player.playing
+    return ctl, stream, player, clock, q, state
+
+
+def in_sync(player, stream, off=0.0):
+    return player.playing and abs(player.pos() - (stream.pos() + off)) < 1e-6
+
+
+def test_watch_waits_for_a_sync():
+    ctl, stream, player, clock, q = make()
+    player.anchor, player.playing = (0.0, clock()), True     # played, never synced
+    state = watch(ctl, clock, 2.0)
+    stream.pause()
+    watch(ctl, clock, 3.0, state=state)
+    assert player.playing, "the watcher paused a film no sync had lined up"
+    assert lines(q) == [controller.WATCH_LINES["needsync"]]
+    stream.play()
+    run_sync(ctl, ctl.sync, "")
+    watch(ctl, clock, 1.0, state=state)
+    assert state["mode"] == "playing" and lines(q)[-1] == "Hearing the film"
+    print("watcher: waits for a sync, then hears the film")
+
+
+def test_watch_pauses_and_resumes():
+    ctl, stream, player, clock, q, state = watching()
+    drain(q)
+    paused_at = {}
+
+    def stop():
+        stream.pause()
+        paused_at["t"] = clock.now
+    watch(ctl, clock, 1.0, [(0.0, stop)], state=state)
+    got = drain(q)
+    assert not player.playing, "the film played on after the stream paused"
+    assert ("swap", True, "pause with the stream: the film's sound stopped") in got
+    assert [e[2] for e in got if e[0] == "watch"] == ["Stream paused"]
+    took = player.anchor[1] - paused_at["t"]
+    assert took <= 0.35, f"balanced paused {took:.2f} s after the stream did"
+    watch(ctl, clock, 10.0, state=state)           # the streamer is away a while
+    assert not player.playing
+    back = {}
+
+    def resume():
+        stream.play()
+        back["t"] = clock.now
+    watch(ctl, clock, 1.0, [(0.0, resume)], state=state)
+    got = drain(q)
+    assert in_sync(player, stream), "the film did not play on from where the stream is"
+    assert ("swap", False, "pause with the stream: the stream resumed") in got
+    resumed = [e[1] for e in got if e[0] == "synced"]
+    assert resumed and resumed[0]["source"] == "resume"
+    came = player.anchor[1] - back["t"]
+    assert came <= 0.45, f"the resume took {came:.2f} s: two looks 0.3 s apart should do"
+    print(f"watcher: paused {took:.1f} s after the stream, played on in place "
+          f"{came:.1f} s after its return")
+
+
+def test_watch_leaves_a_quiet_film_alone():
+    ctl, stream, player, clock, q, state = watching()
+    stream.quiet = True
+    stream.pause()
+    watch(ctl, clock, 5.0, state=state)
+    assert player.playing, "a quiet stretch of film was taken for a pause"
+    assert "Film is quiet here" in lines(q)
+    print("watcher: the film's own quiet decides nothing")
+
+
+def test_watch_rules_under_talk_over():
+    # talk-over hides the film from every look while the stream plays on:
+    # each rule pauses as it says, and the false pause recovers onto the
+    # stream - which played on meanwhile - once the film is heard again
+    want = {"instant": 2, "fast": 7, "balanced": 9, "steady": None}
+    for rule, looks in want.items():
+        ctl, stream, player, clock, q, state = watching(rule)
+        stream.audible, stream.talk_ncc = False, 0.2
+        start = clock.now
+        watch(ctl, clock, 3.0, state=state)
+        if looks is None:
+            assert player.playing, f"{rule} paused on looks it was only unsure of"
+            continue
+        assert not player.playing, f"{rule} never paused"
+        took = round((player.anchor[1] - start) / controller.WATCH_TICK) + 1   # the first at 0
+        assert took == looks, f"{rule} paused after {took} looks, not {looks}"
+        stream.audible = True
+        watch(ctl, clock, 0.5, state=state)
+        assert in_sync(player, stream), f"{rule}: the false pause did not catch up"
+    print("watcher rules: instant pauses after 2 looks, fast 7, balanced 9, steady "
+          "never on unsure ones; a false pause catches up with the stream")
+
+
+def test_watch_obeys_play_by_hand():
+    ctl, stream, player, clock, q, state = watching()
+    stream.pause()
+    watch(ctl, clock, 1.0, state=state)
+    assert not player.playing
+    player.anchor, player.playing = (player.pos(), clock()), True   # Play pressed
+    watch(ctl, clock, 3.0, state=state)
+    assert player.playing, "the watcher paused a film the user had just played"
+    assert state["mode"] == "override"
+    assert controller.WATCH_LINES["override"] in lines(q)
+    stream.play()
+    run_sync(ctl, ctl.sync, "")                    # a sync lines it up: heard again
+    watch(ctl, clock, 0.5, state=state)
+    assert state["mode"] == "playing"
+    stream.pause()
+    watch(ctl, clock, 1.0, state=state)
+    assert not player.playing, "following again once heard: it should pause"
+    print("watcher: a hand on Play is obeyed until the film is heard again")
+
+
+def test_watch_corrects_drift():
+    ctl, stream, player, clock, q, state = watching()
+    player.anchor = (player.pos() + 0.37, clock())             # 0.37 s ahead
+    n = len(player.seeks)
+    watch(ctl, clock, 1.0, state=state)
+    assert len(player.seeks) == n + 1, "drift over 0.35 s was not corrected once"
+    assert in_sync(player, stream)
+    assert any("corrected -0.37 s drift" in m for m in statuses(q))
+    player.anchor = (player.pos() + 0.2, clock())              # within tolerance
+    n = len(player.seeks)
+    watch(ctl, clock, 1.0, state=state)
+    assert len(player.seeks) == n, "drift under 0.35 s was 'corrected'"
+    print("watcher: 0.37 s of drift corrected, 0.2 s left alone")
+
+
+def test_watch_finds_a_far_jump():
+    ctl, stream, player, clock, q, state = watching()
+    windows = []
+    hear = controller.audio_matcher.find_match_audio
+
+    def find(path, feats, lo=None, hi=None, progress=None):
+        windows.append((lo, hi))
+        return hear(path, feats, lo, hi, progress)
+    controller.audio_matcher.find_match_audio = find
+    stream.pause()
+    watch(ctl, clock, 8.0, state=state)      # a search waits for 4 s heard since the stop
+    assert not player.playing and windows, "no wide search while paused"
+    pp = state["pp"]
+    lo, hi = windows[0]
+    assert lo == pp - controller.WATCH_FAR_BACK and hi >= pp + controller.WATCH_FAR_AHEAD
+    stream.anchor = (stream.pos() + 900.0, clock())            # the streamer jumped
+    stream.play()
+    watch(ctl, clock, 40.0, state=state)
+    assert in_sync(player, stream), "a stream 900 s away was never found"
+    assert (None, None) in windows, "the whole film was never searched"
+    print(f"watcher: a 900 s jump found by a whole-film search after "
+          f"{len(windows)} wide searches")
+
+
+def test_watch_pause_holds_against_old_sound():
+    # the recordings a paused watcher takes still hold, for a few seconds,
+    # the film from before the stream stopped: a wide search over them
+    # "found" the stream there and played the film while the stream stayed
+    # paused (seen end to end on real audio, at 1.3 s and again at 3 s)
+    ctl, stream, player, clock, q, state = watching()
+    stream.echo = True
+    stream.pause()
+    watch(ctl, clock, 1.0, state=state)
+    assert not player.playing
+    n = len(player.seeks)
+    watch(ctl, clock, 8.0, state=state)
+    assert not player.playing and len(player.seeks) == n, \
+        f"played the film {len(player.seeks) - n} times on sound from before the pause"
+    stream.play()
+    watch(ctl, clock, 1.0, state=state)
+    assert in_sync(player, stream)
+    print("watcher: a paused stream stays paused - sound from before the stop is not "
+          "taken for its return")
+
+
+def test_watch_keeps_its_pause_across_a_weak_resync():
+    ctl, stream, player, clock, q, state = watching()
+    stream.pause()
+    watch(ctl, clock, 2.0, state=state)
+    assert not player.playing
+    worker = press(ctl, ctl.resync, "")            # claimed now; the watcher ticks meanwhile
+    watch(ctl, clock, 1.0, state=state)
+    assert state["mode"] == "paused", "the watcher dropped its pause while a sync ran"
+    worker()                                       # the stream is paused: weak, not applied
+    assert any("NOT applied" in m for m in statuses(q))
+    watch(ctl, clock, 2.0, state=state)
+    assert not player.playing and state["mode"] == "paused"
+    stream.play()
+    watch(ctl, clock, 0.5, state=state)
+    assert in_sync(player, stream), "the pause was not the watcher's to lift any more"
+    print("watcher: its pause survives a weak Resync, and lifts with the stream")
+
+
+def test_watch_lets_go_for_another_film():
+    ctl, stream, player, clock, q, state = watching()
+    stream.pause()
+    watch(ctl, clock, 2.0, state=state)
+    ctl.load_file("other.mkv")
+    ctl.video_path = "other.mkv"
+    stream.play()
+    watch(ctl, clock, 3.0, state=state)
+    assert not player.playing and state["mode"] == "idle", \
+        "the watcher 'resumed' a film it never paused"
+    print("watcher: lets its pause go when another film is opened")
+
+
+def test_watch_stands_aside():
+    ctl, stream, player, clock, q, state = watching()
+    ctl.session = session.ViewerSession("ws://x", "CODE", "film.mkv", player, q)
+    stream.pause()
+    watch(ctl, clock, 2.0, state=state)
+    assert player.playing and state["mode"] == "idle"
+    assert controller.WATCH_LINES["party"] in lines(q)
+    ctl.session = None
+    ctl.watch_enabled = False
+    watch(ctl, clock, 2.0, state=state)
+    assert player.playing, "the switch was off"
+    assert lines(q)[-1] == ""
+    print("watcher: stands aside for a watch party, and does nothing switched off")
+
+
+def test_watch_settings_saved():
+    import json
+    import tempfile
+    from pathlib import Path
+    path = Path(tempfile.mkdtemp()) / "cfg.json"
+    real = controller.CONFIG_PATH
+    controller.CONFIG_PATH = path
+    try:
+        ctl, *_ = make()
+        ctl.watch_enabled, ctl.watch_rule = False, "steady"
+        ctl.save_config({})
+        cfg = json.loads(path.read_text())
+        assert cfg["pause_with_stream"] is False and cfg["pause_rule"] == "steady"
+        assert "auto_follow" not in cfg
+        ctl2, *_ = make()
+        ctl2.load_config()
+        assert ctl2.watch_enabled is False and ctl2.watch_rule == "steady"
+        for old, on in (({"auto_follow": False}, False), ({"auto_follow": True}, True),
+                        ({}, True), ({"pause_rule": "bogus"}, True)):
+            path.write_text(json.dumps(old))
+            ctl3, *_ = make()
+            ctl3.load_config()
+            assert ctl3.watch_enabled is on and ctl3.watch_rule == "balanced", old
+    finally:
+        controller.CONFIG_PATH = real
+    print("watcher settings: saved and read back; Follow off carries over as off")
+
+
+def test_watch_failures_reported():
+    ctl, stream, player, clock, q, state = watching()
+    controller.diagnostics = Log()
+
+    def gone(*a, **k):
+        raise controller.matcher.MatchError("Could not decode audio from the file.")
+    controller.audio_matcher.film_presence = gone
+    for _ in range(5):
+        try:
+            clock.now += ctl.watch_step(state)
+        except Exception as e:
+            clock.now += ctl._watch_failed(state, e)
+    assert controller.WATCH_LINES["error"] in lines(q)
+    assert len(controller.diagnostics.blocks) == 1, "want one traceback per run"
+    assert player.playing, "an unreadable film was taken for a pause"
+    print("watcher: an unreadable film is reported once and said on its line")
+
 def main():
     test_nudged_film_left_alone()
     test_drift_corrected()
     test_weak_resync_not_applied()
     test_weak_first_look_listens_longer()
     test_slow_film_start_says_why()
-    test_false_pause_recovers()
-    test_real_pause_and_resume()
     test_auto_passes_timed_from_their_start()
-    test_auto_pause_survives_weak_resync()
-    test_held_pause_is_only_that_films()
-    test_long_pause_window_bounded()
     test_vanished_film_gives_up()
-    test_vanished_paused_film_gives_up()
     test_give_up_needs_a_run()
     test_silent_capture_is_a_miss()
     test_viewer_nudge_goes_to_session()
@@ -1419,6 +1473,19 @@ def main():
     test_measure_stream_picture()
     test_film_window_timed_after_sync()
     test_inexact_sync_made_exact_later()
+    test_watch_waits_for_a_sync()
+    test_watch_pauses_and_resumes()
+    test_watch_leaves_a_quiet_film_alone()
+    test_watch_rules_under_talk_over()
+    test_watch_obeys_play_by_hand()
+    test_watch_corrects_drift()
+    test_watch_finds_a_far_jump()
+    test_watch_pause_holds_against_old_sound()
+    test_watch_keeps_its_pause_across_a_weak_resync()
+    test_watch_lets_go_for_another_film()
+    test_watch_stands_aside()
+    test_watch_settings_saved()
+    test_watch_failures_reported()
     print("CONTROLLER TEST PASSED")
 
 

@@ -51,7 +51,7 @@ class Shell(adapter.PlatformAdapter):
         "update_installing": "_on_update_installing", "update_ready": "_on_update_ready",
         "update_failed": "_on_update_failed", "update_cancelled": "_on_update_cancelled",
         "hosting": "_on_hosting", "hosting_ready": "_on_hosting_ready",
-        "hosting_failed": "_on_hosting_failed"}
+        "hosting_failed": "_on_hosting_failed", "watch": "_on_watch"}
 
     TEXT_CLASSES = {"Entry", "TEntry", "Text", "Spinbox", "TSpinbox", "TCombobox"}
 
@@ -137,7 +137,8 @@ class Shell(adapter.PlatformAdapter):
         self.player_var = tk.StringVar(r, value="embedded")
         self.mute_var = tk.BooleanVar(r, value=True)
         self.auto_var = tk.BooleanVar(r, value=False)
-        self.follow_var = tk.BooleanVar(r, value=True)
+        self.watch_var = tk.BooleanVar(r, value=True)          # Pause with the stream
+        self.watch_rule_var = tk.StringVar(r, value="balanced")  # ...how quickly it pauses
         self.interval_var = tk.IntVar(r, value=30)
         self.swap_var = tk.BooleanVar(r, value=True)
         self.device_var = tk.StringVar(r, value="")
@@ -324,9 +325,24 @@ class Shell(adapter.PlatformAdapter):
             interval = self.interval_var.get()
         except (ValueError, tk.TclError):
             interval = 30
-        self.ctl.set_auto(self.auto_var.get(), self.follow_var.get(), interval)
+        self.ctl.set_auto(self.auto_var.get(), interval)
         self._save_config()
         self._show_auto_sub()
+
+    def _on_watch_toggle(self):
+        """The main window's Pause with the stream switch."""
+        self.ctl.set_watch(self.watch_var.get())
+        self._save_config()
+
+    def _on_watch_rule(self, _event=None):
+        """Settings' Pause with the stream rule: how soon it pauses."""
+        self.ctl.set_watch_rule(self.watch_rule_var.get())
+        self._save_config()
+
+    def _on_watch(self, key, text):
+        """queue: the watcher's state changed; its line goes under the
+        switch."""
+        self._show_watch_line(text)
 
     def _on_auto_off(self, text):
         # auto mode gave up (details in the log): untick it
@@ -825,7 +841,8 @@ class Shell(adapter.PlatformAdapter):
         if cfg.get("hint"):
             self.hint_var.set(cfg["hint"])
         self.interval_var.set(self.ctl.auto_interval)
-        self.follow_var.set(self.ctl.auto_follow)
+        self.watch_var.set(self.ctl.watch_enabled)
+        self.watch_rule_var.set(self.ctl.watch_rule)
         self.line_up_var.set(self.ctl.line_up)
         self.swap_var.set(bool(cfg.get("swap", True)))
         self.check_updates_var.set(bool(cfg.get("check_updates", True)))

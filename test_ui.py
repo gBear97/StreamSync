@@ -786,11 +786,15 @@ class Env:
 
         # Auto mode must never start listening here: a real capture would
         # need a sound card, and on a Mac the microphone permission.
-        def set_auto(enabled, follow, interval):
-            self.auto_calls.append((enabled, follow, interval))
-            real_set_auto(False, follow, interval)
+        def set_auto(enabled, interval):
+            self.auto_calls.append((enabled, interval))
+            real_set_auto(False, interval)
         self.auto_calls = []
         ctl.set_auto = set_auto
+        # Nor may Pause with the stream take a look: the same capture. Its
+        # loop asks watch_step each time, so a stand-in here stops it at
+        # once; its line is checked from events put on the queue.
+        ctl.watch_step = lambda state: 0.25
         # The stream-pause swap would raise or hide real windows and apps.
         self.swaps = []
         app._stream_swap = lambda show, why="": self.swaps.append(show)
@@ -889,7 +893,7 @@ def main_synced(env, root, app):
     check("FirstRun hides with a film", app.first_frame.winfo_ismapped(), 0)
     shown = texts(app.root)
     for s in ("Synced", " - stream at 1:12:40", "1:12:40", "2:49:03", "Film muted",
-              "+0.20 s", "Keep in sync automatically", "Fullscreen",
+              "+0.20 s", "Keep in sync automatically", "Pause with the stream", "Fullscreen",
               "Resync", "Sync to stream", "Fine-tune", "Reset", "Open film…"):
         check_in("Main text", s, shown)
     # The controls row cuts the subtitle label to fit the card. Linux has
@@ -908,6 +912,29 @@ def main_synced(env, root, app):
     check("Main has the auto Switch", sw is not None)
     if sw is not None:
         check("auto_var set by code draws the Switch on", switch_is_on(sw))
+    # Pause with the stream: its own Switch, on by default, and the line
+    # under it says what the watcher hears
+    switches = []
+
+    def collect(w):
+        if isinstance(w, widgets.Switch):
+            switches.append(w)
+        for c in w.winfo_children():
+            collect(c)
+    collect(app.main_frame)
+    check("Main has two Switches: auto, and Pause with the stream", len(switches), 2)
+    app.q.put(("watch", "heard", "Hearing the film"))
+    pump(root, 0.3)
+    check_in("Pause with the stream's line", "Hearing the film", texts(app.root))
+    if len(switches) == 2:
+        watch_sw = switches[1]
+        check("Pause with the stream starts on", switch_is_on(watch_sw))
+        app.watch_var.set(False)
+        app._on_watch_toggle()
+        check("its Switch reaches the engine", app.ctl.watch_enabled, False)
+        app.watch_var.set(True)
+        app._on_watch_toggle()
+        check("and back on", app.ctl.watch_enabled, True)
     shot(root, root, "02-main-synced")
 
     # A status that comes, wraps to two lines and goes leaves the timeline
@@ -1025,7 +1052,8 @@ def settings(env, root, app):
               "VLC app", "Plays in your installed VLC's own window instead.",
               "Start searching near", "Optional. Blank searches the whole film.",
               "Re-check every", "seconds", 'While "Keep in sync automatically" is on.',
-              "Follow the stream's pauses", "Show the stream while the film is paused",
+              "Pause with the stream", "Balanced - about a second",
+              "Show the stream while the film is paused",
               app.STREAM_LABEL, "Refresh", "Check for updates when StreamSync starts",
               "Check now", "Space", "Play / pause", "Back / forward 5 s", "Fullscreen",
               "Esc", "Leave fullscreen", "Done", app.LISTEN_HELP):
@@ -1034,6 +1062,13 @@ def settings(env, root, app):
               "Lips match the voices you hear. Best with the film muted.",
               "The stream's picture"):
         check_in("Settings picture text", s, shown)
+    # Pause with the stream's rule: picked here, it reaches the engine
+    d.rule_select.choose("steady")
+    pump(root, 0.3)
+    check("the pause rule reaches the engine", app.ctl.watch_rule, "steady")
+    d.rule_select.choose("balanced")
+    pump(root, 0.3)
+    check("and back", app.ctl.watch_rule, "balanced")
     check("Measure shows where the screen can be grabbed",
           bool(d.measure_btn.winfo_ismapped()), bool(app.CAN_MEASURE_PICTURE))
     want = "not measured yet" if app.CAN_MEASURE_PICTURE else "needs Windows for now"
@@ -1102,7 +1137,7 @@ def settings(env, root, app):
     check("Done applies it to interval_var", app.interval_var.get(), 45)
     check("Done closes Settings", app._settings, None)
     check("Settings window gone", bool(d.win.winfo_exists()), False)
-    check("Done handed the interval to the engine", env.auto_calls[-1:], [(False, True, 45)])
+    check("Done handed the interval to the engine", env.auto_calls[-1:], [(False, 45)])
     check("the engine's auto mode stayed off in this test", app.ctl.auto_enabled, False)
 
 

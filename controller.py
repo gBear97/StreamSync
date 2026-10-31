@@ -26,6 +26,8 @@ It talks to the shell only through the event queue, with
                          the film was moved to it, "source": "sync",
                          "auto" or "resume"}. The stream is at
                          match + (perf_counter() - at) now.
+    ("watch", key, text) Pause with the stream's state changed: key is a
+                         WATCH_LINES key, text the line to show for it
 """
 
 import json
@@ -61,11 +63,76 @@ AUTO_RETRY_SECONDS = 8.0   # one longer look before counting a failure
 AUTO_FAIL_GIVEUP = 3       # an auto check failing the same way this many
                            # times running is not a blip: stop, and say so
 DRIFT_TOLERANCE = 0.35
-PAUSE_LOOK_BACK = 25.0     # resume search: behind the pause point...
-PAUSE_LOOK_AHEAD = 40.0    # ...and ahead of it, plus time since the pause
-PAUSE_GROW_STEP = 60.0     # ...counted in whole steps (one decode per step)
-PAUSE_GROW_MAX = 600.0     # ...and at most this much
 SESSION_CLOSE_WAIT = 1.5   # how long quitting waits for a session to end
+
+# Pause with the stream (watch_step): a look at the stream's last
+# WATCH_LOOK seconds every WATCH_TICK, against the film where it places
+# the stream (audio_matcher.film_presence).
+WATCH_TICK = 0.1
+WATCH_LOOK = 0.6
+# Paused, a look counts toward playing again at WATCH_RESUME_HEARD or more,
+# and plays the film once another, WATCH_RESUME_GAP or more later, agrees
+# with it on where the stream is. Looks 0.1 s apart share most of their
+# sound, so a voice or an ad that resembled the film near where it stopped
+# passed two of them in a row: on paused streams with talk-over, two
+# looks in a row at 0.30 "resumed" 9-13 times a minute; at 0.40 and 0.3 s
+# apart, 0-1.4 (ads 0.5) - for about 0.3 s more before a real resume.
+WATCH_RESUME_HEARD = 0.40
+WATCH_RESUME_GAP = 0.3
+WATCH_RESUME_AGREE = 0.08
+WATCH_DRIFT_LOOKS = 3      # heard looks in a row off by over DRIFT_TOLERANCE, agreeing...
+WATCH_DRIFT_AGREE = 0.06   # ...this well, before the drift is corrected
+WATCH_NEAR_BACK = 0.3      # paused: the resume is looked for a look's length and this before
+WATCH_NEAR_AHEAD = 0.5     # ...where it stopped, to this after (where it stopped is known to
+                           # about 0.3 s, and a look straddles the resume or comes late)
+WATCH_FAR_LISTEN = 4.0     # a wide search matches this much of the stream's sound,
+WATCH_FAR_BACK = 25.0      # ...from this far behind where it stopped to this far past
+WATCH_FAR_AHEAD = 40.0     # ...where it would be had it played on,
+WATCH_FAR_REACH = 600.0    # ...but no further than this past where it stopped,
+WATCH_FAR_WHOLE = 30.0     # ...and every fourth one after this long paused, the whole film
+WATCH_FAR_EVERY = ((30.0, 2.0), (120.0, 5.0), (math.inf, 15.0))  # (paused under s, s between)
+WATCH_FAIL_SHOW = 10       # looks in a row that could not be taken before the line says so
+
+# How quickly it pauses (Settings). A look reads heard at or above `heard`,
+# missing under `missing`, unsure between; the film pauses after
+# `missing_run` missing looks in a row, or `unheard_run` looks in a row not
+# heard (None: never on that count). Measured on realistic streams
+# (bench_audio's films and speech: ducking, compression, codecs), 0.6 s
+# looks every 0.1 s:
+#
+#              false pauses a minute while the     a pause noticed after,
+#              streamer talks (-5 dB .. +10 dB     median / p90 s (silence,
+#              against the film's typical level)   voice, ad)
+#   instant    29 .. 75                            0.3-0.6 / 0.6-0.8
+#   fast       3.7 .. 17                           0.7-0.8 / 1.0-1.1
+#   balanced   1.0 .. 7.4                          0.9-1.0 / 1.1-1.7
+#   steady     0.3 .. 2.9                          0.9-1.6 / 1.1-3.8
+#
+# With nobody talking over the film, none of them paused by mistake. The
+# instant rule is the plain one - a look that misses the film is a pause -
+# and a voice as loud as the film hides it from a single look often enough
+# to stutter the film many times a minute.
+WATCH_RULES = {
+    "instant": {"heard": 0.35, "missing": 0.35, "missing_run": 2, "unheard_run": None},
+    "fast": {"heard": 0.35, "missing": 0.15, "missing_run": 2, "unheard_run": 7},
+    "balanced": {"heard": 0.30, "missing": 0.15, "missing_run": 3, "unheard_run": 9},
+    "steady": {"heard": 0.30, "missing": 0.15, "missing_run": 3, "unheard_run": None},
+}
+WATCH_LINES = {   # the line under the main window's switch, per watcher state
+    "off": "",
+    "nofilm": "Starts once a film is open and synced",
+    "needsync": "Starts after the next sync",
+    "sync": "Waiting for the sync",
+    "party": "Off while a watch party runs",
+    "heard": "Hearing the film",
+    "quiet": "Film is quiet here",
+    "paused": "Stream paused",
+    "override": "You played it - following again once it hears the film",
+    "byhand": "Film paused",
+    "noaudio": "Can't hear this computer's sound",
+    "error": "Can't read the film's sound",
+    "fault": "Stopped by an error - details in the log",
+}
 # Picture timing (picture_timing.py): the stream's picture against its sound,
 # and the film window's own picture against the player's clock.
 MEASURE_FIND = 3.0         # the stream's whole window grabbed first, to find the video
@@ -157,8 +224,13 @@ class SyncController:
         self._measuring = False
         self.audio_device = ""       # substring of the capture device name
         self.auto_enabled = False
-        self.auto_follow = True
         self.auto_interval = 30
+        self.watch_enabled = True    # Pause with the stream
+        self.watch_rule = "balanced"  # how quickly it pauses: a WATCH_RULES key
+        # (film, player) a sync last lined up with the stream: the watcher
+        # only acts on a film it knows where the stream is against
+        self._lined_up = None
+        self._prefetching = False
         self.relay_url = "ws://localhost:8765"
         self.host_via = "tunnel"     # "tunnel": host through this computer; "relay": relay_url
         self.position_from = "listen"  # a host's film position: "listen" (heard) or "player"
@@ -176,11 +248,18 @@ class SyncController:
         self._gen = 0                # bumped by every manual sync
         self._closing = False
         self._auto_thread = None
+        self._watch_thread = None
         self._now = time.monotonic   # tests substitute a simulated clock
+        # threads the watcher starts (a wide search, a prefetch); tests run
+        # them in place
+        self._spawn = lambda fn, *args: threading.Thread(
+            target=fn, args=args, daemon=True).start()
 
     def start(self):
         self._auto_thread = threading.Thread(target=self._auto_loop, daemon=True)
         self._auto_thread.start()
+        self._watch_thread = threading.Thread(target=self._watch_loop, daemon=True)
+        self._watch_thread.start()
 
     # -------------------------------------------------------------- state
 
@@ -211,6 +290,7 @@ class SyncController:
     def load_file(self, path):
         """Load `path` into the active player. VLCError propagates for the
         embedded player; external loads report through the queue."""
+        self._lined_up = None          # a new film waits for its first sync
         if self.player is self.embedded:
             self.embedded.load(path)
             # Named only once it holds: a load that raised used to leave
@@ -240,6 +320,7 @@ class SyncController:
             return str(e)
         self.embedded.pause()
         self.player = self.external
+        self._lined_up = None          # VLC starts where it starts: sync it
         if self.video_path:
             t = self.embedded.time()
             path = self.video_path
@@ -273,6 +354,7 @@ class SyncController:
         if self.external is not None:
             self.external.pause()
         self.player = self.embedded
+        self._lined_up = None          # it sat paused while VLC played
         if self.video_path and self._embedded_path != self.video_path:
             self.embedded.load(self.video_path)
             self._embedded_path = self.video_path
@@ -427,6 +509,7 @@ class SyncController:
                 self._say("Seeking...")
                 player.sync_seek(match_t, t0, offset,
                                  waiting=lambda: self._say(self._opening_hint()))
+                self._lined_up = (self.video_path, player)
                 player.set_mute(mute)
                 self.q.put(("swap", False, "a sync moved the film"))
                 self._after_sync(self._gen, refine=ok and not exact)
@@ -468,16 +551,14 @@ class SyncController:
 
     # ----------------------------------------------------------- auto mode
 
-    def set_auto(self, enabled, follow, interval):
+    def set_auto(self, enabled, interval):
         self.auto_enabled = bool(enabled)
-        self.auto_follow = bool(follow)
         try:
             self.auto_interval = max(10, int(interval))
         except (TypeError, ValueError):
             self.auto_interval = 30
         if self.auto_enabled:
-            self._say(f"Auto re-sync on: checking every {self.auto_interval} s"
-                      + (", following pauses." if self.auto_follow else "."))
+            self._say(f"Auto re-sync on: checking every {self.auto_interval} s.")
 
     def _auto_probe(self, lo, hi):
         """One listen+match attempt: (t, score, z, t0) when confident, else
@@ -502,105 +583,55 @@ class SyncController:
         return None
 
     def auto_step(self, state):
-        """One pass of auto mode; returns seconds until the next pass.
+        """One check of auto mode; returns seconds until the next.
 
-        `state` carries mode ("normal" or "probe"), failures, pause_point,
-        paused_at and film (what auto mode paused) across passes; held
-        marks a pause kept while auto mode stood aside. Split out of the
-        loop so tests can drive it without threads or sleeps.
+        It listens around where the film places the stream and corrects
+        any drift over DRIFT_TOLERANCE. A miss is tried again in 10 s,
+        counted in state["failures"]: following the stream's pauses is
+        the watcher's job (watch_step), and auto mode no longer pauses the
+        film. Split out of the loop so tests can drive it without threads
+        or sleeps.
         """
         player = self.player
         gen = self._gen
-        if state["mode"] == "normal":
-            if not player.is_playing():
-                return 5
-            clk = player.clock()
-            if clk is None:
-                return 5
-            off = self.placement_offset()
-            here = clk[0] - off               # where the stream should be
-            hit = self._auto_probe(here - 45, here + 50)
-            if hit and not self._stale(gen):
-                t, score, z, t0 = hit
-                state["failures"] = 0
-                # the player is meant to sit at stream + offset
-                off = self.placement_offset()
-                pos_t0 = playing_position_at(player, t0)
-                drift = None if pos_t0 is None else (t + off) - pos_t0
-                self._log("auto", "audio", here - 45, here + 50, t, score, z,
-                          AUTO_RECORD_SECONDS, drift=drift, offset=off,
-                          applied=drift is not None and abs(drift) > DRIFT_TOLERANCE)
-                if drift is not None and abs(drift) > DRIFT_TOLERANCE:
-                    player.sync_seek(t, t0, off)
-                    self._say(f"Auto: corrected {drift:+.2f}s drift "
-                              f"(score {score:.1f}, z {z:.0f}).")
-                if drift is not None:
-                    # heard and checked: the film is in sync now, moved or
-                    # not. (drift is None when the player's position at that
-                    # moment could not be read - it paused, or its clock had
-                    # not settled - so nothing was checked.)
-                    self.q.put(("synced", {"match": t, "at": t0, "trusted": True,
-                                           "applied": abs(drift) > DRIFT_TOLERANCE,
-                                           "source": "auto"}))
-                return self.auto_interval
-            if hit:
-                return 1     # a manual sync or a session overtook this one
-            state["failures"] += 1
-            if state["failures"] == 1:
-                # the stream stopped somewhere after the last good match and
-                # before this look - the player has run on since, so this is
-                # the better guess at where
-                state["miss_point"] = here
-            self._log("auto", "audio", here - 45, here + 50, None, None, None,
-                      AUTO_RETRY_SECONDS, failures=state["failures"])
-            if self.auto_follow and state["failures"] >= 2 and not self._stale(gen):
-                player.pause()
-                state.update(mode="probe",
-                             pause_point=state.get("miss_point", here),
-                             paused_at=self._now(),
-                             film=(self.video_path, player))
-                self.q.put(("swap", True, "auto mode: no film audio on the stream"))
-                self._say("Auto: film audio not found on the stream - "
-                          "assuming pause. Watching for resume...")
-                return 8
-            return 10
-        if state.pop("held", False) and (
-                state["film"] != (self.video_path, player)
-                or player.is_playing()):
-            # auto mode stood aside with this film paused, and meanwhile it
-            # was played (a manual sync that applied, the user) or another
-            # film loaded: the pause is not auto mode's to lift any more
-            state.update(mode="normal", failures=0)
-            return 1
-        # probe: paused, waiting for the stream to resume. If the "pause"
-        # was really a stretch the matcher could not hear, the stream kept
-        # playing - so the window grows with the time since, or the film
-        # would wait forever for audio that has already gone by. It grows
-        # a step at a time, because the film's decode is cached by window
-        # (in chunks of up to 900 s) and an edge that moved every probe had
-        # its chunk decoded afresh every probe; and only so far, because a
-        # real pause - hours of one, if the streamer is away - resumes
-        # where it stopped, and a search that kept growing scanned ever
-        # more of the film at every look.
-        since = self._now() - state["paused_at"]
-        grow = min(math.ceil(since / PAUSE_GROW_STEP) * PAUSE_GROW_STEP,
-                   PAUSE_GROW_MAX)
-        lo = state["pause_point"] - PAUSE_LOOK_BACK
-        hi = state["pause_point"] + PAUSE_LOOK_AHEAD + grow
-        hit = self._auto_probe(lo, hi)
+        if not player.is_playing():
+            return 5
+        clk = player.clock()
+        if clk is None:
+            return 5
+        off = self.placement_offset()
+        here = clk[0] - off               # where the stream should be
+        hit = self._auto_probe(here - 45, here + 50)
         if hit and not self._stale(gen):
             t, score, z, t0 = hit
+            state["failures"] = 0
+            # the player is meant to sit at stream + offset
             off = self.placement_offset()
-            self._log("resume", "audio", lo, hi, t, score, z, AUTO_RECORD_SECONDS,
-                      offset=off, applied=True)
-            player.sync_seek(t, t0, off)
-            self.q.put(("swap", False, "auto mode: the stream resumed"))
-            self._say("Auto: stream resumed - resynced.")
-            self.q.put(("synced", {"match": t, "at": t0, "trusted": True,
-                                   "applied": True, "source": "resume"}))
-            state.update(mode="normal", failures=0)
+            pos_t0 = playing_position_at(player, t0)
+            drift = None if pos_t0 is None else (t + off) - pos_t0
+            self._log("auto", "audio", here - 45, here + 50, t, score, z,
+                      AUTO_RECORD_SECONDS, drift=drift, offset=off,
+                      applied=drift is not None and abs(drift) > DRIFT_TOLERANCE)
+            if drift is not None and abs(drift) > DRIFT_TOLERANCE:
+                player.sync_seek(t, t0, off)
+                self._say(f"Auto: corrected {drift:+.2f}s drift "
+                          f"(score {score:.1f}, z {z:.0f}).")
+            if drift is not None:
+                # heard and checked: the film is in sync now, moved or
+                # not. (drift is None when the player's position at that
+                # moment could not be read - it paused, or its clock had
+                # not settled - so nothing was checked.)
+                self._lined_up = (self.video_path, player)
+                self.q.put(("synced", {"match": t, "at": t0, "trusted": True,
+                                       "applied": abs(drift) > DRIFT_TOLERANCE,
+                                       "source": "auto"}))
             return self.auto_interval
-        return 8
+        if hit:
+            return 1     # a manual sync or a session overtook this one
+        state["failures"] += 1
+        self._log("auto", "audio", here - 45, here + 50, None, None, None,
+                  AUTO_RETRY_SECONDS, failures=state["failures"])
+        return 10
 
     def _stale(self, gen):
         """A manual sync started (or is running) since `gen` was read - its
@@ -642,29 +673,20 @@ class SyncController:
         return max(self.auto_interval, 20)
 
     def _auto_loop(self):
-        state = {"mode": "normal", "failures": 0, "pause_point": None,
-                 "paused_at": None, "fail_sig": None, "fail_n": 0}
+        state = {"failures": 0, "fail_sig": None, "fail_n": 0}
         next_at = 0.0
         while not self._closing:
             time.sleep(0.5)
             if (not self.auto_enabled or self._busy or not self.video_path
                     or self.session_running()):  # sessions own the playhead
-                if state["mode"] == "probe":
-                    # a pause auto mode made is still its to lift: nobody
-                    # else will, and a weak Resync (not applied) leaves the
-                    # film paused where normal mode would ignore it for good
-                    state["held"] = True
-                else:
-                    state.update(mode="normal", failures=0)
                 # standing aside ends a failure streak: a user retrying
                 # (or re-ticking Auto) gets the full tries again
-                state.update(fail_sig=None, fail_n=0)
+                state.update(failures=0, fail_sig=None, fail_n=0)
                 continue
             if time.monotonic() < next_at:
                 continue
-            # a pass is timed from its start: "every 30 s" is every 30 s,
-            # and a held pause listens again as soon as a look ends. A
-            # failure backs off from when it failed
+            # a pass is timed from its start: "every 30 s" is every 30 s.
+            # A failure backs off from when it failed
             began = time.monotonic()
             try:
                 next_at = began + self.auto_step(state)
@@ -672,6 +694,349 @@ class SyncController:
                 next_at = time.monotonic() + self._auto_failed(state, e)
             else:
                 state.update(fail_sig=None, fail_n=0)   # a clean check
+
+    # ------------------------------------------------ pause with the stream
+    #
+    # The watcher. While the switch is on and a sync has lined this film up
+    # with the stream, it looks at the stream's last WATCH_LOOK seconds
+    # every WATCH_TICK and asks whether the film's own sound is in it where
+    # the film places the stream. Only the film's track decides: quiet
+    # there, nothing is decided; sound there that the stream carries, the
+    # film plays on (and a steady drift is corrected); sound there that the
+    # stream does not carry, for as long as the chosen rule asks
+    # (WATCH_RULES), the film pauses. Paused, it listens for the stream to
+    # come back where it stopped - or where it would be had it played on,
+    # when the "pause" was talk-over it could not hear through - and plays
+    # the film from the exact spot. Wider searches, on their own thread,
+    # find a stream that comes back somewhere else: an ad that rejoined
+    # live, a streamer who jumped.
+
+    def set_watch(self, enabled):
+        self.watch_enabled = bool(enabled)
+
+    def set_watch_rule(self, rule):
+        if rule in WATCH_RULES:
+            self.watch_rule = rule
+
+    @staticmethod
+    def watch_state():
+        """A fresh watcher state for watch_step."""
+        return {"mode": "idle", "missing": 0, "not_heard": 0, "heard": None,
+                "stop_at": None, "drift": [], "cand": None, "shown": None,
+                "token": 0, "far_busy": False, "far_hit": None, "far_n": 0,
+                "fails": 0, "fail_sig": None, "fail_n": 0}
+
+    def _watch_show(self, state, key):
+        if state["shown"] != key:
+            state["shown"] = key
+            self.q.put(("watch", key, WATCH_LINES[key]))
+
+    def _watch_reset(self, state, mode):
+        """Into `mode`, with every streak over. The token moves on, so a
+        wide search still running for the last pause finds nothing."""
+        state.update(mode=mode, missing=0, not_heard=0, cand=None, far_hit=None,
+                     token=state["token"] + 1)
+        state["drift"] = []
+
+    def _watch_idle(self, state, why):
+        if state["mode"] != "idle":
+            self._watch_reset(state, "idle")
+            state["heard"] = None
+        self._watch_show(state, why)
+        return 0.25
+
+    def watch_step(self, state):
+        """One look of Pause with the stream; returns seconds until the
+        next. `state` is watch_state()'s, carried across looks. Split out
+        of the loop so tests can drive it without threads or sleeps."""
+        player = self.player
+        if not self.watch_enabled:
+            return self._watch_idle(state, "off")
+        if not self.video_path:
+            return self._watch_idle(state, "nofilm")
+        if self.session_running():
+            return self._watch_idle(state, "party")     # the session owns the playhead
+        if self._busy:
+            # a manual sync is deciding. A pause the watcher made stays its
+            # own meanwhile: a sync that is not applied leaves the film
+            # paused, and nobody else would play it when the stream returns
+            if state["mode"] == "paused":
+                self._watch_show(state, "sync")
+                return 0.25
+            return self._watch_idle(state, "sync")
+        if self._lined_up != (self.video_path, player):
+            return self._watch_idle(state, "needsync")
+        if state["mode"] == "paused":
+            if not player.is_playing():
+                state["gen"] = self._gen   # a sync came and went without playing it
+                self._watch_show(state, "paused")
+                return self._watch_paused(state)
+            # played meanwhile: a sync lines the film up afresh; anyone
+            # else - the user - is obeyed until the film is heard again
+            if self._gen != state["gen"]:
+                self._watch_reset(state, "playing")
+            else:
+                self._watch_reset(state, "override")
+                diagnostics.log("watch: played by hand while the stream was paused - "
+                                "following again once the film is heard")
+            return WATCH_TICK
+        if state["mode"] == "idle":
+            self._watch_reset(state, "playing")
+        if not player.is_playing():
+            # paused by the user (or the film ended): theirs to play again
+            state["missing"] = state["not_heard"] = 0
+            self._watch_show(state, "byhand")
+            return 0.25
+        return self._watch_playing(state)
+
+    def _watch_capture(self, state):
+        """The stream's last WATCH_LOOK seconds as (samples, sr, t0), or
+        None when there are none to take yet."""
+        try:
+            samples, sr, t0, _ = self._loopback().capture_span(
+                WATCH_LOOK, timeout=WATCH_LOOK + 1.0, allow_silence=True)
+        except RuntimeError as e:
+            state["fails"] += 1
+            if state["fails"] == 1:
+                diagnostics.log(f"watch: no look at the stream: {e}")
+            if state["fails"] >= WATCH_FAIL_SHOW:
+                self._watch_show(state, "noaudio")
+            return None
+        state["fails"] = 0
+        return samples, sr, t0
+
+    def _watch_playing(self, state):
+        player = self.player
+        if getattr(player, "settling", lambda: False)():
+            return WATCH_TICK            # a sync's corrections are still moving it
+        cap = self._watch_capture(state)
+        if cap is None:
+            return WATCH_TICK
+        samples, sr, t0 = cap
+        pos = playing_position_at(player, t0)
+        if pos is None:
+            return WATCH_TICK            # its clock has not settled since a seek
+        at = pos - self.placement_offset()      # where the stream should be at t0
+        rule = WATCH_RULES[self.watch_rule]
+        p = audio_matcher.film_presence(self.video_path, samples, sr, at,
+                                        heard=rule["heard"], missing=rule["missing"])
+        self._watch_prefetch(at)
+        if p.state == "quiet":
+            state["missing"] = state["not_heard"] = 0
+            state["drift"] = []
+            self._watch_show(state, "quiet")
+            return WATCH_TICK
+        if p.state == "heard":
+            state["missing"] = state["not_heard"] = 0
+            state["heard"] = (at + p.shift, t0)
+            if state["mode"] == "override":
+                state["mode"] = "playing"
+                diagnostics.log("watch: the film is heard again - following the stream's pauses")
+            self._watch_show(state, "heard")
+            self._watch_drift(state, p, at, t0)
+            return WATCH_TICK
+        state["drift"] = []
+        if state["mode"] == "override":
+            self._watch_show(state, "override")
+            return WATCH_TICK
+        state["not_heard"] += 1
+        state["missing"] = state["missing"] + 1 if p.state == "missing" else 0
+        if state["not_heard"] == 1:
+            state["stop_at"] = at        # it stopped after the last heard look, by this one
+            state["stop_t0"] = t0
+        if (state["missing"] >= rule["missing_run"]
+                or (rule["unheard_run"] is not None
+                    and state["not_heard"] >= rule["unheard_run"])):
+            self._watch_pause(state, p)
+        return WATCH_TICK
+
+    def _watch_drift(self, state, p, at, t0):
+        """A heard look off by more than DRIFT_TOLERANCE, the same way as
+        the looks just before it, moves the film there."""
+        if abs(p.shift) <= DRIFT_TOLERANCE:
+            state["drift"] = []
+            return
+        recent = (state["drift"] + [p.shift])[-WATCH_DRIFT_LOOKS:]
+        state["drift"] = recent
+        if len(recent) < WATCH_DRIFT_LOOKS or max(recent) - min(recent) > WATCH_DRIFT_AGREE:
+            return
+        player = self.player
+        where = at + p.shift             # the film time the stream carried at t0
+        player.sync_seek(where, t0, self.placement_offset())
+        self._lined_up = (self.video_path, player)
+        state["drift"] = []
+        self._say(f"Pause with the stream: corrected {p.shift:+.2f} s drift.")
+        diagnostics.log(f"watch: corrected {p.shift:+.3f} s drift at {fmt_time(where)} "
+                        f"(ncc {p.ncc:.2f})")
+        self.q.put(("synced", {"match": where, "at": t0, "trusted": True,
+                               "applied": True, "source": "auto"}))
+
+    def _watch_pause(self, state, p):
+        # The stream stopped after the last heard look and by the first
+        # look that did not hear it: about half a look into that one.
+        pp = state["stop_at"] + 0.5 * WATCH_LOOK
+        self.player.pause()
+        now = self._now()
+        self._watch_reset(state, "paused")
+        # Sound heard before the end of that first look can still hold
+        # film from before the stop: a look or a wide search over it would
+        # "find" the stream where it was, and play the film while the
+        # stream stays paused. Only what was heard after counts.
+        state.update(gen=self._gen, pp=pp, paused_at=now, far_next=now + 1.0, far_n=0,
+                     quiet_from=state["stop_t0"] + WATCH_LOOK)
+        self.q.put(("swap", True, "pause with the stream: the film's sound stopped"))
+        self._watch_show(state, "paused")
+        diagnostics.log(f"watch: paused - the film's sound is missing from the stream near "
+                        f"{fmt_time(pp)} (ncc {p.ncc:.2f}, film {p.level_db:+.0f} dB, "
+                        f"rule {self.watch_rule})")
+
+    def _watch_paused(self, state):
+        hit = state["far_hit"]
+        if hit is not None and hit[0] == state["token"]:
+            return self._watch_resume(state, hit[1], hit[2], "found by a wide search")
+        cap = self._watch_capture(state)
+        if cap is not None and cap[2] < state["quiet_from"]:
+            cap = None                   # it still holds sound from before the stop
+        if cap is not None:
+            samples, sr, t0 = cap
+            path = self.video_path
+            heard = max(WATCH_RULES[self.watch_rule]["heard"], WATCH_RESUME_HEARD)
+            best = None
+            # back where it stopped: the resume can be anywhere in the look
+            near = audio_matcher.film_presence(
+                path, samples, sr, state["pp"], lo=-(WATCH_LOOK + WATCH_NEAR_BACK),
+                hi=WATCH_NEAR_AHEAD, heard=heard)
+            if near.state == "heard":
+                best = (near, state["pp"])
+            # or where it would be had it played on: a "pause" that was a
+            # stretch of talk-over the looks could not hear through
+            if state["heard"] is not None:
+                hf, ht = state["heard"]
+                cont = hf + (t0 - ht)
+                state["cont"] = cont
+                if cont - state["pp"] > WATCH_NEAR_AHEAD + WATCH_LOOK:
+                    p2 = audio_matcher.film_presence(path, samples, sr, cont, heard=heard)
+                    if p2.state == "heard" and (best is None or p2.ncc > best[0].ncc):
+                        best = (p2, cont)
+            cand = state["cand"]
+            if cand is not None and t0 - cand[1] > 1.0:
+                cand = state["cand"] = None      # never confirmed: start over
+            if best is not None:
+                p, at = best
+                where = at + p.shift     # the film time the stream carried at t0
+                if cand is None or abs((where - cand[0]) - (t0 - cand[1])) > WATCH_RESUME_AGREE:
+                    state["cand"] = (where, t0)  # the first look, or one that disagrees
+                elif t0 - cand[1] >= WATCH_RESUME_GAP:
+                    # two looks, apart enough to hear different sound,
+                    # agreeing on where the stream is: play the film
+                    return self._watch_resume(state, where, t0, "the film's sound is back")
+        now = self._now()
+        if now >= state["far_next"] and not state["far_busy"]:
+            self._watch_far_start(state, now)
+        return WATCH_TICK
+
+    def _watch_far_start(self, state, now):
+        since = now - state["paused_at"]
+        every = next(e for limit, e in WATCH_FAR_EVERY if since < limit)
+        state["far_next"] = now + every
+        state["far_n"] += 1
+        if since >= WATCH_FAR_WHOLE and state["far_n"] % 4 == 0:
+            lo = hi = None               # the whole film: a jump anywhere
+        else:
+            # where it would be had it played on, up to WATCH_FAR_REACH: a
+            # long pause (the streamer away an hour, music on) must not
+            # scan ever more of the film at every search
+            pp = state["pp"]
+            lo = pp - WATCH_FAR_BACK
+            hi = min(max(pp, state.get("cont") or pp), pp + WATCH_FAR_REACH) + WATCH_FAR_AHEAD
+        state["far_busy"] = True
+        self._spawn(self._watch_far, state, state["token"], self.video_path, lo, hi,
+                    state["quiet_from"])
+
+    def _watch_far(self, state, token, path, lo, hi, quiet_from):
+        """A wide search, on a thread of its own: the stream's last
+        WATCH_FAR_LISTEN seconds matched from lo to hi (None: the whole
+        film), once all of them were heard after quiet_from. A trusted
+        match is left in state["far_hit"] for the next look to play the
+        film from."""
+        try:
+            samples, sr, t0, _ = self._loopback().capture_span(WATCH_FAR_LISTEN, timeout=2.0)
+            if t0 < quiet_from:
+                return            # it still holds film from before the stop: not yet
+            feats = audio_matcher.prep_capture(samples, sr)
+            t, score, z = audio_matcher.find_match_audio(path, feats, lo, hi)
+            if trusted(score, z) and state["token"] == token:
+                self._log("watch", "audio", lo, hi, t, score, z, WATCH_FAR_LISTEN,
+                          applied=True)
+                state["far_hit"] = (token, t, t0)
+        except RuntimeError:
+            pass      # a silent stream or a gap (MatchError too): nothing to find yet
+        except Exception as e:
+            diagnostics.log(f"watch: a wide search failed: {type(e).__name__}: {e}")
+        finally:
+            state["far_busy"] = False
+
+    def _watch_resume(self, state, where, t0, why):
+        player = self.player
+        paused = self._now() - state["paused_at"]
+        try:
+            player.sync_seek(where, t0, self.placement_offset())
+        except VLCError as e:
+            diagnostics.log(f"watch: could not play the film again: {e}")
+            self._say(f"Pause with the stream: couldn't play the film again ({e}).")
+            state.update(far_hit=None, cand=None)    # found afresh before another try
+            return 1.0
+        self._lined_up = (self.video_path, player)
+        self._watch_reset(state, "playing")
+        self.q.put(("swap", False, "pause with the stream: the stream resumed"))
+        self.q.put(("synced", {"match": where, "at": t0, "trusted": True,
+                               "applied": True, "source": "resume"}))
+        self._watch_show(state, "heard")
+        diagnostics.log(f"watch: resumed at {fmt_time(where)} after {paused:.1f} s - {why}")
+        return WATCH_TICK
+
+    def _watch_prefetch(self, at):
+        """The film's next block of sound, decoded ahead on a thread, so a
+        look never waits on ffmpeg as playback moves into it."""
+        path = self.video_path
+        nxt = audio_matcher.presence_block_start(at + 20.0)
+        if self._prefetching or audio_matcher.presence_cached(path, nxt):
+            return
+        self._prefetching = True
+
+        def run():
+            try:
+                audio_matcher.film_block(path, nxt)
+            except Exception as e:
+                diagnostics.log(f"watch: could not decode ahead at {fmt_time(nxt)}: {e}")
+            finally:
+                self._prefetching = False
+        self._spawn(run)
+
+    def _watch_failed(self, state, e):
+        """A look that raised `e`; returns seconds until the next. Logged
+        once a run, with a traceback; said on the line once it repeats."""
+        sig = (type(e).__name__, str(e))
+        n = state["fail_n"] + 1 if sig == state["fail_sig"] else 1
+        state.update(fail_sig=sig, fail_n=n)
+        if n == 1:
+            diagnostics.log_block("pause with the stream: a look failed:", "".join(
+                traceback.format_exception(type(e), e, e.__traceback__)))
+        if n >= 3:
+            self._watch_show(state, "error" if isinstance(e, (OSError, matcher.MatchError))
+                             else "fault")
+        return 2.0 if n >= 3 else 0.5
+
+    def _watch_loop(self):
+        state = self.watch_state()
+        while not self._closing:
+            try:
+                wait = self.watch_step(state)
+            except Exception as e:
+                wait = self._watch_failed(state, e)
+            else:
+                state.update(fail_sig=None, fail_n=0)
+            time.sleep(wait)
 
     # ------------------------------------------------------ picture timing
 
@@ -979,6 +1344,7 @@ class SyncController:
 
     def join(self, relay_url, code, password, mute):
         self._end_last_party()
+        self._lined_up = None          # the host places the film now, not the stream
         self.relay_url = relay_url
         self.session = session.ViewerSession(
             relay_url, code, self.video_path, self.player, self.q,
@@ -1141,7 +1507,8 @@ class SyncController:
             "video_path": self.video_path,
             "audio_device": self.audio_device,
             "auto_interval": self.auto_interval,
-            "auto_follow": self.auto_follow,
+            "pause_with_stream": self.watch_enabled,
+            "pause_rule": self.watch_rule,
             "relay_url": self.relay_url,
             "host_via": self.host_via,
             "position_from": self.position_from,
@@ -1159,7 +1526,7 @@ class SyncController:
                                   traceback.format_exc())
             return
         diagnostics.log(f"config saved (auto={self.auto_enabled} "
-                        f"follow={self.auto_follow})")
+                        f"pause_with_stream={self.watch_enabled} rule={self.watch_rule})")
 
     def load_config(self):
         """Apply the controller's saved settings; return the whole dict so
@@ -1177,7 +1544,11 @@ class SyncController:
             self.auto_interval = max(10, int(cfg.get("auto_interval", 30)))
         except (TypeError, ValueError):
             self.auto_interval = 30
-        self.auto_follow = bool(cfg.get("auto_follow", True))
+        # Pause with the stream replaced auto mode's "Follow the stream's
+        # pauses", and starts as that was left (on, unless switched off)
+        self.watch_enabled = bool(cfg.get("pause_with_stream", cfg.get("auto_follow", True)))
+        if cfg.get("pause_rule") in WATCH_RULES:
+            self.watch_rule = cfg["pause_rule"]
         if cfg.get("relay_url"):
             self.relay_url = cfg["relay_url"]
         if cfg.get("host_via") in ("tunnel", "relay"):

@@ -63,7 +63,8 @@ class MainWindow:
     first_frame and main_frame."""
 
     VIEWS = ("_show_main_state", "_show_film", "_show_film_link", "_show_sync_state",
-             "_show_ago", "_show_auto_sub", "_show_position", "_preview_position",
+             "_show_ago", "_show_auto_sub", "_show_watch_line", "_show_position",
+             "_preview_position",
              "_show_mute", "_show_subtitle", "_show_offset", "_show_party_live",
              "_show_listen", "_show_status_line")
 
@@ -271,6 +272,19 @@ class MainWindow:
         self._auto_sub = tk.Label(words, text="", font=font(12), bg=card_bg, fg=theme.MUTED,
                                   anchor="w", **_TIGHT)
         self._auto_sub.pack(fill="x", pady=(px(1), 0))
+
+        # Pause with the stream: its line says what the watcher hears now
+        watch = tk.Frame(sync.body, bg=card_bg)
+        watch.pack(fill="x", pady=(px(12), 0))
+        widgets.Switch(watch, self.watch_var,
+                       command=lambda: self._on_watch_toggle()).pack(side="left")
+        words = tk.Frame(watch, bg=card_bg)
+        words.pack(side="left", fill="x", expand=True, padx=(px(12), 0))
+        tk.Label(words, text="Pause with the stream", font=font(14), bg=card_bg,
+                 fg=theme.TEXT, anchor="w", **_TIGHT).pack(fill="x")
+        self._watch_sub = tk.Label(words, text="", font=font(12), bg=card_bg, fg=theme.MUTED,
+                                   anchor="w", **_TIGHT)
+        self._watch_sub.pack(fill="x", pady=(px(1), 0))
 
         # playback card
         play = widgets.Card(main, padding=18)
@@ -480,10 +494,12 @@ class MainWindow:
             interval = self.interval_var.get()
         except (tk.TclError, ValueError):
             interval = 30        # the dialogs validate it; this is only a label
-        text = f"Re-checks every {interval} s"
-        if self.follow_var.get():
-            text += " and follows the stream's pauses"
-        self._auto_sub.config(text=text)
+        self._auto_sub.config(text=f"Re-checks every {interval} s")
+
+    def _show_watch_line(self, text):
+        """The line under Pause with the stream: what the watcher hears now
+        (controller.WATCH_LINES)."""
+        self._watch_sub.config(text=text)
 
     def _show_position(self, t, n, playing):
         """The timeline, both times and the play button. With no time (no
@@ -575,7 +591,7 @@ class _Gallery(MainWindow):
         self.player_var = tk.StringVar(root, value="embedded")
         self.mute_var = tk.BooleanVar(root, value=True)
         self.auto_var = tk.BooleanVar(root, value=False)
-        self.follow_var = tk.BooleanVar(root, value=True)
+        self.watch_var = tk.BooleanVar(root, value=True)
         self.interval_var = tk.IntVar(root, value=30)
         self.device_var = tk.StringVar(root, value="")
         self.embedded = self.player = SimpleNamespace(name="built-in")
@@ -587,6 +603,7 @@ class _Gallery(MainWindow):
             self._choose_file()
             self._t, self._playing = FILM_AT, True
             self.auto_var.set(True)
+            self._show_watch_line("Hearing the film")
             self._nudge(0.2)
             self._show_sync_state("synced", FILM_AT)
             self._show_ago("2 s ago")
@@ -617,6 +634,9 @@ class _Gallery(MainWindow):
 
     def _on_auto_toggle(self):
         self._show_auto_sub()
+
+    def _on_watch_toggle(self):
+        self._show_watch_line("Hearing the film" if self.watch_var.get() else "")
 
     def _can_seek(self):
         return self._pos[1] is not None
