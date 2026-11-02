@@ -10,11 +10,13 @@ takes. The stream can stay **minimized**; only its audio needs to play.
 It runs on Windows and macOS, with the same window and the same controls
 on both.
 
-**[Download the latest release](https://github.com/gBear97/StreamSync/releases/latest)**
-and pick the file for your computer: **Windows**, **macOS (Apple Silicon)**
-or **macOS (Intel)**. Not sure which Mac you have? **Apple menu > About
-This Mac** says *Chip: Apple M1* (or M2, M3 and so on) on Apple Silicon,
-and *Processor: ... Intel ...* on an Intel Mac. See [Install](#install).
+**[Download StreamSync](https://gbear97.github.io/StreamSync/)** - the
+page offers the file for your computer. Or pick it from the
+[latest release](https://github.com/gBear97/StreamSync/releases/latest):
+**Windows**, **macOS (Apple Silicon)** or **macOS (Intel)**. Not sure which
+Mac you have? **Apple menu > About This Mac** says *Chip: Apple M1* (or
+M2, M3 and so on) on Apple Silicon, and *Processor: ... Intel ...* on an
+Intel Mac. See [Install](#install).
 
 ## What's new in 2.0
 

@@ -1,0 +1,50 @@
+name: Landing page
+
+# Publishes the landing page, site/index.html, to GitHub Pages at
+# https://gbear97.github.io/StreamSync/ - free hosting, no server to run.
+# Runs when the page changes on main, or by hand (Run workflow).
+on:
+  push:
+    branches: [main]
+    paths:
+      - site/index.html
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write      # to publish
+  id-token: write   # Pages checks the upload came from this workflow
+
+# One deployment at a time. A push while one runs waits for it, rather
+# than cutting it off half-published.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish the landing page
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Just the page: the rest of site/ (deploy_aws.ps1) isn't for visitors.
+      - name: Gather the page
+        run: |
+          mkdir _site
+          cp site/index.html _site/
+
+      - uses: actions/configure-pages@v6
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+      - name: Publish
+        id: deployment
+        uses: actions/deploy-pages@v5
