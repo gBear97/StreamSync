@@ -112,6 +112,9 @@
     border: 1px solid var(--hair); font-weight: 400;
   }
   .btn.ghost:hover { border-color: var(--ash); filter: none; }
+  .dl-note { margin: 14px 0 0; color: var(--ash); font-size: 0.9rem; min-height: 1.4em; }
+  .dl-note a { color: var(--linen); text-decoration: underline; text-underline-offset: 3px; }
+  .dl-note a:hover { color: var(--tungsten); }
 
   /* ---------- the screen ---------- */
   .stage { position: relative; margin: 64px auto 0; max-width: var(--maxw); padding: 0 24px; }
@@ -248,9 +251,10 @@
     Or go further: <strong>host a watch party</strong> where the stream carries nothing
     but you.</p>
   <div class="ctas">
-    <a class="btn" href="#download">Download for Windows</a>
-    <a class="btn ghost" href="#download">macOS beta</a>
+    <a class="btn" id="dl-main" href="#download">Download StreamSync</a>
+    <a class="btn ghost" id="dl-all" href="#download">All downloads</a>
   </div>
+  <p class="dl-note" id="dl-note">For Windows and macOS.</p>
 </header>
 
 <div class="stage">
@@ -442,7 +446,7 @@
       <p>A setup program that installs just for you &#x2014; no admin prompt. First-run setup checks
         for VLC and installs anything missing through winget, Microsoft's own package manager.
         From then on, StreamSync updates itself.</p>
-      <a class="btn" href="https://github.com/gBear97/StreamSync/releases/latest">Download for Windows</a>
+      <a class="btn" id="dl-win" href="https://github.com/gBear97/StreamSync/releases/latest">Download for Windows</a>
     </div>
     <div class="plat">
       <div class="head"><h3>macOS</h3><span class="tag beta">BETA</span></div>
@@ -450,15 +454,18 @@
         StreamSync hears the stream through macOS's own audio tap (14.2 and later): nothing to install or route,
         macOS just asks once. First-run setup offers VLC when it's missing.</p>
       <div class="ctas" style="margin-top:0">
-        <a class="btn" href="https://github.com/gBear97/StreamSync/releases/latest">Download for macOS</a>
+        <a class="btn" id="dl-mac-arm" href="https://github.com/gBear97/StreamSync/releases/latest">macOS (Apple Silicon)</a>
+        <a class="btn ghost" id="dl-mac-intel" href="https://github.com/gBear97/StreamSync/releases/latest">macOS (Intel)</a>
         <a class="btn ghost" href="https://github.com/gBear97/StreamSync/blob/main/MAC_FIRST_RUN.md">First-run guide</a>
       </div>
     </div>
   </div>
-  <p class="prose"><strong>Which file?</strong> On the releases page, Windows is the file ending in
-    <strong>-setup.exe</strong>. For a Mac, take the <strong>.dmg</strong> marked
-    <strong>arm64</strong> for Apple Silicon or <strong>x86_64</strong> for Intel (Apple menu &#x203A;
-    About This Mac says which). Both need VLC; first-run setup offers to install it.</p>
+  <p class="prose"><strong>Which Mac do I have?</strong> Apple menu &#x203A; About This Mac shows
+    <strong>Chip: Apple M1</strong> (or M2, M3 and so on) on Apple Silicon, and
+    <strong>Processor: &#x2026; Intel &#x2026;</strong> on an Intel Mac. The buttons download straight
+    from the latest release on GitHub, where the files are labelled <strong>Windows</strong>,
+    <strong>macOS (Apple Silicon)</strong> and <strong>macOS (Intel)</strong>. Both need VLC;
+    first-run setup offers to install it.</p>
   <p class="prose"><strong>Updating.</strong> StreamSync checks for a new version when it starts and
     offers it in its own window. It downloads the update, checks it against the release's signed
     checksums, installs it and restarts &#x2014; or, if anything doesn't check out, installs nothing
@@ -603,6 +610,91 @@
     requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
+})();
+</script>
+
+<script>
+// Download buttons: each goes straight to its file in the latest release,
+// and the top one to the file for this visitor's computer. Without
+// JavaScript, or when GitHub doesn't answer, they stay on the releases page.
+(function () {
+  var REPO = "gBear97/StreamSync";
+  var PAGE = "https://github.com/" + REPO + "/releases/latest";
+  // The same tests the app's own updater finds its file by
+  // (updater.pick_asset), so the page offers exactly what the app updates from.
+  var FILES = {
+    win: { label: "Windows", button: "dl-win",
+           test: function (n) { return n.indexOf("-windows-x64-") >= 0 && /-setup\.exe$/.test(n); } },
+    arm: { label: "macOS (Apple Silicon)", button: "dl-mac-arm",
+           test: function (n) { return n.indexOf("-arm64-") >= 0 && /\.dmg$/.test(n); } },
+    intel: { label: "macOS (Intel)", button: "dl-mac-intel",
+             test: function (n) { return n.indexOf("-x86_64-") >= 0 && /\.dmg$/.test(n); } }
+  };
+  var main = document.getElementById("dl-main");
+  var note = document.getElementById("dl-note");
+
+  // "win", "arm", "intel" or "other". ?os=win, mac, mac-intel or other
+  // overrides the guess: for testing, or a link meant for one computer.
+  function guess() {
+    var m = /[?&]os=(win|mac-intel|mac|other)(?:&|$)/.exec(location.search);
+    if (m) return Promise.resolve({ "mac": "arm", "mac-intel": "intel" }[m[1]] || m[1]);
+    var ua = navigator.userAgent || "";
+    var uad = navigator.userAgentData;
+    var plat = (uad && uad.platform) || navigator.platform || "";
+    if ((uad && uad.mobile) || /Android|iPhone|iPad|iPod/.test(ua)) return Promise.resolve("other");
+    if (/^Win/.test(plat) || /Windows NT/.test(ua)) return Promise.resolve("win");
+    if (!/^Mac/.test(plat) && !/Macintosh/.test(ua)) return Promise.resolve("other");
+    // an iPad asking for the desktop site looks like a Mac, with a touch screen
+    if (navigator.maxTouchPoints > 1) return Promise.resolve("other");
+    // Only Chrome, Edge and Brave tell an Apple Silicon Mac from an Intel
+    // one. Safari and Firefox call every Mac Intel, so they get Apple
+    // Silicon - every new Mac since 2023 - with Intel right beside it.
+    if (!uad || !uad.getHighEntropyValues) return Promise.resolve("arm");
+    return uad.getHighEntropyValues(["architecture"]).then(function (v) {
+      return v.architecture === "x86" ? "intel" : "arm";
+    }, function () { return "arm"; });
+  }
+
+  function show(kind, release) {
+    var files = {};
+    var assets = (release && release.assets) || [];
+    Object.keys(FILES).forEach(function (k) {
+      for (var i = 0; i < assets.length; i++) {
+        if (FILES[k].test(assets[i].name)) { files[k] = assets[i]; break; }
+      }
+      if (files[k]) document.getElementById(FILES[k].button).href = files[k].browser_download_url;
+    });
+    if (kind === "other") {
+      main.textContent = "See the downloads";
+      main.href = "#download";
+      document.getElementById("dl-all").style.display = "none";   // it says the same
+      note.textContent = "StreamSync runs on Windows and macOS.";
+      return;
+    }
+    var file = files[kind];
+    main.textContent = "Download for " + FILES[kind].label;
+    main.href = file ? file.browser_download_url : PAGE;
+    note.textContent = file
+      ? "Version " + release.tag_name.replace(/^v/, "") + " · " + Math.round(file.size / 1048576) + " MB"
+      : "";
+    if (kind === "win") return;
+    var other = kind === "arm" ? "intel" : "arm";
+    var link = document.createElement("a");
+    link.href = files[other] ? files[other].browser_download_url : PAGE;
+    link.textContent = kind === "arm" ? "Get the Intel version" : "Get the Apple Silicon version";
+    note.appendChild(document.createTextNode(
+      (file ? " · " : "") + (kind === "arm" ? "Intel Mac? " : "Apple Silicon Mac? ")));
+    note.appendChild(link);
+  }
+
+  var release = fetch("https://api.github.com/repos/" + REPO + "/releases/latest",
+                      { headers: { Accept: "application/vnd.github+json" } })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .catch(function () { return null; });
+  guess().then(function (kind) {
+    show(kind, null);                  // the releases page until GitHub answers
+    return release.then(function (r) { if (r) show(kind, r); });
+  });
 })();
 </script>
 
