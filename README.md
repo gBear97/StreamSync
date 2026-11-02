@@ -10,6 +10,12 @@ takes. The stream can stay **minimized**; only its audio needs to play.
 It runs on Windows and macOS, with the same window and the same controls
 on both.
 
+**[Download the latest release](https://github.com/gBear97/StreamSync/releases/latest)**
+and pick the file for your computer: **Windows**, **macOS (Apple Silicon)**
+or **macOS (Intel)**. Not sure which Mac you have? **Apple menu > About
+This Mac** says *Chip: Apple M1* (or M2, M3 and so on) on Apple Silicon,
+and *Processor: ... Intel ...* on an Intel Mac. See [Install](#install).
+
 ## What's new in 2.0
 
 - **One app for both systems, in a new dark design.** Windows and the Mac
@@ -55,9 +61,10 @@ on both.
 
 ## Install
 
-**Windows**: download `StreamSync-<version>-windows-x64-<commit>-setup.exe`
-from the [latest release](https://github.com/gBear97/StreamSync/releases/latest)
-and run it. It installs for your user only, into
+**Windows**: from the [latest release](https://github.com/gBear97/StreamSync/releases/latest),
+download **Windows - StreamSync &lt;version&gt; installer** (the file
+`StreamSync-<version>-windows-x64-<commit>-setup.exe`) and run it. It
+installs for your user only, into
 `%LOCALAPPDATA%\Programs\StreamSync`, without an admin prompt, and adds
 StreamSync to the Start menu (a desktop icon is optional). The folder
 cannot be changed: it is the one place the app's updater replaces.
@@ -67,11 +74,16 @@ may show SmartScreen's "Windows protected your PC": **More info > Run
 anyway**. To uninstall, use Windows' **Settings > Apps** like any other
 program.
 
-**macOS** (14 Sonoma or later): download the `.dmg` for your Mac - `arm64`
-for Apple Silicon, `x86_64` for Intel (**Apple menu > About This Mac**
-says which) - open it, and drag StreamSync.app into your Applications
-folder. Releases are signed and notarized, so the app just opens. On the
-first launch the first-run check offers to install VLC if it is missing,
+**macOS** (14 Sonoma or later): from the
+[latest release](https://github.com/gBear97/StreamSync/releases/latest),
+download **macOS (Apple Silicon)** for a Mac with an Apple M-series chip,
+or **macOS (Intel)** for an Intel Mac. **Apple menu > About This Mac**
+says which: *Chip: Apple M1* (or M2, M3 and so on) is Apple Silicon,
+*Processor: ... Intel ...* is Intel. (The files are the `.dmg`s with
+`arm64` and `x86_64` in their names.) Open it, and drag StreamSync.app
+into your Applications folder. Releases are signed and notarized, so the
+app just opens. On the first launch the first-run check offers to install
+VLC if it is missing,
 and on the first sync macOS asks once whether StreamSync may record this
 computer's audio - nothing else to install or route;
 [MAC_FIRST_RUN.md](MAC_FIRST_RUN.md) walks through it step by step.

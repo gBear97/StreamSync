@@ -172,11 +172,14 @@ jobs:
           "Installed $env:VERSION per user, ran it, uninstalled cleanly."
 
       # --clobber: a re-run replaces what an earlier, failed run attached.
+      # After the #: the label the release page shows instead of the file
+      # name (see release.yml's disk images). ASCII only: this runs in Git
+      # Bash on Windows.
       - name: Attach the installer to the release
         if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$TAG" "$SETUP" --repo "$GITHUB_REPOSITORY" --clobber
+        run: gh release upload "$TAG" "$SETUP#Windows - StreamSync $VERSION installer" --repo "$GITHUB_REPOSITORY" --clobber
 
       # A draft gets its SHA256SUMS (and signature) from the Release
       # workflow's publish job, which checksums everything attached. A
@@ -223,5 +226,6 @@ jobs:
             git checkout -q "$GITHUB_SHA" -- sigcheck.py updater.py
           fi
           bash ci/sign_sums.sh SHA256SUMS
-          gh release upload "$TAG" SHA256SUMS SHA256SUMS.sig \
+          gh release upload "$TAG" "SHA256SUMS#Checksums (SHA256SUMS) - optional" \
+            "SHA256SUMS.sig#Checksums signature (SHA256SUMS.sig) - optional" \
             --repo "$GITHUB_REPOSITORY" --clobber
