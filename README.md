@@ -262,8 +262,9 @@ every**, 10 s at the least):
   scans about 45 s either side of where the film *should* be - roughly
   one second of CPU work per check, then it sleeps. Raise the interval if
   you want it even lighter.
-- Drift beyond 0.35 s is corrected automatically. Your fine-tune offset
-  is part of where the film *should* be, so it is kept.
+- Drift beyond 0.1 s is corrected automatically, small enough that lips
+  stay with the stream's voices. Your fine-tune offset is part of where
+  the film *should* be, so it is kept.
 - If checks keep failing the same way, auto mode turns itself off and
   says why.
 
@@ -286,13 +287,15 @@ says what it hears:
 - where the film's track is quiet, there is nothing to listen for, and
   nothing is decided (**Film is quiet here**);
 - where the film has sound and the stream carries it, the film plays on
-  (**Hearing the film**). If that sound arrives more than 0.35 s early
+  (**Hearing the film**). If that sound arrives more than 0.1 s early
   or late, the film is moved onto it;
 - where the film has sound and the stream does not carry it, the film
   pauses (**Stream paused**), whatever the streamer is saying.
 
 When the film's sound comes back, the film plays from exactly where the
-stream is, typically 0.6 to 1 s later. If it comes back somewhere else -
+stream is, typically 0.6 to 1 s later. A streamer talking through his
+pause does not count as the film coming back, even where his voice
+happens to resemble the film's sound. If it comes back somewhere else -
 Twitch rejoining the live stream after an ad, or the streamer jumping to
 another scene - StreamSync searches outward from where it stopped, and
 in time the whole film, and plays from there. Press Play yourself while
@@ -607,9 +610,13 @@ Step by step, with a first sync test: [MAC_FIRST_RUN.md](MAC_FIRST_RUN.md).
   whether there is anything to hear; how many looks in a row may miss the
   film before it pauses is the rule chosen in Settings. While paused it
   listens for the film where the stream stopped, and where it would be had
-  it played on (a "pause" that was talk-over it could not hear through),
-  and a full match runs every few seconds over a widening stretch of the
-  film for a stream that comes back somewhere else.
+  it played on (a "pause" that was talk-over it could not hear through).
+  It plays the film once two looks 0.3 s apart agree on where the stream
+  is, each correlating well and standing clear of every other alignment
+  of the look - the film's sound makes one sharp peak, a voice that
+  happens to correlate several of a size. A full match runs every few
+  seconds over a widening stretch of the film for a stream that comes
+  back somewhere else.
 - **Timing**: stream audio is recorded continuously and every sample is
   dated by its position in the recording, not by when a recording was
   asked for - so the matched moment is corrected by exactly how long ago

@@ -62,7 +62,14 @@ AUTO_RECORD_SECONDS = 4.0  # auto-mode recording length
 AUTO_RETRY_SECONDS = 8.0   # one longer look before counting a failure
 AUTO_FAIL_GIVEUP = 3       # an auto check failing the same way this many
                            # times running is not a blip: stop, and say so
-DRIFT_TOLERANCE = 0.35
+# Drift over this is put right (auto mode's checks, and the watcher's
+# looks). The film is often watched muted against the stream's own sound,
+# where lips show a slip of a tenth of a second. On the 2026-11-04 live
+# test (Twitch in Brave) the stream's sound slipped later in 20-60 ms steps,
+# -0.5 s over 1.5 h. At 0.35 s that stayed within 0.1 s of the stream 83% of
+# the time (up to 183 ms off); at 0.1 s, replayed on the same recording,
+# 99% (p95 64 ms), with no more false pauses.
+DRIFT_TOLERANCE = 0.1
 SESSION_CLOSE_WAIT = 1.5   # how long quitting waits for a session to end
 
 # Pause with the stream (watch_step): a look at the stream's last
@@ -71,17 +78,25 @@ SESSION_CLOSE_WAIT = 1.5   # how long quitting waits for a session to end
 WATCH_TICK = 0.1
 WATCH_LOOK = 0.6
 # Paused, a look counts toward playing again at WATCH_RESUME_HEARD or more,
-# and plays the film once another, WATCH_RESUME_GAP or more later, agrees
-# with it on where the stream is. Looks 0.1 s apart share most of their
-# sound, so a voice or an ad that resembled the film near where it stopped
-# passed two of them in a row: on paused streams with talk-over, two
+# standing WATCH_RESUME_CLEAR above every other alignment of the look, and
+# plays the film once another, WATCH_RESUME_GAP or more later, agrees with
+# it on where the stream is - that look taken where the first one says the
+# stream has got to by then. Looks 0.1 s apart share most of their sound,
+# so a voice or an ad that resembled the film near where it stopped passed
+# two of them in a row: on simulated paused streams with talk-over, two
 # looks in a row at 0.30 "resumed" 9-13 times a minute; at 0.40 and 0.3 s
-# apart, 0-1.4 (ads 0.5) - for about 0.3 s more before a real resume.
+# apart, 0-1.4 (ads 0.5). A real streamer talking through his pauses did
+# far more: on the 2026-11-04 live test 16% of looks at his voice reached
+# 0.40, and the film played 77 s of his stops in 8 false resumes. Only 0.7%
+# of those looks also stood 0.30 clear, against 89% of looks at the film's
+# real returns; replayed on the same stops, that left no false resumes.
 WATCH_RESUME_HEARD = 0.40
+WATCH_RESUME_CLEAR = 0.30
 WATCH_RESUME_GAP = 0.3
 WATCH_RESUME_AGREE = 0.08
-WATCH_DRIFT_LOOKS = 3      # heard looks in a row off by over DRIFT_TOLERANCE, agreeing...
-WATCH_DRIFT_AGREE = 0.06   # ...this well, before the drift is corrected
+WATCH_DRIFT_LOOKS = 3      # heard looks off by over DRIFT_TOLERANCE, agreeing...
+WATCH_DRIFT_AGREE = 0.06   # ...this well and standing WATCH_RESUME_CLEAR (a voice that
+                           # passes for the film moves nothing), before it is corrected
 WATCH_NEAR_BACK = 0.3      # paused: the resume is looked for a look's length and this before
 WATCH_NEAR_AHEAD = 0.5     # ...where it stopped, to this after (where it stopped is known to
                            # about 0.3 s, and a look straddles the resume or comes late)
@@ -181,6 +196,18 @@ def trusted(score, z):
     return score >= audio_matcher.SCORE_OK and z >= audio_matcher.Z_OK
 
 
+def _clear(p):
+    """A look whose best alignment stands clear of every other: the film's
+    own sound, not a voice that happens to correlate with it there
+    (Presence.clear; None from a look that did not measure it)."""
+    return p.clear is None or p.clear >= WATCH_RESUME_CLEAR
+
+
+def _resumable(p):
+    """A paused watcher's look that can start (or confirm) a resume."""
+    return p.state == "heard" and _clear(p)
+
+
 def playing_position_at(player, perf):
     """Where `player` was at perf_counter() time `perf`, if it is playing.
 
@@ -230,6 +257,12 @@ class SyncController:
         # (film, player) a sync last lined up with the stream: the watcher
         # only acts on a film it knows where the stream is against
         self._lined_up = None
+        # (film, film time, perf time): where a trusted sync or auto check
+        # last heard the stream. The watcher starts from it, so a pause
+        # before any look of its own has heard the film can still look
+        # where the stream would be had it played on
+        self._stream_heard = None
+        self._surveyed = None        # the film whose typical level was surveyed
         self._prefetching = False
         self.relay_url = "ws://localhost:8765"
         self.host_via = "tunnel"     # "tunnel": host through this computer; "relay": relay_url
@@ -510,6 +543,7 @@ class SyncController:
                 player.sync_seek(match_t, t0, offset,
                                  waiting=lambda: self._say(self._opening_hint()))
                 self._lined_up = (self.video_path, player)
+                self._stream_heard = (self.video_path, match_t, t0) if ok else None
                 player.set_mute(mute)
                 self.q.put(("swap", False, "a sync moved the film"))
                 self._after_sync(self._gen, refine=ok and not exact)
@@ -622,6 +656,7 @@ class SyncController:
                 # moment could not be read - it paused, or its clock had
                 # not settled - so nothing was checked.)
                 self._lined_up = (self.video_path, player)
+                self._stream_heard = (self.video_path, t, t0)
                 self.q.put(("synced", {"match": t, "at": t0, "trusted": True,
                                        "applied": abs(drift) > DRIFT_TOLERANCE,
                                        "source": "auto"}))
@@ -782,6 +817,10 @@ class SyncController:
             return WATCH_TICK
         if state["mode"] == "idle":
             self._watch_reset(state, "playing")
+            heard = self._stream_heard
+            if heard is not None and heard[0] == self.video_path:
+                state["heard"] = heard[1:]
+            self._watch_survey()
         if not player.is_playing():
             # paused by the user (or the film ended): theirs to play again
             state["missing"] = state["not_heard"] = 0
@@ -853,6 +892,8 @@ class SyncController:
     def _watch_drift(self, state, p, at, t0):
         """A heard look off by more than DRIFT_TOLERANCE, the same way as
         the looks just before it, moves the film there."""
+        if not _clear(p):
+            return                       # might be a voice: neither for nor against
         if abs(p.shift) <= DRIFT_TOLERANCE:
             state["drift"] = []
             return
@@ -898,42 +939,63 @@ class SyncController:
         if cap is not None and cap[2] < state["quiet_from"]:
             cap = None                   # it still holds sound from before the stop
         if cap is not None:
-            samples, sr, t0 = cap
-            path = self.video_path
-            heard = max(WATCH_RULES[self.watch_rule]["heard"], WATCH_RESUME_HEARD)
-            best = None
-            # back where it stopped: the resume can be anywhere in the look
-            near = audio_matcher.film_presence(
-                path, samples, sr, state["pp"], lo=-(WATCH_LOOK + WATCH_NEAR_BACK),
-                hi=WATCH_NEAR_AHEAD, heard=heard)
-            if near.state == "heard":
-                best = (near, state["pp"])
-            # or where it would be had it played on: a "pause" that was a
-            # stretch of talk-over the looks could not hear through
-            if state["heard"] is not None:
-                hf, ht = state["heard"]
-                cont = hf + (t0 - ht)
-                state["cont"] = cont
-                if cont - state["pp"] > WATCH_NEAR_AHEAD + WATCH_LOOK:
-                    p2 = audio_matcher.film_presence(path, samples, sr, cont, heard=heard)
-                    if p2.state == "heard" and (best is None or p2.ncc > best[0].ncc):
-                        best = (p2, cont)
-            cand = state["cand"]
-            if cand is not None and t0 - cand[1] > 1.0:
-                cand = state["cand"] = None      # never confirmed: start over
-            if best is not None:
-                p, at = best
-                where = at + p.shift     # the film time the stream carried at t0
-                if cand is None or abs((where - cand[0]) - (t0 - cand[1])) > WATCH_RESUME_AGREE:
-                    state["cand"] = (where, t0)  # the first look, or one that disagrees
-                elif t0 - cand[1] >= WATCH_RESUME_GAP:
-                    # two looks, apart enough to hear different sound,
-                    # agreeing on where the stream is: play the film
-                    return self._watch_resume(state, where, t0, "the film's sound is back")
+            resumed = self._watch_listen(state, *cap)
+            if resumed is not None:
+                return resumed
         now = self._now()
         if now >= state["far_next"] and not state["far_busy"]:
             self._watch_far_start(state, now)
         return WATCH_TICK
+
+    def _watch_listen(self, state, samples, sr, t0):
+        """Paused, one look for the stream coming back. A look that hears
+        the film well and clear of any other alignment is a candidate; the
+        film plays once a look WATCH_RESUME_GAP or more later agrees with
+        it on where the stream is. That second look is taken where the
+        candidate says the stream has got to by then, so a resume found at
+        the edge of the look back where it stopped is not lost as the
+        stream moves on past it. Returns watch_step's wait once the film
+        plays, else None."""
+        path = self.video_path
+        heard = max(WATCH_RULES[self.watch_rule]["heard"], WATCH_RESUME_HEARD)
+        cand = state["cand"]
+        if cand is not None and t0 - cand[1] > 1.0:
+            cand = state["cand"] = None      # never confirmed: start over
+        if cand is not None:
+            pred = cand[0] + (t0 - cand[1])
+            p = audio_matcher.film_presence(path, samples, sr, pred, heard=heard)
+            if _resumable(p) and abs(p.shift) <= WATCH_RESUME_AGREE:
+                if t0 - cand[1] >= WATCH_RESUME_GAP:
+                    # two looks, apart enough to hear different sound,
+                    # agreeing on where the stream is: play the film
+                    return self._watch_resume(state, pred + p.shift, t0,
+                                              "the film's sound is back")
+                return None                  # agrees, too soon to count as a second
+        best = None
+        # back where it stopped: the resume can be anywhere in the look
+        near = audio_matcher.film_presence(
+            path, samples, sr, state["pp"], lo=-(WATCH_LOOK + WATCH_NEAR_BACK),
+            hi=WATCH_NEAR_AHEAD, heard=heard)
+        if _resumable(near):
+            best = (near, state["pp"])
+        # or where it would be had it played on: a "pause" that was a
+        # stretch of talk-over the looks could not hear through
+        if state["heard"] is not None:
+            hf, ht = state["heard"]
+            cont = hf + (t0 - ht)
+            state["cont"] = cont
+            if cont - state["pp"] > WATCH_NEAR_AHEAD + WATCH_LOOK:
+                p2 = audio_matcher.film_presence(path, samples, sr, cont, heard=heard)
+                if _resumable(p2) and (best is None or p2.ncc > best[0].ncc):
+                    best = (p2, cont)
+        if best is not None:
+            p, at = best
+            where = at + p.shift         # the film time the stream carried at t0
+            if cand is None or abs((where - cand[0]) - (t0 - cand[1])) > WATCH_RESUME_AGREE:
+                state["cand"] = (where, t0)  # the first look, or one that disagrees
+            elif t0 - cand[1] >= WATCH_RESUME_GAP:
+                return self._watch_resume(state, where, t0, "the film's sound is back")
+        return None
 
     def _watch_far_start(self, state, now):
         since = now - state["paused_at"]
@@ -988,12 +1050,30 @@ class SyncController:
             return 1.0
         self._lined_up = (self.video_path, player)
         self._watch_reset(state, "playing")
+        state["heard"] = (where, t0)
+        self._stream_heard = (self.video_path, where, t0)
         self.q.put(("swap", False, "pause with the stream: the stream resumed"))
         self.q.put(("synced", {"match": where, "at": t0, "trusted": True,
                                "applied": True, "source": "resume"}))
         self._watch_show(state, "heard")
         diagnostics.log(f"watch: resumed at {fmt_time(where)} after {paused:.1f} s - {why}")
         return WATCH_TICK
+
+    def _watch_survey(self):
+        """Once per film, on a thread: stretches heard from across it, so
+        its typical level holds from the first look (survey_typical)."""
+        path = self.video_path
+        if self._surveyed == path or not Path(path).is_file():
+            return
+        self._surveyed = path
+
+        def run():
+            try:
+                audio_matcher.survey_typical(path)
+            except Exception as e:
+                diagnostics.log(f"watch: could not survey the film's level: "
+                                f"{type(e).__name__}: {e}")
+        self._spawn(run)
 
     def _watch_prefetch(self, at):
         """The film's next block of sound, decoded ahead on a thread, so a

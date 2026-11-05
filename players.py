@@ -66,6 +66,13 @@ SETTLE_TOL = 0.008
 # under SETTLE_TOL, left the film where it was.
 NUDGE_MIN = 0.001
 RATE_SETTLE = 1.3           # libvlc applies a rate change ~1 s late
+# A seek's playback is waited for this long before the correction gives
+# up. A first sync on a film that has not played - a 48 GB UHD remux, on the
+# 2026-11-04 live test - took about 3.4 s to play on from its seek; the old
+# 3 s wait gave up first, left the film 3 s behind the stream, and the
+# watcher took that for a pause. A wait over SLOW_SEEK is logged.
+SEEK_SETTLE = 15.0
+SLOW_SEEK = 2.0
 CLOCK_EVENTS = 4
 EXT_PORT = 9723
 EXT_PASSWORD = "streamsync"
@@ -239,8 +246,14 @@ class _ClosedLoop:
         try:
             for _ in range(4):
                 if seek_guess is not None:
-                    if not self._settle(gen):
+                    began = time.perf_counter()
+                    if not self._settle(gen, timeout=SEEK_SETTLE):
                         return
+                    waited = time.perf_counter() - began
+                    if waited > SLOW_SEEK:
+                        import diagnostics
+                        diagnostics.log(f"player: a seek took {waited:.1f} s to play on "
+                                        f"(stall guess {self._stall:.2f} s)")
                     err = self._error()
                     if err is None:
                         return

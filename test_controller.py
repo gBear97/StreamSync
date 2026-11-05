@@ -75,6 +75,12 @@ class Stream:
         self.unclear = 0          # refinements that come back unclear before one doesn't
         self.quiet = False        # the film's track is quiet here: nothing to listen for
         self.talk_ncc = 0.2       # what a look scores while talk-over hides the film
+        self.film_clear = 0.5     # how clear a look that hears the film stands (Presence.clear)
+        # paused, a voice the film's sound resembles as though the film
+        # played on from where it stopped: what a look scores then (None:
+        # no such voice), and how clear it stands
+        self.voice_ncc = None
+        self.voice_clear = 0.1
         self.echo = False         # a recording that began before a pause hears the film in it
         self.paused_since = None
 
@@ -221,18 +227,25 @@ def install_fakes(stream):
         # nothing to hear, and talk_ncc while talk-over hides it
         t0, seconds = samples
         P = controller.audio_matcher.Presence
+
+        def scored(ncc, shift, clear):
+            state = "heard" if ncc >= heard else ("missing" if ncc < missing else "unsure")
+            return P(state, shift, ncc, 0.0, 1.0, clear)
         if stream.quiet:
             return P("quiet", None, 0.0, -40.0, 0.0)
+        if (path == stream.film and not stream.playing and stream.voice_ncc is not None
+                and stream.paused_since is not None):
+            shift = stream.pos() + (t0 - stream.paused_since) - at
+            if lo <= shift <= hi:
+                return scored(stream.voice_ncc, shift, stream.voice_clear)
         if path != stream.film or not stream.playing:
-            return P("missing", None, 0.05, 0.0, 1.0)
+            return P("missing", None, 0.05, 0.0, 1.0, 0.0)
         if not stream.audible:
-            ncc = stream.talk_ncc
-            state = "heard" if ncc >= heard else ("missing" if ncc < missing else "unsure")
-            return P(state, 0.0, ncc, 0.0, 1.0)
+            return scored(stream.talk_ncc, 0.0, 0.1)
         shift = stream.pos(t0) - at
         if lo <= shift <= hi:
-            return P("heard", shift, 0.8, 0.0, 1.0)
-        return P("missing", None, 0.05, 0.0, 1.0)
+            return P("heard", shift, 0.8, 0.0, 1.0, stream.film_clear)
+        return P("missing", None, 0.05, 0.0, 1.0, 0.0)
     controller.audio_matcher.prep_capture = prep
     controller.audio_matcher.find_match_audio = find
     controller.audio_matcher.refine_match = refine
@@ -1247,6 +1260,88 @@ def test_watch_pauses_and_resumes():
           f"{came:.1f} s after its return")
 
 
+def test_watch_holds_against_a_voice():
+    # a streamer talking through his pause, his voice resembling the film
+    # as though it played on: on the 2026-11-04 live test looks like these
+    # (ncc 0.40 and more, two agreeing 0.3 s apart) played the film through
+    # 77 s of his stops. They do not stand clear of the look's other
+    # alignments, as the film's own sound does, and no longer count
+    ctl, stream, player, clock, q, state = watching()
+    stream.pause()
+    watch(ctl, clock, 1.0, state=state)
+    assert not player.playing
+    drain(q)
+    stream.voice_ncc = 0.5
+    watch(ctl, clock, 10.0, state=state)
+    assert not player.playing, "the film played on a voice over the paused stream"
+    assert not [e for e in drain(q) if e[0] == "synced"]
+    stream.voice_ncc = None
+    back = {}
+
+    def resume():
+        stream.play()
+        back["t"] = clock.now
+    watch(ctl, clock, 1.0, [(0.0, resume)], state=state)
+    assert in_sync(player, stream), "the stream's real return was missed"
+    came = player.anchor[1] - back["t"]
+    assert came <= 0.45, f"the resume took {came:.2f} s"
+    # the same voice standing clear, as only the film does, still counts:
+    # the gate is clearness, not the voice
+    ctl, stream, player, clock, q, state = watching()
+    stream.pause()
+    watch(ctl, clock, 1.0, state=state)
+    stream.voice_ncc, stream.voice_clear = 0.5, 0.5
+    watch(ctl, clock, 3.0, state=state)
+    assert player.playing
+    print("watcher: a voice over a paused stream that only correlates with the film "
+          "plays nothing; the stream's return still plays it in 0.3 s")
+
+
+def test_watch_follows_a_resume_past_the_first_look():
+    # the stream comes back just short of the far edge of the look back
+    # where it stopped: one look hears it there, and by the next one 0.3 s
+    # on it has moved past that look's reach. The second look is taken
+    # where the first says the stream has got to, so it is not left to a
+    # wide search seconds later
+    ctl, stream, player, clock, q, state = watching()
+    stream.pause()
+    watch(ctl, clock, 3.0, state=state)
+    assert not player.playing
+    back = {}
+
+    def resume():
+        stream.anchor = (state["pp"] + 0.95, clock())
+        stream.play()
+        back["t"] = clock.now
+    watch(ctl, clock, 1.0, [(0.0, resume)], state=state)
+    assert in_sync(player, stream), "a resume past the first look's reach was lost"
+    came = player.anchor[1] - back["t"]
+    assert came <= 0.45, f"the resume took {came:.2f} s"
+    print(f"watcher: a stream back just past where the first look reaches played "
+          f"on in {came:.1f} s")
+
+
+def test_watch_starts_from_the_sync():
+    # a film that lands 3 s behind its sync (a slow first seek did, live):
+    # the watcher's own looks have not heard it yet, so it pauses - and it
+    # knows from the sync where the stream would be by now, so it finds it
+    # there at once rather than waiting seconds for a wide search
+    ctl, stream, player, clock, q = make()
+    ctl.watch_enabled = True
+    run_sync(ctl, ctl.sync, "")
+    player.anchor = (player.pos() - 3.0, clock())
+    drain(q)
+    watch(ctl, clock, 3.0)
+    got = drain(q)
+    assert in_sync(player, stream), "the misplaced film never caught up with the stream"
+    resumed = [e[1] for e in got if e[0] == "synced"]
+    assert resumed and resumed[-1]["source"] == "resume"
+    took = [e[1] for e in got if e[0] == "swap"]
+    assert took == [True, False], took
+    print("watcher: a film 3 s behind its sync pauses once and is found where the "
+          "sync says the stream is by now, within a second")
+
+
 def test_watch_leaves_a_quiet_film_alone():
     ctl, stream, player, clock, q, state = watching()
     stream.quiet = True
@@ -1302,17 +1397,28 @@ def test_watch_obeys_play_by_hand():
 
 def test_watch_corrects_drift():
     ctl, stream, player, clock, q, state = watching()
-    player.anchor = (player.pos() + 0.37, clock())             # 0.37 s ahead
+    player.anchor = (player.pos() + 0.13, clock())             # 0.13 s ahead
     n = len(player.seeks)
     watch(ctl, clock, 1.0, state=state)
-    assert len(player.seeks) == n + 1, "drift over 0.35 s was not corrected once"
+    assert len(player.seeks) == n + 1, "drift over 0.1 s was not corrected once"
     assert in_sync(player, stream)
-    assert any("corrected -0.37 s drift" in m for m in statuses(q))
-    player.anchor = (player.pos() + 0.2, clock())              # within tolerance
+    assert any("corrected -0.13 s drift" in m for m in statuses(q))
+    player.anchor = (player.pos() + 0.06, clock())             # within tolerance
     n = len(player.seeks)
     watch(ctl, clock, 1.0, state=state)
-    assert len(player.seeks) == n, "drift under 0.35 s was 'corrected'"
-    print("watcher: 0.37 s of drift corrected, 0.2 s left alone")
+    assert len(player.seeks) == n, "drift under 0.1 s was 'corrected'"
+    # heard, but not standing clear of other alignments - a voice that
+    # passes for the film - moves nothing, however far off it says it is
+    player.anchor = (player.pos() + 0.24, clock())
+    stream.film_clear = 0.1
+    n = len(player.seeks)
+    watch(ctl, clock, 1.0, state=state)
+    assert len(player.seeks) == n, "an unclear look moved the film"
+    stream.film_clear = 0.5
+    watch(ctl, clock, 1.0, state=state)
+    assert len(player.seeks) == n + 1 and in_sync(player, stream)
+    print("watcher: 0.13 s of drift corrected, 0.06 s left alone, and drift only "
+          "an unclear look reports left alone too")
 
 
 def test_watch_finds_a_far_jump():
@@ -1475,6 +1581,9 @@ def main():
     test_inexact_sync_made_exact_later()
     test_watch_waits_for_a_sync()
     test_watch_pauses_and_resumes()
+    test_watch_holds_against_a_voice()
+    test_watch_follows_a_resume_past_the_first_look()
+    test_watch_starts_from_the_sync()
     test_watch_leaves_a_quiet_film_alone()
     test_watch_rules_under_talk_over()
     test_watch_obeys_play_by_hand()

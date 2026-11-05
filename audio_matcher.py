@@ -31,6 +31,7 @@ import math
 import os
 import subprocess
 import threading
+import time
 
 import numpy as np
 import imageio_ffmpeg
@@ -465,8 +466,14 @@ PRESENCE_LOUD_FRAC = 0.5   # ...and a window needs this share of frames above th
 PRESENCE_HEARD = 0.30      # a look's correlation at or above this hears the film,
 PRESENCE_MISSING = 0.15    # under this misses it, and between is unsure (the
                            # caller's rule may set its own: controller.WATCH_RULES)
+PRESENCE_CLEAR_S = 0.1     # Presence.clear: the best alignment against the best one
+                           # more than this far from it
+SURVEY_STRETCHES = 6       # survey_typical: stretches heard across the film...
+SURVEY_S = 20.0            # ...this long each,
+SURVEY_PACE = 0.5          # ...this many seconds apart
 
-Presence = collections.namedtuple("Presence", "state shift ncc level_db loud_frac")
+Presence = collections.namedtuple("Presence", "state shift ncc level_db loud_frac clear",
+                                  defaults=(None,))
 Presence.__doc__ = """film_presence's answer.
 
 state      "quiet" (the film's track has nothing to hear here), or how the
@@ -480,7 +487,11 @@ ncc        that best correlation (-1..1);
 level_db   the film's level over the window against the film's typical
            level (dB, median frame);
 loud_frac  share of the window's film frames within PRESENCE_QUIET_DB of
-           that typical level."""
+           that typical level;
+clear      how far ncc stands above the best correlation more than
+           PRESENCE_CLEAR_S from it. The film makes one sharp peak; a voice
+           that happens to correlate makes several of a size. None when
+           quiet or silent."""
 
 
 class _FilmBlock:
@@ -550,15 +561,40 @@ def _note_typical(path, block):
     """The film's typical level: the median frame level of the blocks seen
     so far (silence left out), each counted once. It starts from the first
     block played and settles as more of the film goes by - a quiet opening
-    scene judged against itself alone would pass for typical."""
-    lv = block.level_db
+    scene judged against itself alone would pass for typical - and at
+    once if survey_typical has heard stretches from across the film."""
+    _note_level(path, block.start, block.level_db)
+
+
+def _note_level(path, start, lv):
     live = lv[lv > lv.max() - PRESENCE_LIVE_DB]
     if live.size < 16:
         return
     key = _block_key(path, 0.0)[:2]
     with _blocks_lock:
         seen = _typical.setdefault(key, {})
-        seen[round(block.start, 3)] = float(np.median(live))
+        seen[round(start, 3)] = float(np.median(live))
+
+
+def survey_typical(path, stretches=SURVEY_STRETCHES, seconds=SURVEY_S):
+    """Hear `stretches` short stretches spread across the film, so its
+    typical level holds from the first look rather than settling as the
+    film goes by. On the 2026-11-04 live test the first block alone put it
+    at 19.1 dB against 3.8 dB once settled. Meant for a thread of its own:
+    a few seconds of decoding, nothing kept but each stretch's level."""
+    duration, _start = probe(path)
+    if not duration or duration < 4 * seconds:
+        return
+    for i in range(stretches):
+        if i:
+            time.sleep(SURVEY_PACE)      # gently: the film itself may be opening
+        t = duration * (i + 0.5) / stretches
+        try:
+            x = decode_audio(path, t, seconds)
+        except MatchError:
+            continue
+        lv = 10.0 * np.log10((_band_mags(x, SR).astype(np.float64) ** 2).sum(axis=1) + 1e-20)
+        _note_level(path, t, lv)
 
 
 def typical_level(path):
@@ -620,7 +656,9 @@ def film_presence(path, samples, sr, at, lo=-PRESENCE_SEARCH, hi=PRESENCE_SEARCH
         if abs(den) > 1e-12:
             d = float(np.clip(0.5 * (a - c) / den, -1.0, 1.0))
     state = "heard" if best >= heard else ("missing" if best < missing else "unsure")
-    return Presence(state, (k + d - s_lo) * HOP_S, best, level, loud)
+    far = np.abs(np.arange(len(ncc)) - k) * HOP_S > PRESENCE_CLEAR_S
+    clear = best - float(ncc[far].max()) if far.any() else 1.0
+    return Presence(state, (k + d - s_lo) * HOP_S, best, level, loud, clear)
 
 
 def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None):
