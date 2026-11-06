@@ -81,6 +81,8 @@ class Stream:
         # no such voice), and how clear it stands
         self.voice_ncc = None
         self.voice_clear = 0.1
+        self.voice_every = 1      # ...on every look, or every nth (the rest miss)
+        self.looks = 0
         self.echo = False         # a recording that began before a pause hears the film in it
         self.paused_since = None
 
@@ -235,8 +237,9 @@ def install_fakes(stream):
             return P("quiet", None, 0.0, -40.0, 0.0)
         if (path == stream.film and not stream.playing and stream.voice_ncc is not None
                 and stream.paused_since is not None):
+            stream.looks += 1
             shift = stream.pos() + (t0 - stream.paused_since) - at
-            if lo <= shift <= hi:
+            if stream.looks % stream.voice_every == 0 and lo <= shift <= hi:
                 return scored(stream.voice_ncc, shift, stream.voice_clear)
         if path != stream.film or not stream.playing:
             return P("missing", None, 0.05, 0.0, 1.0, 0.0)
@@ -1297,6 +1300,31 @@ def test_watch_holds_against_a_voice():
           "plays nothing; the stream's return still plays it in 0.3 s")
 
 
+def test_watch_notices_a_stop_through_a_voice():
+    # the streamer stops and talks, and now and then a look passes for the
+    # film (ncc 0.5) without standing clear. Each used to restart the count
+    # toward a pause, so a stop through talk was noticed late, or here never;
+    # such looks now count neither way
+    ctl, stream, player, clock, q, state = watching()
+    stream.voice_ncc, stream.voice_clear, stream.voice_every = 0.5, 0.1, 2
+    stopped = {}
+
+    def stop():
+        stream.pause()
+        stopped["t"] = clock.now
+    watch(ctl, clock, 3.0, [(0.0, stop)], state=state)
+    assert not player.playing, "a stop through the streamer's voice was never noticed"
+    took = player.anchor[1] - stopped["t"]
+    assert took <= 0.8, f"noticed {took:.2f} s after the stop"
+    # the film heard only modestly clear (0.2) still counts as heard
+    ctl, stream, player, clock, q, state = watching()
+    stream.film_clear = 0.2
+    watch(ctl, clock, 5.0, state=state)
+    assert player.playing, "film standing 0.2 clear was taken for a stop"
+    print(f"watcher: a stop through a voice that passes for the film now and then "
+          f"noticed in {took:.1f} s; film heard 0.2 clear plays on")
+
+
 def test_watch_follows_a_resume_past_the_first_look():
     # the stream comes back just short of the far edge of the look back
     # where it stopped: one look hears it there, and by the next one 0.3 s
@@ -1582,6 +1610,7 @@ def main():
     test_watch_waits_for_a_sync()
     test_watch_pauses_and_resumes()
     test_watch_holds_against_a_voice()
+    test_watch_notices_a_stop_through_a_voice()
     test_watch_follows_a_resume_past_the_first_look()
     test_watch_starts_from_the_sync()
     test_watch_leaves_a_quiet_film_alone()

@@ -94,6 +94,16 @@ WATCH_RESUME_HEARD = 0.40
 WATCH_RESUME_CLEAR = 0.30
 WATCH_RESUME_GAP = 0.3
 WATCH_RESUME_AGREE = 0.08
+# Playing, a heard look standing less than this clear counts neither way:
+# it doesn't restart the count toward a pause, as a heard look does, nor add
+# to it. A streamer talking through his pause made such looks now and then,
+# each restarting the count, so a stop was noticed late (5.6 s at worst on
+# the 2026-11-04 live test). Replayed on that night's recording (Balanced,
+# looks 0.15 s apart as live): slowest notice 5.6 -> 2.4 s, resumes 1.2 ->
+# 0.9 s median, the film running 24 -> 15 s while the stream was stopped,
+# and still 3 false pauses. Counting such looks as unsure instead doubled
+# the false pauses; standing 0.30 clear (WATCH_RESUME_CLEAR) asked too much.
+WATCH_HEARD_CLEAR = 0.15
 WATCH_DRIFT_LOOKS = 3      # heard looks off by over DRIFT_TOLERANCE, agreeing...
 WATCH_DRIFT_AGREE = 0.06   # ...this well and standing WATCH_RESUME_CLEAR (a voice that
                            # passes for the film moves nothing), before it is corrected
@@ -864,6 +874,12 @@ class SyncController:
             state["missing"] = state["not_heard"] = 0
             state["drift"] = []
             self._watch_show(state, "quiet")
+            return WATCH_TICK
+        if p.state == "heard" and p.clear is not None and p.clear < WATCH_HEARD_CLEAR:
+            # heard, but not standing clear of the look's other alignments:
+            # as likely a voice over a stopped stream as the film. It
+            # neither restarts the count toward a pause nor adds to it
+            state["drift"] = []
             return WATCH_TICK
         if p.state == "heard":
             state["missing"] = state["not_heard"] = 0
