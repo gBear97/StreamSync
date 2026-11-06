@@ -1197,12 +1197,12 @@ def test_inexact_sync_made_exact_later():
 
 # ------------------------------------------------- pause with the stream
 
-def watch(ctl, clock, seconds, events=(), state=None):
+def watch(ctl, clock, seconds, events=(), state=None, spawn=None):
     """Run watch_step for `seconds` of simulated time, wide searches and
-    prefetches in place; `events` are (after, fn) pairs. Returns the
-    watcher state, to go on from."""
+    prefetches in place (or through `spawn`); `events` are (after, fn)
+    pairs. Returns the watcher state, to go on from."""
     state = state if state is not None else ctl.watch_state()
-    ctl._spawn = lambda fn, *a: fn(*a)
+    ctl._spawn = spawn or (lambda fn, *a: fn(*a))
     start = clock.now
     todo = sorted(events, key=lambda e: e[0])
     while clock.now - start < seconds:
@@ -1571,6 +1571,39 @@ def test_watch_finds_a_far_jump():
           f"{len(windows)} wide searches")
 
 
+def test_watch_whole_film_search_leaves_the_near_ones_going():
+    # a whole-film search can take a minute (the film's sound decoded afresh),
+    # and the wide searches near where the stream stopped waited for it: after
+    # an ad of 30 s or more, a stream back beyond the close looks' reach went
+    # unfound all that time. It runs apart from them now, one at a time
+    ctl, stream, player, clock, q, state = watching()
+    held = []
+
+    def spawn(fn, *a):
+        if getattr(fn, "__func__", None) is controller.SyncController._watch_far and a[3] is None:
+            held.append(a)               # the whole film, still decoding: never lands
+        else:
+            fn(*a)
+    stream.pause()                       # an ad
+    watch(ctl, clock, 40.0, state=state, spawn=spawn)
+    assert not player.playing and held, "no whole-film search in 40 s paused"
+    back = {}
+
+    def rejoin():
+        played_on = stream.pos() + (clock.now - stream.paused_since)
+        stream.anchor = (played_on - 10.0, clock())      # beyond the close looks' reach
+        stream.play()
+        back["t"] = clock.now
+    watch(ctl, clock, 8.0, [(0.0, rejoin)], state=state, spawn=spawn)
+    assert in_sync(player, stream), \
+        "a stream back 10 s off was left waiting on the whole-film search"
+    came = player.anchor[1] - back["t"]
+    assert came <= 6.0, f"found {came:.1f} s after it came back"
+    assert len(held) == 1, f"{len(held)} whole-film searches at once"
+    print(f"watcher: with a whole-film search still running, a stream back 10 s off "
+          f"was found by a near one in {came:.1f} s")
+
+
 def test_watch_pause_holds_against_old_sound():
     # the recordings a paused watcher takes still hold, for a few seconds,
     # the film from before the stream stopped: a wide search over them
@@ -1719,6 +1752,7 @@ def main():
     test_watch_obeys_play_by_hand()
     test_watch_corrects_drift()
     test_watch_finds_a_far_jump()
+    test_watch_whole_film_search_leaves_the_near_ones_going()
     test_watch_pause_holds_against_old_sound()
     test_watch_keeps_its_pause_across_a_weak_resync()
     test_watch_lets_go_for_another_film()

@@ -622,9 +622,11 @@ Step by step, with a first sync test: [MAC_FIRST_RUN.md](MAC_FIRST_RUN.md).
   sound nearby a smaller one beside the real peak. Where the film's music
   repeats itself within that reach (a steady beat), the real peak may not
   stand clear either, and the film waits for a later look or the full
-  match. A full match runs every few
-  seconds over a widening stretch of the film for a stream that comes
-  back somewhere else.
+  match. A full match runs every few seconds over a widening stretch of
+  the film for a stream that comes back somewhere else, and after 30 s
+  now and then over the whole film. Decoding a whole film can take a
+  minute, so that one runs on its own and the nearer matches go on
+  meanwhile.
 - **Timing**: stream audio is recorded continuously and every sample is
   dated by its position in the recording, not by when a recording was
   asked for - so the matched moment is corrected by exactly how long ago

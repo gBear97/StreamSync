@@ -149,6 +149,13 @@ WATCH_FAR_AHEAD = 40.0     # ...where it would be had it played on,
 WATCH_FAR_REACH = 600.0    # ...but no further than this past where it stopped,
 WATCH_FAR_WHOLE = 30.0     # ...and every fourth one after this long paused, the whole film
 WATCH_FAR_EVERY = ((30.0, 2.0), (120.0, 5.0), (math.inf, 15.0))  # (paused under s, s between)
+# A whole-film search runs apart from the others, one at a time: decoding
+# the whole film can take a minute (60 s on the PC's first sync), and the
+# searches near where the stream stopped used to wait for it. They do not
+# keep it cached for long, either: each takes a slot of its own in
+# audio_matcher's feature cache, so within a minute of a pause they push
+# out what the first sync decoded. After an ad of 30 s or more, a stream
+# back beyond the close looks' reach then went unfound until it was done.
 WATCH_FAIL_SHOW = 10       # looks in a row that could not be taken before the line says so
 
 # How quickly it pauses (Settings). A look reads heard at or above `heard`,
@@ -801,8 +808,8 @@ class SyncController:
         """A fresh watcher state for watch_step."""
         return {"mode": "idle", "missing": 0, "not_heard": 0, "heard": None,
                 "stop_at": None, "drift": [], "cand": None, "shown": None,
-                "token": 0, "far_busy": False, "far_hit": None, "far_n": 0,
-                "fails": 0, "fail_sig": None, "fail_n": 0}
+                "token": 0, "far_busy": False, "whole_busy": False, "far_hit": None,
+                "far_n": 0, "fails": 0, "fail_sig": None, "fail_n": 0}
 
     def _watch_show(self, state, key):
         if state["shown"] != key:
@@ -1066,7 +1073,8 @@ class SyncController:
         every = next(e for limit, e in WATCH_FAR_EVERY if since < limit)
         state["far_next"] = now + every
         state["far_n"] += 1
-        if since >= WATCH_FAR_WHOLE and state["far_n"] % 4 == 0:
+        if (since >= WATCH_FAR_WHOLE and state["far_n"] % 4 == 0
+                and not state["whole_busy"]):
             lo = hi = None               # the whole film: a jump anywhere
         else:
             # where it would be had it played on, up to WATCH_FAR_REACH: a
@@ -1075,7 +1083,8 @@ class SyncController:
             pp = state["pp"]
             lo = pp - WATCH_FAR_BACK
             hi = min(max(pp, state.get("cont") or pp), pp + WATCH_FAR_REACH) + WATCH_FAR_AHEAD
-        state["far_busy"] = True
+        # the whole film on its own flag: the near searches go on meanwhile
+        state["whole_busy" if lo is None else "far_busy"] = True
         self._spawn(self._watch_far, state, state["token"], self.video_path, lo, hi,
                     state["quiet_from"])
 
@@ -1100,7 +1109,7 @@ class SyncController:
         except Exception as e:
             diagnostics.log(f"watch: a wide search failed: {type(e).__name__}: {e}")
         finally:
-            state["far_busy"] = False
+            state["whole_busy" if lo is None else "far_busy"] = False
 
     def _watch_resume(self, state, where, t0, why):
         player = self.player
