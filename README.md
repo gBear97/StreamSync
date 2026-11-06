@@ -295,10 +295,12 @@ says what it hears:
 When the film's sound comes back, the film plays from exactly where the
 stream is, typically 0.6 to 1 s later. A streamer talking through his
 pause does not count as the film coming back, even where his voice
-happens to resemble the film's sound. If it comes back somewhere else -
-Twitch rejoining the live stream after an ad, or the streamer jumping to
-another scene - StreamSync searches outward from where it stopped, and
-in time the whole film, and plays from there. Press Play yourself while
+happens to resemble the film's sound. A stream that comes back up to
+about 2 s from where it stopped, or 3 s from where it would have got to -
+as Twitch's player does when it rejoins after an ad - is found just as
+quickly. If it comes back further away - a rejoin further off, or the
+streamer jumping to another scene - StreamSync searches outward from
+where it stopped, and in time the whole film, and plays from there. Press Play yourself while
 the stream is paused and the film plays on; StreamSync follows again once
 it hears the film on the stream, or after your next sync.
 
@@ -609,12 +611,18 @@ Step by step, with a first sync test: [MAC_FIRST_RUN.md](MAC_FIRST_RUN.md).
   so a look costs a few milliseconds. The film's own level there says
   whether there is anything to hear; how many looks in a row may miss the
   film before it pauses is the rule chosen in Settings. While paused it
-  listens for the film where the stream stopped, and where it would be had
-  it played on (a "pause" that was talk-over it could not hear through).
-  It plays the film once two looks 0.3 s apart agree on where the stream
-  is, each correlating well and standing clear of every other alignment
-  of the look - the film's sound makes one sharp peak, a voice that
-  happens to correlate several of a size. A full match runs every few
+  listens for the film where the stream stopped, 2 s either side, and
+  where it would be had it played on (a "pause" that was talk-over it
+  could not hear through, or Twitch rejoining live after an ad), 3 s
+  either side once the pause has gone on a few seconds. It plays the film
+  once two looks 0.3 s apart agree on where the stream is, each
+  correlating well and standing clear of every other alignment it
+  reaches: the film's sound makes one sharp peak, a voice that happens to
+  correlate several of a size, and a stretch of film that repeats the
+  sound nearby a smaller one beside the real peak. Where the film's music
+  repeats itself within that reach (a steady beat), the real peak may not
+  stand clear either, and the film waits for a later look or the full
+  match. A full match runs every few
   seconds over a widening stretch of the film for a stream that comes
   back somewhere else.
 - **Timing**: stream audio is recorded continuously and every sample is

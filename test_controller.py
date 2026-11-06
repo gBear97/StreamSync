@@ -24,8 +24,11 @@ to leave playback alone:
   spot when it comes back; leaves a quiet stretch of film alone; under
   talk-over, pauses as each rule says, and recovers from a false pause
   where the stream really is; obeys a hand on Play until it hears the
-  film again; corrects a steady drift; finds a stream that comes back far
-  away with a wide search; keeps its pause across a weak Resync, lets it
+  film again; corrects a steady drift; plays a stream that comes back a
+  second or two from where it stopped or would be from there at once,
+  even where the film repeats its own sound at that distance, and near
+  the film's start; finds a stream that comes back far away with a wide
+  search; keeps its pause across a weak Resync, lets it
   go for another film, stands aside for a watch party; and its switch
   and rule are saved, the old Follow setting carried over;
 - nudges during a watch party go to the session, which would otherwise
@@ -82,6 +85,9 @@ class Stream:
         self.voice_ncc = None
         self.voice_clear = 0.1
         self.voice_every = 1      # ...on every look, or every nth (the rest miss)
+        # the film repeats this stretch of its sound (lag, ncc): a look also
+        # finds the stream `lag` s further on in the film, at that ncc
+        self.repeat = None
         self.looks = 0
         self.echo = False         # a recording that began before a pause hears the film in it
         self.paused_since = None
@@ -233,6 +239,8 @@ def install_fakes(stream):
         def scored(ncc, shift, clear):
             state = "heard" if ncc >= heard else ("missing" if ncc < missing else "unsure")
             return P(state, shift, ncc, 0.0, 1.0, clear)
+        if at + lo < 0:
+            return P("quiet", None, 0.0, -40.0, 0.0)  # as the real one: before the film starts
         if stream.quiet:
             return P("quiet", None, 0.0, -40.0, 0.0)
         if (path == stream.film and not stream.playing and stream.voice_ncc is not None
@@ -246,9 +254,19 @@ def install_fakes(stream):
         if not stream.audible:
             return scored(stream.talk_ncc, 0.0, 0.1)
         shift = stream.pos(t0) - at
-        if lo <= shift <= hi:
-            return P("heard", shift, 0.8, 0.0, 1.0, stream.film_clear)
-        return P("missing", None, 0.05, 0.0, 1.0, 0.0)
+        peaks = [(0.8, shift)]
+        if stream.repeat is not None:
+            lag, ncc = stream.repeat
+            peaks.append((ncc, shift + lag))
+        seen = [pk for pk in peaks if lo <= pk[1] <= hi]
+        if not seen:
+            return P("missing", None, 0.05, 0.0, 1.0, 0.0)
+        # the best peak in the look, standing clear of the other if that
+        # is in the look too
+        ncc, best = max(seen)
+        rest = [n for n, s in seen if abs(s - best) > 0.1]
+        clear = min(stream.film_clear, ncc - max(rest)) if rest else stream.film_clear
+        return scored(ncc, best, clear)
     controller.audio_matcher.prep_capture = prep
     controller.audio_matcher.find_match_audio = find
     controller.audio_matcher.refine_match = refine
@@ -1349,6 +1367,86 @@ def test_watch_follows_a_resume_past_the_first_look():
           f"on in {came:.1f} s")
 
 
+def test_watch_finds_a_return_near_where_it_would_be():
+    # Twitch rejoins live after an ad a second or so from where the stream
+    # would be had it played on. Looks there reached 0.4 s either side, so
+    # such a return waited seconds for a wide search - or worse: on the PC's
+    # live test (2026-11-05) the stream came back 1.13 s behind, where the
+    # film's own sound repeats itself 1.13 s on, and a look found only the
+    # repeat, standing clear, and played the film 1.1 s off. After a longer
+    # pause, the look there reaches 3 s either side now: the real spot is in
+    # the look, and it wins
+    for off, repeat in ((1.13, None), (1.13, (1.13, 0.45)), (2.5, None)):
+        ctl, stream, player, clock, q, state = watching()
+        stream.pause()                                   # the ad
+        watch(ctl, clock, 38.0, state=state)
+        assert not player.playing
+        back = {}
+
+        def rejoin():
+            played_on = stream.pos() + (clock.now - stream.paused_since)
+            stream.anchor = (played_on - off, clock())
+            stream.play()
+            stream.repeat = repeat
+            back["t"] = clock.now
+        watch(ctl, clock, 1.0, [(0.0, rejoin)], state=state)
+        case = f"{off} s back, repeat {repeat}"
+        assert player.playing, f"{case}: the stream's return was missed"
+        assert in_sync(player, stream), \
+            f"{case}: the film plays {player.pos() - stream.pos():+.2f} s off the stream"
+        came = player.anchor[1] - back["t"]
+        assert came <= 0.45, f"{case}: the resume took {came:.2f} s"
+    print(f"watcher: a stream back 1.13 or 2.5 s from where it would have got to plays "
+          f"from there in {came:.1f} s, also where the film repeats itself at that lag")
+
+
+def test_watch_finds_a_return_just_before_the_stop():
+    # the streamer pauses a couple of seconds, goes back a second and a half
+    # and plays on: the look back where it stopped reaches 2.6 s behind it,
+    # so the stream is found there at once, not seconds later by a wide search
+    ctl, stream, player, clock, q, state = watching()
+    stream.pause()
+    watch(ctl, clock, 2.0, state=state)
+    assert not player.playing
+    back = {}
+
+    def resume():
+        stream.anchor = (state["pp"] - 1.5, clock())
+        stream.play()
+        back["t"] = clock.now
+    watch(ctl, clock, 1.0, [(0.0, resume)], state=state)
+    assert in_sync(player, stream), "a stream back 1.5 s before where it stopped was lost"
+    came = player.anchor[1] - back["t"]
+    assert came <= 0.45, f"the resume took {came:.2f} s"
+    print(f"watcher: a stream back 1.5 s before where it stopped plays on in {came:.1f} s")
+
+
+def test_watch_resumes_near_the_films_start():
+    # a stop 2 s into the film: a look reaching 2.6 s back would reach before
+    # the film's start, which film_presence answers as quiet, so only a wide
+    # search seconds later found the return. Looks stop at the film's start
+    ctl, stream, player, clock, q = make()
+    stream.anchor = (0.5, clock())
+    ctl.watch_enabled = True
+    run_sync(ctl, ctl.sync, "")
+    state = watch(ctl, clock, 1.5)
+    assert state["mode"] == "playing" and player.playing
+    stream.pause()
+    watch(ctl, clock, 10.0, state=state)
+    assert not player.playing
+    stopped = state["pp"]
+    back = {}
+
+    def resume():
+        stream.play()
+        back["t"] = clock.now
+    watch(ctl, clock, 3.0, [(0.0, resume)], state=state)
+    assert in_sync(player, stream), "a stream back 2 s into the film was not followed"
+    came = player.anchor[1] - back["t"]
+    assert came <= 0.45, f"the resume took {came:.2f} s"
+    print(f"watcher: a stop {stopped:.1f} s into the film plays on in {came:.1f} s")
+
+
 def test_watch_starts_from_the_sync():
     # a film that lands 3 s behind its sync (a slow first seek did, live):
     # the watcher's own looks have not heard it yet, so it pauses - and it
@@ -1612,6 +1710,9 @@ def main():
     test_watch_holds_against_a_voice()
     test_watch_notices_a_stop_through_a_voice()
     test_watch_follows_a_resume_past_the_first_look()
+    test_watch_finds_a_return_near_where_it_would_be()
+    test_watch_finds_a_return_just_before_the_stop()
+    test_watch_resumes_near_the_films_start()
     test_watch_starts_from_the_sync()
     test_watch_leaves_a_quiet_film_alone()
     test_watch_rules_under_talk_over()

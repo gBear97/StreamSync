@@ -89,7 +89,9 @@ WATCH_LOOK = 0.6
 # far more: on the 2026-11-04 live test 16% of looks at his voice reached
 # 0.40, and the film played 77 s of his stops in 8 false resumes. Only 0.7%
 # of those looks also stood 0.30 clear, against 89% of looks at the film's
-# real returns; replayed on the same stops, that left no false resumes.
+# real returns (with the looks of then, reaching under 1 s: see
+# WATCH_RESUME_REACH);
+# replayed on the same stops, that left no false resumes.
 WATCH_RESUME_HEARD = 0.40
 WATCH_RESUME_CLEAR = 0.30
 WATCH_RESUME_GAP = 0.3
@@ -107,9 +109,40 @@ WATCH_HEARD_CLEAR = 0.15
 WATCH_DRIFT_LOOKS = 3      # heard looks off by over DRIFT_TOLERANCE, agreeing...
 WATCH_DRIFT_AGREE = 0.06   # ...this well and standing WATCH_RESUME_CLEAR (a voice that
                            # passes for the film moves nothing), before it is corrected
-WATCH_NEAR_BACK = 0.3      # paused: the resume is looked for a look's length and this before
-WATCH_NEAR_AHEAD = 0.5     # ...where it stopped, to this after (where it stopped is known to
-                           # about 0.3 s, and a look straddles the resume or comes late)
+# Paused, each look for the stream coming back reaches this far either side
+# of where it looks: where the stream stopped (and a look's length more
+# before it, as a look can straddle the resume), where it would be had it
+# played on, and where a first look says it has got to; when the first two
+# are close, one look reaches from before the one to past the other, so
+# each is weighed against the other's alignments. Twitch rejoins live
+# after an ad a second or so from where the stream would have got to. On
+# the PC's live test (2026-11-05) it came back 1.13 s behind, where the
+# film's own sound repeats itself 1.13 s on: reaching 0.4 s, a look there
+# held only the repeat, standing clear of all else in it, and played the
+# film 1.1 s off. Replayed on the film's sound, a look reaching 2 s put
+# its best alignment on the true spot every time (105 of 105), and stood
+# clear there on 103.
+# Reaching further also weighs each alignment against more of the film. A
+# voice over a paused stream no longer stands clear: of 7605 looks at the
+# streamer talking on the two recorded nights, 82 passed reaching 0.4 s and
+# none reaching 2 s (clearest 0.29), and the 11/5 VOD's false resume in
+# the credits no longer forms. The price is music with a steady beat, whose
+# repeats fall within 2 s: there the real spot stands clear less often
+# (across the 11/4 recording, 89% of looks at it reaching 2 s against 93%
+# with the looks of before), and about 1 in
+# 45-100 returns a 0.4 s look took at once waits over 2 s for a later look
+# or a wide search. Replayed on both nights, resumes came no later in the
+# median. Reaching 3 s also takes in the music's longer repeats: worse.
+WATCH_RESUME_REACH = 2.0
+# After a longer pause, though, the look where the stream would be had it
+# played on reaches this far: what puts the stream there is Twitch's player
+# after an ad - right there if the stream played on under the ad (in a small
+# or side player), less the player's change of latency after a full-screen
+# one, likely 0-2 s and sometimes more. Simulated after a 38 s ad on the
+# 11/4 recording, returns 2.5 s off played on in about a second at 3 s (16
+# of 16) against none within 15 s at 2 s, and looks reaching 3 s locked
+# onto no wrong spot within reach on either recorded night.
+WATCH_REJOIN_REACH = 3.0
 WATCH_FAR_LISTEN = 4.0     # a wide search matches this much of the stream's sound,
 WATCH_FAR_BACK = 25.0      # ...from this far behind where it stopped to this far past
 WATCH_FAR_AHEAD = 40.0     # ...where it would be had it played on,
@@ -970,16 +1003,26 @@ class SyncController:
         it on where the stream is. That second look is taken where the
         candidate says the stream has got to by then, so a resume found at
         the edge of the look back where it stopped is not lost as the
-        stream moves on past it. Returns watch_step's wait once the film
-        plays, else None."""
+        stream moves on past it. Each look reaches WATCH_RESUME_REACH either
+        side (after a longer pause, the look where it would be had it played
+        on reaches WATCH_REJOIN_REACH), so a stream back a second or two
+        from where it is looked for is found there, and a stretch of film
+        that merely repeats the stream's sound nearby does not stand clear
+        of the real one - nor, where the repeat is strong (a steady beat),
+        does the real one, and the resume waits for a later look or a wide
+        search. Looks stop at the film's start. Returns watch_step's wait
+        once the film plays, else None."""
         path = self.video_path
         heard = max(WATCH_RULES[self.watch_rule]["heard"], WATCH_RESUME_HEARD)
+        reach = WATCH_RESUME_REACH
         cand = state["cand"]
         if cand is not None and t0 - cand[1] > 1.0:
             cand = state["cand"] = None      # never confirmed: start over
         if cand is not None:
             pred = cand[0] + (t0 - cand[1])
-            p = audio_matcher.film_presence(path, samples, sr, pred, heard=heard)
+            # a look reaching back past the film's start would answer quiet
+            p = audio_matcher.film_presence(path, samples, sr, pred, lo=max(-reach, -pred),
+                                            hi=reach, heard=heard)
             if _resumable(p) and abs(p.shift) <= WATCH_RESUME_AGREE:
                 if t0 - cand[1] >= WATCH_RESUME_GAP:
                     # two looks, apart enough to hear different sound,
@@ -987,23 +1030,28 @@ class SyncController:
                     return self._watch_resume(state, pred + p.shift, t0,
                                               "the film's sound is back")
                 return None                  # agrees, too soon to count as a second
-        best = None
-        # back where it stopped: the resume can be anywhere in the look
-        near = audio_matcher.film_presence(
-            path, samples, sr, state["pp"], lo=-(WATCH_LOOK + WATCH_NEAR_BACK),
-            hi=WATCH_NEAR_AHEAD, heard=heard)
-        if _resumable(near):
-            best = (near, state["pp"])
-        # or where it would be had it played on: a "pause" that was a
-        # stretch of talk-over the looks could not hear through
+        # back where it stopped (the resume can be anywhere in the look), and
+        # where it would be had it played on: a "pause" that was a stretch of
+        # talk-over the looks could not hear through, or Twitch rejoining
+        # live after an ad. Close together, one look covers both, so each
+        # spot's alignment is weighed against the other's
+        pp = state["pp"]
+        looks = [(pp, -(WATCH_LOOK + reach), reach)]
         if state["heard"] is not None:
             hf, ht = state["heard"]
             cont = hf + (t0 - ht)
             state["cont"] = cont
-            if cont - state["pp"] > WATCH_NEAR_AHEAD + WATCH_LOOK:
-                p2 = audio_matcher.film_presence(path, samples, sr, cont, heard=heard)
-                if _resumable(p2) and (best is None or p2.ncc > best[0].ncc):
-                    best = (p2, cont)
+            if abs(cont - pp) <= 2 * reach:
+                looks = [(pp, min(-(WATCH_LOOK + reach), cont - pp - reach),
+                          max(reach, cont - pp + reach))]
+            elif cont > pp:
+                looks.append((cont, -WATCH_REJOIN_REACH, WATCH_REJOIN_REACH))
+        best = None
+        for at, lo, hi in looks:
+            p = audio_matcher.film_presence(path, samples, sr, at, lo=max(lo, -at), hi=hi,
+                                            heard=heard)
+            if _resumable(p) and (best is None or p.ncc > best[0].ncc):
+                best = (p, at)
         if best is not None:
             p, at = best
             where = at + p.shift         # the film time the stream carried at t0
