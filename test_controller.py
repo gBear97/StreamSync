@@ -1258,12 +1258,15 @@ def test_watch_pauses_and_resumes():
     watch(ctl, clock, 1.0, [(0.0, stop)], state=state)
     got = drain(q)
     assert not player.playing, "the film played on after the stream paused"
-    assert ("swap", True, "pause with the stream: the film's sound stopped") in got
+    assert not [e for e in got if e[0] == "swap"], \
+        "the stream's window came forward before the pause had lasted"
     assert [e[2] for e in got if e[0] == "watch"] == ["Stream paused"]
     took = player.anchor[1] - paused_at["t"]
     assert took <= 0.35, f"balanced paused {took:.2f} s after the stream did"
     watch(ctl, clock, 10.0, state=state)           # the streamer is away a while
     assert not player.playing
+    shown = [e for e in drain(q) if e[0] == "swap"]
+    assert shown == [("swap", True, "pause with the stream: the film's sound stopped")], shown
     back = {}
 
     def resume():
@@ -1279,6 +1282,50 @@ def test_watch_pauses_and_resumes():
     assert came <= 0.45, f"the resume took {came:.2f} s: two looks 0.3 s apart should do"
     print(f"watcher: paused {took:.1f} s after the stream, played on in place "
           f"{came:.1f} s after its return")
+
+
+def test_watch_shows_the_stream_only_for_a_pause_that_lasts():
+    # a pause over within WATCH_SWAP_HOLD - a voice hiding the film for a
+    # second, a stall - leaves the windows as they are: live, each one
+    # flashed the browser forward and back
+    hold = controller.WATCH_SWAP_HOLD
+    ctl, stream, player, clock, q, state = watching()
+    drain(q)
+    watch(ctl, clock, 1.5, [(0.0, stream.pause), (1.0, stream.play)], state=state)
+    got = drain(q)
+    assert in_sync(player, stream), "the film did not play on after a 1 s stop"
+    assert [e[1]["source"] for e in got if e[0] == "synced"] == ["resume"], got
+    assert [e[1] for e in got if e[0] == "swap"] == [False], \
+        "a 1 s pause brought the stream's window forward"
+    watch(ctl, clock, hold + 1.0, state=state)     # ...and none comes later
+    assert not [e for e in drain(q) if e[0] == "swap"]
+    # one that lasts brings it forward once, WATCH_SWAP_HOLD after the pause
+    stream.pause()
+    watch(ctl, clock, 0.5, state=state)
+    assert not player.playing
+    paused = player.anchor[1]
+    assert not [e for e in drain(q) if e[0] == "swap"]
+    shown_at = None
+    while clock.now - paused < hold + 1.0 and shown_at is None:
+        watch(ctl, clock, 0.1, state=state)
+        if [e for e in drain(q) if e[0] == "swap" and e[1] is True]:
+            shown_at = clock.now - paused
+    assert shown_at is not None and hold <= shown_at <= hold + 0.3, shown_at
+    watch(ctl, clock, 5.0, state=state)
+    assert not [e for e in drain(q) if e[0] == "swap"], "sent for the stream's window twice"
+    # played by hand before it is due: the pause is over, nothing is sent
+    ctl, stream, player, clock, q, state = watching()
+    stream.pause()
+    watch(ctl, clock, 1.0, state=state)
+    assert not player.playing
+    drain(q)
+    player.anchor, player.playing = (player.pos(), clock()), True   # Play pressed
+    watch(ctl, clock, hold + 1.0, state=state)
+    assert state["mode"] == "override"
+    assert not [e for e in drain(q) if e[0] == "swap" and e[1] is True], \
+        "the stream's window came forward over a film the user had played"
+    print(f"watcher: a 1 s pause leaves the windows alone; one that lasts shows the "
+          f"stream {shown_at:.1f} s in, once; not after a hand on Play")
 
 
 def test_watch_holds_against_a_voice():
@@ -1463,7 +1510,7 @@ def test_watch_starts_from_the_sync():
     resumed = [e[1] for e in got if e[0] == "synced"]
     assert resumed and resumed[-1]["source"] == "resume"
     took = [e[1] for e in got if e[0] == "swap"]
-    assert took == [True, False], took
+    assert took == [False], took     # over too soon to show the stream for
     print("watcher: a film 3 s behind its sync pauses once and is found where the "
           "sync says the stream is by now, within a second")
 
@@ -1740,6 +1787,7 @@ def main():
     test_inexact_sync_made_exact_later()
     test_watch_waits_for_a_sync()
     test_watch_pauses_and_resumes()
+    test_watch_shows_the_stream_only_for_a_pause_that_lasts()
     test_watch_holds_against_a_voice()
     test_watch_notices_a_stop_through_a_voice()
     test_watch_follows_a_resume_past_the_first_look()

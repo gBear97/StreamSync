@@ -157,6 +157,15 @@ WATCH_FAR_EVERY = ((30.0, 2.0), (120.0, 5.0), (math.inf, 15.0))  # (paused under
 # out what the first sync decoded. After an ad of 30 s or more, a stream
 # back beyond the close looks' reach then went unfound until it was done.
 WATCH_FAIL_SHOW = 10       # looks in a row that could not be taken before the line says so
+# A pause the watcher makes brings the stream's window forward only once it
+# has lasted this long. Most of its pauses are over sooner: a streamer
+# talking over the film hides it for a second, the stream stalls for a
+# moment, and each one flashed the browser forward and back (and took the
+# film out of fullscreen). On the 2026-11-08 live test, 32 of the 37 pauses
+# the Mac made and played on from were over within 2 s, and 39 of the PC's
+# 44 - the Mac's 16 false ones (0.5-1.9 s each) all among them; the 77 s
+# stop was not. A real stop shows the streamer this much later.
+WATCH_SWAP_HOLD = 2.0
 
 # How quickly it pauses (Settings). A look reads heard at or above `heard`,
 # missing under `missing`, unsure between; the film pauses after
@@ -809,7 +818,7 @@ class SyncController:
         return {"mode": "idle", "missing": 0, "not_heard": 0, "heard": None,
                 "stop_at": None, "drift": [], "cand": None, "shown": None,
                 "token": 0, "far_busy": False, "whole_busy": False, "far_hit": None,
-                "far_n": 0, "fails": 0, "fail_sig": None, "fail_n": 0}
+                "far_n": 0, "fails": 0, "fail_sig": None, "fail_n": 0, "swap_at": None}
 
     def _watch_show(self, state, key):
         if state["shown"] != key:
@@ -820,7 +829,7 @@ class SyncController:
         """Into `mode`, with every streak over. The token moves on, so a
         wide search still running for the last pause finds nothing."""
         state.update(mode=mode, missing=0, not_heard=0, cand=None, far_hit=None,
-                     token=state["token"] + 1)
+                     token=state["token"] + 1, swap_at=None)
         state["drift"] = []
 
     def _watch_idle(self, state, why):
@@ -979,9 +988,11 @@ class SyncController:
         # film from before the stop: a look or a wide search over it would
         # "find" the stream where it was, and play the film while the
         # stream stays paused. Only what was heard after counts.
+        # The stream's window comes forward only if the pause lasts
+        # (WATCH_SWAP_HOLD): _watch_paused sends for it.
         state.update(gen=self._gen, pp=pp, paused_at=now, far_next=now + 1.0, far_n=0,
-                     quiet_from=state["stop_t0"] + WATCH_LOOK)
-        self.q.put(("swap", True, "pause with the stream: the film's sound stopped"))
+                     quiet_from=state["stop_t0"] + WATCH_LOOK,
+                     swap_at=now + WATCH_SWAP_HOLD)
         self._watch_show(state, "paused")
         diagnostics.log(f"watch: paused - the film's sound is missing from the stream near "
                         f"{fmt_time(pp)} (ncc {p.ncc:.2f}, film {p.level_db:+.0f} dB, "
@@ -999,6 +1010,10 @@ class SyncController:
             if resumed is not None:
                 return resumed
         now = self._now()
+        if state["swap_at"] is not None and now >= state["swap_at"]:
+            # still paused: a stop worth showing the streamer for
+            state["swap_at"] = None
+            self.q.put(("swap", True, "pause with the stream: the film's sound stopped"))
         if now >= state["far_next"] and not state["far_busy"]:
             self._watch_far_start(state, now)
         return WATCH_TICK

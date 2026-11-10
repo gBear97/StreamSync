@@ -332,6 +332,12 @@ browser goes back and the film comes back where it was: the same place
 and size, maximized if it was, and fullscreen restored if it was
 fullscreen. A film window you closed or minimized stays that way.
 
+A pause that Pause with the stream makes brings the browser forward only
+once it has lasted 2 seconds. Most of its pauses are shorter - a streamer
+talking over the film for a moment, a stall in the stream - and the film
+simply holds for a second and plays on, with the windows left alone. A
+pause you make yourself shows the stream at once.
+
 - **Windows**: pick the browser window under **Stream window** (Refresh
   lists open windows; *Automatic* picks a Twitch or Kick window, or the
   browser window if only one is open). The window is restored, then
