@@ -34,6 +34,13 @@ from version import __version__
 
 DEFAULT_MIC = "Default microphone"     # the mic pick that means mic_name=None
 SCROLL_STEP = 20                       # design px: Settings' scroll unit, wheel and focus alike
+# Settings' Pause with the stream: controller.WATCH_RULES, slowest first
+WATCH_RULE_LABELS = {
+    "steady": "Steady - fewest false pauses",
+    "balanced": "Balanced - about a second",
+    "fast": "Fast - under a second",
+    "instant": "Instant - at once, stutters with talk-over",
+}
 
 
 def _bg(parent):
@@ -334,8 +341,16 @@ class SettingsDialog(_Dialog):
             field.entry.bind("<KP_Enter>", lambda e, f=apply: f(True), add="+")
             field.entry.bind("<FocusOut>", lambda e, f=apply: f(False), add="+")
 
-        widgets.Check(sec, "Follow the stream's pauses", app.follow_var,
-                      command=app._on_auto_toggle).pack(anchor="w", pady=(px(gap), 0))
+        _label(sec, "Pause with the stream", 14, True).pack(anchor="w", pady=(px(gap), 0))
+        self.rule_select = widgets.Select(
+            sec, app.watch_rule_var, values=list(WATCH_RULE_LABELS),
+            label_for=lambda v: WATCH_RULE_LABELS.get(v, v), command=app._on_watch_rule,
+            height=34, width=300)
+        self.rule_select.pack(anchor="w", pady=(px(6), 0))
+        _label(sec, "How soon the film pauses once the stream stops carrying its sound. "
+               "Faster rules also pause for a moment now and then while the streamer "
+               "talks over the film.", 12, fg=theme.MUTED, wrap=inner_w).pack(
+            anchor="w", pady=(px(6), 0))
         widgets.Check(sec, "Show the stream while the film is paused", app.swap_var,
                       command=self._swap_changed).pack(anchor="w", pady=(px(gap), 0))
         row = _frame(sec)
@@ -1379,7 +1394,8 @@ def _gallery(argv=None):
             self._update_line = "StreamSync 1.1.0 is up to date."
             self.player_var = tk.StringVar(root, "embedded")
             self.mute_var = tk.BooleanVar(root, True)
-            self.follow_var = tk.BooleanVar(root, True)
+            self.watch_var = tk.BooleanVar(root, True)
+            self.watch_rule_var = tk.StringVar(root, "balanced")
             self.interval_var = tk.IntVar(root, 30)
             self.swap_var = tk.BooleanVar(root, True)
             self.device_var = tk.StringVar(root, "(default) Speakers")

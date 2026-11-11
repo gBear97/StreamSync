@@ -144,11 +144,79 @@ def main():
         "one second is too little to refine"
     print("refine: within half a millisecond; nothing from noise or too little")
 
+    presence(tmp, clip)
+    survey(tmp)
     quiet_scene(tmp)
     dts_core(tmp, clip, feats)
     chunk_boundary(clip)
     long_film_retries()
     print("AUDIO MATCHER TEST PASSED")
+
+
+def presence(tmp, clip):
+    """film_presence, the look Pause with the stream takes several times a
+    second: heard where the stream carries the film (with how far off the
+    film placed it), not heard over noise or silence, and "quiet" where the
+    film's own track has nothing to hear."""
+    rng = np.random.default_rng(11)
+    at = 61.3
+    look = audio_matcher.decode_audio(clip, at, 2.0)[:int(0.6 * SR)]   # it decodes 1 s or more
+    voice = np.convolve(rng.standard_normal(look.size), np.hamming(65), "same")
+    voice *= 0.5 * np.sqrt((look * look).mean()) / (np.sqrt((voice * voice).mean()) + 1e-12)
+    stream = audio_matcher.resample(look + voice.astype(np.float32), SR, 48000)
+    for placed, want in ((at, 0.0), (at - 0.25, 0.25), (at + 0.3, -0.3)):
+        p = audio_matcher.film_presence(clip, stream, 48000, placed)
+        print(f"presence, film placed {want:+.2f} s off: {p.state}, shift {p.shift:+.3f} s, "
+              f"ncc {p.ncc:.2f}, clear {p.clear:.2f}")
+        assert p.state == "heard" and abs(p.shift - want) < 0.03, p
+        # the film's sound makes one sharp peak, standing clear of the rest
+        assert p.clear >= 0.3, p
+    noise = (0.1 * rng.standard_normal(stream.size)).astype(np.float32)
+    p = audio_matcher.film_presence(clip, noise, 48000, at)
+    assert p.state != "heard", f"noise was heard as the film: {p}"
+    assert p.clear < 0.3, f"noise stood clear as the film does: {p}"
+    p = audio_matcher.film_presence(clip, np.zeros_like(stream), 48000, at)
+    assert p.state == "missing", f"digital silence: {p}"
+    # a film with a silent stretch: nothing to listen for there
+    x = np.zeros(int(40 * SR))
+    x[:] = 0.3 * rng.standard_normal(x.size)
+    x[int(15 * SR):int(25 * SR)] = 0.0
+    wav = os.path.join(tmp, "gap.wav")
+    with wave.open(wav, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(SR)
+        f.writeframes((x * 32767).astype(np.int16).tobytes())
+    p = audio_matcher.film_presence(wav, noise, 48000, 19.0)
+    assert p.state == "quiet", f"the film's silent stretch was judged: {p}"
+    print("presence: heard and placed within 30 ms, standing clear; noise not heard "
+          "nor clear; silence missing; a silent stretch of film quiet")
+
+
+def survey(tmp):
+    """survey_typical: a film whose opening minute is 30 dB under the rest
+    takes its typical level from the rest once surveyed - judged on its
+    first block alone, nearly all of it would pass for loud."""
+    rng = np.random.default_rng(5)
+    x = 0.3 * rng.standard_normal(int(200 * SR))
+    x[:int(60 * SR)] *= 10 ** (-30 / 20)
+    wav = os.path.join(tmp, "quiet-opening.wav")
+    with wave.open(wav, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(SR)
+        f.writeframes((np.clip(x, -1, 1) * 32767).astype(np.int16).tobytes())
+    audio_matcher.film_block(wav, 0.0)
+    first = audio_matcher.typical_level(wav)
+    audio_matcher.survey_typical(wav)
+    surveyed = audio_matcher.typical_level(wav)
+    loud = audio_matcher.film_block(wav, 90.0)
+    lv = loud.level_db
+    rest = float(np.median(lv[lv > lv.max() - audio_matcher.PRESENCE_LIVE_DB]))
+    print(f"survey: typical level {first:.1f} dB from the first block, {surveyed:.1f} dB "
+          f"surveyed (the film's loud part: {rest:.1f} dB)")
+    assert rest - first > 25, (first, rest)
+    assert abs(surveyed - rest) < 3, (surveyed, rest)
 
 
 def quiet_scene(tmp):

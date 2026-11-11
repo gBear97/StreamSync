@@ -456,14 +456,14 @@ try:
     diagnostics.LOG_DIR = tmp
     diagnostics.LOG_FILE = os.path.join(tmp, "config-saves.log")
     ctl = controller.SyncController(queue.Queue(), None)
-    ctl.auto_enabled, ctl.auto_follow = True, False
+    ctl.auto_enabled, ctl.watch_enabled = True, False
 
     controller.CONFIG_PATH = Path(tmp) / "streamsync.json"
     ctl.save_config({"hint": ""})
     ok("the settings were written",
        controller.CONFIG_PATH.read_text().startswith("{"))
     ok("a config save is logged, with the auto arming flags",
-       "config saved (auto=True follow=False)" in read_log())
+       "config saved (auto=True pause_with_stream=False rule=balanced)" in read_log())
 
     controller.CONFIG_PATH = Path(tmp) / "no-such-folder" / "streamsync.json"
     try:

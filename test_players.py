@@ -1067,6 +1067,34 @@ def main():
     assert 0.22 < p._stall < 0.38, p._stall
     mp.stop()
 
+    # 2b. a first seek that takes 3-5 s to play on, as a film opening cold
+    # did on the 2026-11-04 live test (a 48 GB remux): waited out and put
+    # right. The old 3 s wait gave up and left the film 3 s behind.
+    p, mp = make(stall=4.0, seed=4)
+    first_set_time = mp.set_time
+
+    def set_time(ms):
+        first_set_time(ms)
+        mp.stall = 0.1                     # warm now: later seeks are quick
+    mp.set_time = set_time
+    import diagnostics
+    logged, real_log = [], diagnostics.log
+    diagnostics.log = lambda message, echo=True: logged.append(message)   # not the user's log
+    try:
+        c = time.perf_counter()
+        p.sync_seek(500.0, c, 0.0)
+        wait_done(p, timeout=40)
+        time.sleep(0.3)
+    finally:
+        diagnostics.log = real_log
+    now = time.perf_counter()
+    err = mp.truth(now) - (500.0 + now - c)
+    print(f"sync through a slow first seek (3-5 s to play on): error {1000 * err:+.0f} ms; "
+          f"logged {logged}")
+    assert abs(err) < 0.03, err
+    assert any("a seek took" in m for m in logged), logged
+    mp.stop()
+
     # 3. a nudge moves the picture by what it says
     p, mp = make(stall=0.1, seed=2)
     now = time.perf_counter()
