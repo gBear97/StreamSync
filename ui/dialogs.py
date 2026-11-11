@@ -36,7 +36,7 @@ DEFAULT_MIC = "Default microphone"     # the mic pick that means mic_name=None
 SCROLL_STEP = 20                       # design px: Settings' scroll unit, wheel and focus alike
 # Settings' Pause with the stream: controller.WATCH_RULES, slowest first
 WATCH_RULE_LABELS = {
-    "steady": "Steady - fewest false pauses",
+    "steady": "Steady - few false pauses, can miss stops",
     "balanced": "Balanced - about a second",
     "fast": "Fast - under a second",
     "instant": "Instant - at once, stutters with talk-over",

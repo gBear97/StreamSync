@@ -336,6 +336,11 @@ The false pauses go from a streamer 5 dB quieter than the film to one
 by mistake. A stream you mute sounds the same as a paused one, so the
 film pauses then too.
 
+Steady has a price the table doesn't show. It waits for three listens in
+a row that miss the film outright, and a streamer who talks through the
+pause rarely gives it those: in live tests it took up to 35 s to notice
+such a stop. Balanced noticed the same stops within a few seconds.
+
 ## See the streamer during pauses
 
 With **Settings > Show the stream while the film is paused** on, a
