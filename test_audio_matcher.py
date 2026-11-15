@@ -145,6 +145,7 @@ def main():
     print("refine: within half a millisecond; nothing from noise or too little")
 
     presence(tmp, clip)
+    centre(tmp)
     survey(tmp)
     quiet_scene(tmp)
     dts_core(tmp, clip, feats)
@@ -191,6 +192,190 @@ def presence(tmp, clip):
     assert p.state == "quiet", f"the film's silent stretch was judged: {p}"
     print("presence: heard and placed within 30 ms, standing clear; noise not heard "
           "nor clear; silence missing; a silent stretch of film quiet")
+
+
+def _speech(rng, n, sr):
+    """Speech-like sound: syllables of a voiced harmonic stack at a random
+    pitch with a breath of band noise, words and pauses between them."""
+    x = np.zeros(n)
+    i = 0
+    while i < n:
+        i += int(rng.uniform(0.05, 0.3) * sr) if rng.random() < 0.8 else int(rng.uniform(0.5, 1.5) * sr)
+        m = int(rng.uniform(0.15, 0.4) * sr)
+        if i + m > n:
+            break
+        t = np.arange(m) / sr
+        f0 = rng.uniform(100.0, 220.0)
+        tone = sum(np.sin(2 * np.pi * f0 * h * t + rng.uniform(0, 6.3)) / h
+                   for h in range(1, int(3000.0 / f0)))
+        breath = np.convolve(rng.standard_normal(m), np.hanning(9), "same") * 0.3
+        env = np.sin(np.pi * np.arange(m) / m) ** 0.7
+        x[i:i + m] += (tone + breath) * env
+        i += m
+    return x / (np.abs(x).max() + 1e-12)
+
+
+def _music(rng, n, sr):
+    """Music-like sound: two random tones every quarter second, as render_clip."""
+    x = np.zeros(n)
+    seg = int(0.25 * sr)
+    tt = np.arange(seg) / sr
+    ramp = np.minimum(1.0, np.minimum(np.arange(seg), np.arange(seg)[::-1]) / (0.01 * sr))
+    for s in range(n // seg):
+        for f in np.exp(rng.uniform(np.log(120.0), np.log(5500.0), size=2)):
+            x[s * seg:(s + 1) * seg] += np.sin(2 * np.pi * f * tt) * ramp
+    return x / (np.abs(x).max() + 1e-12)
+
+
+def _write_wav(path, chans, sr):
+    x = np.stack(chans, axis=1)
+    with wave.open(path, "wb") as f:
+        f.setnchannels(x.shape[1])
+        f.setsampwidth(2)
+        f.setframerate(sr)
+        f.writeframes((np.clip(x, -1, 1) * 32767).astype(np.int16).tobytes())
+
+
+def centre(tmp):
+    """A 5.1 film is heard by its centre where the stream's copy has its
+    music elsewhere: dialogue in the centre, music in front left and right,
+    and a stream that carries the same dialogue over the music moved 7 s.
+    decode_presence gives the mix exactly as decode_audio does, and the
+    centre on its own; a stereo or mono file has no centre to give."""
+    sr = 48000
+    rng = np.random.default_rng(21)
+    n = int(90 * sr)
+    talk, music, amb = _speech(rng, n, sr), _music(rng, n, sr), rng.standard_normal(n)
+    FL = 0.35 * music + 0.02 * amb
+    FR = 0.35 * np.roll(music, int(0.013 * sr)) + 0.02 * np.roll(amb, 97)
+    FC = 0.5 * talk
+    SL, SR_ = 0.05 * np.roll(amb, 1013), 0.05 * np.roll(amb, 2029)
+    wav = os.path.join(tmp, "six.wav")
+    _write_wav(wav, [FL, FR, FC, np.zeros(n), SL, SR_], sr)
+    film = os.path.join(tmp, "six.mkv")
+    ff = imageio_ffmpeg.get_ffmpeg_exe()
+    subprocess.run([ff, "-hide_banner", "-y", "-i", wav, "-af", "aformat=channel_layouts=5.1(side)",
+                    "-c:a", "flac", film], check=True, capture_output=True)
+    stereo, mono = os.path.join(tmp, "two.mkv"), os.path.join(tmp, "one.mkv")
+    for out, ac in ((stereo, "2"), (mono, "1")):
+        subprocess.run([ff, "-hide_banner", "-y", "-i", film, "-ac", ac, "-c:a", "flac", out],
+                       check=True, capture_output=True)
+    os.remove(wav)
+
+    mix, cen = audio_matcher.decode_presence(film, 20.0, 30.0)
+    assert np.array_equal(mix, audio_matcher.decode_audio(film, 20.0, 30.0)), \
+        "decode_presence's mix differs from decode_audio's"
+    want = audio_matcher.resample(FC[20 * sr:50 * sr], sr, SR)
+    k = min(want.size, cen.size)
+    r = float(np.corrcoef(cen[:k], want[:k])[0, 1])
+    r_mix = float(np.corrcoef(cen[:k], mix[:k])[0, 1])
+    print(f"centre: decoded centre against the film's FC r {r:.3f}, against the mix {r_mix:.3f}")
+    assert r > 0.99 and r_mix < 0.9, (r, r_mix)
+    # a lossy 5.1 track whose centre is empty decodes it to faint dither: no centre either
+    hollow_wav, hollow = os.path.join(tmp, "hollow.wav"), os.path.join(tmp, "hollow.ac3")
+    _write_wav(hollow_wav, [FL, FR, np.zeros(n), np.zeros(n), SL, SR_], sr)
+    subprocess.run([ff, "-hide_banner", "-y", "-i", hollow_wav, "-af",
+                    "aformat=channel_layouts=5.1(side)", "-c:a", "ac3", "-b:a", "448k", hollow],
+                   check=True, capture_output=True)
+    os.remove(hollow_wav)
+    for path in (stereo, mono, hollow):
+        m, c = audio_matcher.decode_presence(path, 20.0, 30.0)
+        assert c is None, f"{os.path.basename(path)} gave a centre"
+        assert np.array_equal(m, audio_matcher.decode_audio(path, 20.0, 30.0))
+    # a track the two-way decode can't give is decoded as before, the mix alone
+    real_both = audio_matcher._decode_both
+    audio_matcher._decode_both = lambda *a: np.zeros((0, 2), np.float32)
+    try:
+        m, c = audio_matcher.decode_presence(film, 20.0, 30.0)
+    finally:
+        audio_matcher._decode_both = real_both
+    assert c is None and np.array_equal(m, mix), "no fallback to the mix alone"
+
+    # the stream: the film's dialogue as it is, its music 7 s later
+    moved = np.roll(music, int(7.0 * sr))
+    stream_full = FC + 0.707 * 0.35 * (moved + np.roll(moved, int(0.013 * sr)))
+    same_full = FC + 0.707 * (FL + FR) + 0.5 * (SL + SR_)
+    # syllables to listen at: 0.6 s looks whose centre has speech
+    looks, t = [], 15.0
+    while len(looks) < 12 and t < 80.0:
+        seg = talk[int(t * sr):int((t + 0.6) * sr)]
+        if np.mean(np.abs(seg) > 0.05) > 0.5:
+            looks.append(t)
+            t += 1.3
+        t += 0.1
+    assert len(looks) >= 8, looks
+    got = {"centre": 0, "mix": 0}
+    heard_51 = heard_two = 0
+    ncc_51, ncc_two = [], []
+    for at in looks:
+        cap = stream_full[int(at * sr):int((at + 0.6) * sr)].astype(np.float32)
+        p = audio_matcher.film_presence(film, cap, sr, at)
+        q = audio_matcher.film_presence(stereo, cap, sr, at)
+        got[p.by] += 1
+        heard_51 += p.state == "heard"
+        heard_two += q.state == "heard"
+        ncc_51.append(p.ncc)
+        ncc_two.append(q.ncc)
+        assert p.centre is not None and q.centre is None and q.by == "mix", (p, q)
+        assert p.ncc >= q.ncc - 0.02, (p, q)
+        if p.state == "heard":
+            assert abs(p.shift) < 0.03, p
+    m51, m2 = float(np.median(ncc_51)), float(np.median(ncc_two))
+    print(f"centre: music moved 7 s - the 5.1 file heard {heard_51} of {len(looks)} looks "
+          f"(by centre {got['centre']}, mix {got['mix']}; median ncc {m51:.2f}), "
+          f"its stereo copy {heard_two} (median ncc {m2:.2f})")
+    assert heard_51 >= len(looks) - 1 and got["centre"] >= len(looks) - 2, (heard_51, got)
+    assert heard_two < heard_51 and m51 - m2 > 0.15, (heard_two, m51, m2)
+    # where the stream's copy is the file's own, the mix answers as well as ever
+    p = audio_matcher.film_presence(film, same_full[int(looks[0] * sr):int((looks[0] + 0.6) * sr)]
+                                    .astype(np.float32), sr, looks[0])
+    assert p.state == "heard" and p.ncc > 0.7 and abs(p.shift) < 0.03, p
+    noise = (0.1 * rng.standard_normal(int(0.6 * sr))).astype(np.float32)
+    p = audio_matcher.film_presence(film, noise, sr, looks[0])
+    assert p.state != "heard" and p.clear < 0.3, f"noise was heard as the film: {p}"
+    # centre=False: the mix alone, exactly as a film without a centre
+    cap = stream_full[int(looks[0] * sr):int((looks[0] + 0.6) * sr)].astype(np.float32)
+    p, q = (audio_matcher.film_presence(film, cap, sr, looks[0], centre=False),
+            audio_matcher.film_presence(film, cap, sr, looks[0]))
+    assert p.by == "mix" and p.centre is None and q.centre is not None, (p, q)
+    assert abs(q.ncc - max(p.ncc, q.centre.ncc)) < 1e-9, (p, q)    # p.ncc is the mix's
+    # ...and so film_presence answers: its look's mix and centre stood in for
+    real_look, L = audio_matcher._look, audio_matcher.Look
+    for mix_ncc, cen_ncc, want in ((0.10, 0.20, "missing"), (0.10, 0.31, "heard"),
+                                   (0.20, 0.10, "unsure")):
+        answers = [L(mix_ncc, 0.01, 0.5), L(cen_ncc, 0.02, 0.5)]
+        audio_matcher._look = lambda W, C, s_lo: answers.pop(0)
+        try:
+            p = audio_matcher.film_presence(film, cap, sr, looks[0])
+        finally:
+            audio_matcher._look = real_look
+        assert p.state == want and p.mix.ncc == mix_ncc and p.centre.ncc == cen_ncc, (p, want)
+        assert p.by == ("centre" if cen_ncc > mix_ncc else "mix")
+        m = audio_matcher.mix_only(p)
+        assert m.ncc == mix_ncc and m.centre is None and m.by == "mix", m
+    # a DTS track with no core: the two-way decode is tried again in full
+    real_both, tried = audio_matcher._decode_both, []
+
+    def both(path, t0, dur, sr_, opts):
+        tried.append(tuple(opts))
+        return np.zeros((0, 2), np.float32) if opts else real_both(path, t0, dur, sr_, opts)
+    audio_matcher._decode_both = both
+    try:
+        m, c = audio_matcher.decode_presence(film, 20.0, 30.0)
+    finally:
+        audio_matcher._decode_both = real_both
+    assert tried == [audio_matcher.DTS_CORE_ONLY, ()] and c is not None and np.array_equal(m, mix), tried
+    # missing stays the mix's call unless the centre hears the film
+    L, st = audio_matcher.Look, audio_matcher._presence_state
+    for mix_ncc, cen_ncc, want in ((0.10, None, "missing"), (0.20, None, "unsure"),
+                                   (0.35, None, "heard"), (0.10, 0.20, "missing"),
+                                   (0.10, 0.31, "heard"), (0.20, 0.10, "unsure"),
+                                   (0.31, 0.05, "heard")):
+        got_state = st(L(mix_ncc, 0.0, 0.5), None if cen_ncc is None else L(cen_ncc, 0.0, 0.5),
+                       0.30, 0.15)
+        assert got_state == want, (mix_ncc, cen_ncc, got_state, want)
+    print("centre: heard by its centre through a different mix; the file's own mix still "
+          "heard; noise not; stereo and mono files have no centre; missing is the mix's call")
 
 
 def survey(tmp):

@@ -30,6 +30,7 @@ It talks to the shell only through the event queue, with
                          WATCH_LINES key, text the line to show for it
 """
 
+import collections
 import json
 import math
 import sys
@@ -166,6 +167,30 @@ WATCH_FAIL_SHOW = 10       # looks in a row that could not be taken before the l
 # 44 - the Mac's 16 false ones (0.5-1.9 s each) all among them; the 77 s
 # stop was not. A real stop shows the streamer this much later.
 WATCH_SWAP_HOLD = 2.0
+# A film with a centre channel of its own (5.1, 7.1) can be heard by its
+# centre alone, where films keep their dialogue (audio_matcher.film_presence):
+# the part any two copies of a film share, where their music and effects can
+# differ. The watcher starts on the mix alone, as for a stereo film, and
+# listens to the centre too - for the rest of the film - once the centre has
+# matched the stream clearly better than the mix on enough of its looks:
+# the stream's copy sounds different from this file.
+#   On the 2026-11-12 VOD (Following: the stream's copy had its music up to
+# 10 s elsewhere, cue by cue) that came at the first full count of looks,
+# 8-10% of them led by the centre, and a replay of the hour paused Balanced
+# 160-165 times against 202-216 on the mix alone - each one unwanted, as
+# the stream never stopped; 24-25 against 45-51 outside the stretches whose
+# music the stream had elsewhere. Heard by its centre from the start, a
+# copy that matched the file (the 2026-11-08 film class) noticed the
+# stream's end 0.6 s later, as the centre - speech - half-matches a
+# streamer's voice; counted this way, that night never came near (at most
+# 0.4% of a count's looks), and its replay was look for look as before. A
+# voice alone over a stopped stream, laid on either film, would make about
+# 1%. Once the centre is listened to, a stop the streamer talks through is
+# noticed a little later (typically 0.1-0.25 s; on simulated stops over the
+# copy that differed, 14% instead of 9% took over 5 s).
+WATCH_CENTRE_LOOKS = 800     # playing looks counted (2 min or more: 2.2 min into that replay),
+WATCH_CENTRE_LEAD = 0.15     # ...where the centre's ncc beats the mix's by more than this;
+WATCH_CENTRE_SHARE = 0.05    # over this share of them, the centre is listened to as well
 
 # How quickly it pauses (Settings). A look reads heard at or above `heard`,
 # missing under `missing`, unsure between; the film pauses after
@@ -321,6 +346,7 @@ class SyncController:
         # before any look of its own has heard the film can still look
         # where the stream would be had it played on
         self._stream_heard = None
+        self._centre_count = None    # the film whose centre is weighed, and how (_centre_look)
         self._surveyed = None        # the film whose typical level was surveyed
         self._prefetching = False
         self.relay_url = "ws://localhost:8765"
@@ -383,6 +409,7 @@ class SyncController:
         """Load `path` into the active player. VLCError propagates for the
         embedded player; external loads report through the queue."""
         self._lined_up = None          # a new film waits for its first sync
+        self._centre_count = None      # ...and is heard by its mix alone at first
         if self.player is self.embedded:
             self.embedded.load(path)
             # Named only once it holds: a load that raised used to leave
@@ -918,6 +945,11 @@ class SyncController:
         rule = WATCH_RULES[self.watch_rule]
         p = audio_matcher.film_presence(self.video_path, samples, sr, at,
                                         heard=rule["heard"], missing=rule["missing"])
+        p = self._centre_look(p, rule)
+        if state["mode"] == "override":
+            # the film heard again ends an override: a resume in all but
+            # name, judged as resume looks are, by the mix alone
+            p = audio_matcher.mix_only(p, rule["heard"], rule["missing"])
         self._watch_prefetch(at)
         if p.state == "quiet":
             state["missing"] = state["not_heard"] = 0
@@ -954,9 +986,66 @@ class SyncController:
             self._watch_pause(state, p)
         return WATCH_TICK
 
+    def _centre_look(self, p, rule):
+        """A playing look as the watcher takes it: the mix's alone
+        (audio_matcher.mix_only) until this film's centre has matched the
+        stream clearly better than its mix on enough looks - over
+        WATCH_CENTRE_SHARE of the last WATCH_CENTRE_LOOKS, by more than
+        WATCH_CENTRE_LEAD - and from then on, for as long as this film is
+        open, the better of the two (see WATCH_CENTRE_LOOKS). Looks the film
+        is quiet for, or the stream silent, count neither way."""
+        count = self._centre_count
+        if count is None or count["path"] != self.video_path:
+            count = self._centre_count = {"path": self.video_path, "on": False, "led": 0,
+                                          "looks": collections.deque()}
+        if count["on"]:
+            return p
+        if p.mix is not None and p.centre is not None:
+            looks = count["looks"]
+            led = p.centre.ncc - p.mix.ncc > WATCH_CENTRE_LEAD
+            looks.append(led)
+            count["led"] += led
+            if len(looks) > WATCH_CENTRE_LOOKS:
+                count["led"] -= looks.popleft()
+            share = count["led"] / WATCH_CENTRE_LOOKS
+            if len(looks) == WATCH_CENTRE_LOOKS and share > WATCH_CENTRE_SHARE:
+                count["on"] = True
+                looks.clear()
+                diagnostics.log(
+                    f"watch: this copy of the film sounds different from the stream's - its "
+                    f"dialogue (centre channel) matched clearly better than its mix on "
+                    f"{share:.0%} of {WATCH_CENTRE_LOOKS} looks; listening to it as well")
+                return p
+        return audio_matcher.mix_only(p, rule["heard"], rule["missing"])
+
+    def _centre_on(self):
+        """Whether the open film is heard by its centre as well (_centre_look)."""
+        count = self._centre_count
+        return count is not None and count["on"] and count["path"] == self.video_path
+
     def _watch_drift(self, state, p, at, t0):
         """A heard look off by more than DRIFT_TOLERANCE, the same way as
-        the looks just before it, moves the film there."""
+        the looks just before it, moves the film there.
+
+        Once a film is heard by its centre as well (_centre_look), drift is
+        judged by the centre's numbers alone, whichever sound answered the
+        look: the dialogue is where any copy of the film lines up. Its mix
+        can line up elsewhere - on the 2026-11-12 replay the file's music sat
+        a fraction of a second to seconds off the stream's, cue by cue - and
+        judged by whichever sound answered, the film was moved onto the
+        music and back again (30-31 corrections in a replay of that hour
+        against 16-22, 13-15 of them leaving it off the dialogue); judged by
+        the centre, 21-22 behind the centre's latch, 8-9 of them still
+        leaving the film off the dialogue for a few seconds, as many as by
+        the mix alone (8-11). A look whose centre doesn't hear the film
+        counts neither way, and so does one from a stretch whose centre is
+        silent."""
+        if p.centre is not None:
+            if p.centre.ncc < WATCH_RULES[self.watch_rule]["heard"]:
+                return
+            p = p._replace(ncc=p.centre.ncc, shift=p.centre.shift, clear=p.centre.clear)
+        elif self._centre_on():
+            return                       # no centre here to judge by, and the mix may be off
         if not _clear(p):
             return                       # might be a voice: neither for nor against
         if abs(p.shift) <= DRIFT_TOLERANCE:
@@ -973,7 +1062,7 @@ class SyncController:
         state["drift"] = []
         self._say(f"Pause with the stream: corrected {p.shift:+.2f} s drift.")
         diagnostics.log(f"watch: corrected {p.shift:+.3f} s drift at {fmt_time(where)} "
-                        f"(ncc {p.ncc:.2f})")
+                        f"(ncc {p.ncc:.2f}{', centre' if p.centre is not None else ''})")
         self.q.put(("synced", {"match": where, "at": t0, "trusted": True,
                                "applied": True, "source": "auto"}))
 
@@ -996,7 +1085,8 @@ class SyncController:
         self._watch_show(state, "paused")
         diagnostics.log(f"watch: paused - the film's sound is missing from the stream near "
                         f"{fmt_time(pp)} (ncc {p.ncc:.2f}, film {p.level_db:+.0f} dB, "
-                        f"rule {self.watch_rule})")
+                        f"rule {self.watch_rule}"
+                        + (f", centre {p.centre.ncc:.2f}" if p.centre is not None else "") + ")")
 
     def _watch_paused(self, state):
         hit = state["far_hit"]
@@ -1032,8 +1122,13 @@ class SyncController:
         that merely repeats the stream's sound nearby does not stand clear
         of the real one - nor, where the repeat is strong (a steady beat),
         does the real one, and the resume waits for a later look or a wide
-        search. Looks stop at the film's start. Returns watch_step's wait
-        once the film plays, else None."""
+        search. Looks stop at the film's start. They hear the film's mix
+        alone, even once the film is heard by its centre too while it plays
+        (_centre_look): a voice over a stopped stream is speech, as the
+        centre is. Over 3360 stops with streamers' and audiobook voices laid
+        on two films' pauses (20 hours), looks taking the better of the two
+        restarted the film 6 times, the mix alone 2 - as before. Returns
+        watch_step's wait once the film plays, else None."""
         path = self.video_path
         heard = max(WATCH_RULES[self.watch_rule]["heard"], WATCH_RESUME_HEARD)
         reach = WATCH_RESUME_REACH
@@ -1044,7 +1139,7 @@ class SyncController:
             pred = cand[0] + (t0 - cand[1])
             # a look reaching back past the film's start would answer quiet
             p = audio_matcher.film_presence(path, samples, sr, pred, lo=max(-reach, -pred),
-                                            hi=reach, heard=heard)
+                                            hi=reach, heard=heard, centre=False)
             if _resumable(p) and abs(p.shift) <= WATCH_RESUME_AGREE:
                 if t0 - cand[1] >= WATCH_RESUME_GAP:
                     # two looks, apart enough to hear different sound,
@@ -1071,7 +1166,7 @@ class SyncController:
         best = None
         for at, lo, hi in looks:
             p = audio_matcher.film_presence(path, samples, sr, at, lo=max(lo, -at), hi=hi,
-                                            heard=heard)
+                                            heard=heard, centre=False)
             if _resumable(p) and (best is None or p.ncc > best[0].ncc):
                 best = (p, at)
         if best is not None:
