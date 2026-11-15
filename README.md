@@ -306,6 +306,24 @@ says what it hears:
 - where the film has sound and the stream does not carry it, the film
   pauses (**Stream paused**), whatever the streamer is saying.
 
+If your copy's soundtrack is 5.1 or 7.1 and the stream's copy of the film
+sounds different from yours - another release, its music laid in a
+little differently - StreamSync notices after two or three minutes of the
+film and from then on also listens to your copy's centre channel on its
+own, where films keep their dialogue: the part two releases usually
+share. The film plays on when either matches the stream, and its drift is
+judged by the dialogue. In a replay of a movie-night VOD whose copy had
+its music up to 10 s away from the file's, cue by cue, the film paused
+about a fifth less often: 160-165 times in the hour instead of 202-216,
+every one of them a mistake, as the stream never stopped. About 2 such
+pauses a minute remain on a copy like that (2.4 in the replay, which
+pauses about a fifth more often than the app did live): a soundtrack that
+different is hard to follow. Once it listens to the centre, a stop the
+streamer talks through can take a little longer to notice, typically a
+quarter of a second, as the centre is speech, as a streamer's voice is. A copy that
+sounds like yours, and a stereo or mono one, is heard exactly as before:
+a replay of such a night came out the same, look for look.
+
 When the film's sound comes back, the film plays from exactly where the
 stream is, typically 0.6 to 1 s later. A streamer talking through his
 pause does not count as the film coming back, even where his voice
@@ -635,8 +653,17 @@ Step by step, with a first sync test: [MAC_FIRST_RUN.md](MAC_FIRST_RUN.md).
   side, for drift), from the film's audio decoded ahead in 60 s blocks,
   so a look costs a few milliseconds. The film's own level there says
   whether there is anything to hear; how many looks in a row may miss the
-  film before it pauses is the rule chosen in Settings. While paused it
-  listens for the film where the stream stopped, 2 s either side, and
+  film before it pauses is the rule chosen in Settings. A film with a
+  centre channel has it decoded too (one decode gives both), and each
+  playing look is also compared with the centre alone. Once the centre has
+  beaten the mix by more than 0.15 on over 5% of the last 800 playing
+  looks the film has sound for (the stream's copy sounds different), the
+  better of the two counts, for as long as that film stays open: a look
+  counts as missing the film only when the mix misses it and the centre
+  doesn't hear it either, and drift is measured on the centre (a look
+  whose centre doesn't hear the film moves nothing). While paused it
+  listens for the film's mix alone (a voice over a stopped stream is
+  speech, as the centre is) where the stream stopped, 2 s either side, and
   where it would be had it played on (a "pause" that was talk-over it
   could not hear through, or Twitch rejoining live after an ad), 3 s
   either side once the pause has gone on a few seconds. It plays the film

@@ -132,6 +132,65 @@ def _decode(path, t0, dur, sr, decoder_opts):
     return np.frombuffer(out.stdout, dtype=np.float32)
 
 
+# The film's centre channel, for Pause with the stream (film_presence). A
+# 5.1 or 7.1 track keeps the dialogue in its centre (FC) and the music and
+# effects mostly in the others - and those are what differs between two
+# releases of a film. On the 2026-11-12 VOD replay (Following, a Blu-ray's
+# 5.1 track against the stream's own copy) the dialogue lined up but the
+# music sat up to 10 s elsewhere, cue by cue, so looks at the mix did not
+# hear the film (ncc under 0.30) on nearly a third of them while it played
+# on. The centre carries the part both share.
+#
+# One ffmpeg run gives both: the mix through the conversion -ac 1 asks for
+# (aformat to mono takes swresample's default downmix, the one -ac 1 uses:
+# sample for sample the same as decode_audio), and the centre through pan.
+# Each branch resamples on its own: one aresample ahead of asplit is
+# negotiated down to mono for both, and the "centre" comes out as the mix.
+# -af rather than -filter_complex, so ffmpeg picks the audio track it picks
+# for decode_audio.
+_MIX_AND_CENTRE = (
+    "asplit[m][c];"
+    "[m]aresample=async=1:first_pts=0,"
+    "aformat=sample_fmts=flt:sample_rates={sr}:channel_layouts=mono[m1];"
+    "[c]pan=mono|c0=FC,aresample=async=1:first_pts=0,"
+    "aformat=sample_fmts=flt:sample_rates={sr}:channel_layouts=mono[c1];"
+    "[m1][c1]join=inputs=2:channel_layout=stereo")
+CENTRE_SILENT = 1e-4   # a centre whose samples never pass this is no centre at all (an
+                       # empty channel of a lossy track decodes to dither around 2e-5)
+
+
+def decode_presence(path, t0, dur, sr=SR):
+    """(mix, centre): float32 PCM of [t0, t0+dur] on the player timeline -
+    the mono mix exactly as decode_audio gives it, and the track's centre
+    channel on its own, or None where the track has no centre of its own:
+    stereo or quad (pan's FC is digital silence there), mono (ffmpeg's mono
+    is its centre, the mix itself), or a stretch whose centre is silent.
+    The DTS core-only first try and its fallback are decode_audio's; a
+    track the two-way decode can't give at all is decoded as before, the
+    mix alone (MatchError only if that fails too)."""
+    x = _decode_both(path, t0, dur, sr, DTS_CORE_ONLY)
+    if len(x) < sr:
+        x = _decode_both(path, t0, dur, sr, ())
+    if len(x) < sr:
+        return decode_audio(path, t0, dur, sr), None
+    mix, centre = np.ascontiguousarray(x[:, 0]), np.ascontiguousarray(x[:, 1])
+    if (float(np.abs(centre).max(initial=0.0)) <= CENTRE_SILENT
+            or np.array_equal(centre, mix)):
+        centre = None
+    return mix, centre
+
+
+def _decode_both(path, t0, dur, sr, decoder_opts):
+    """(frames, 2) float32: the mix, then the centre."""
+    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-nostats",
+           *decoder_opts, "-ss", f"{max(t0, 0.0):.3f}", "-i", path,
+           "-t", f"{dur:.3f}", "-vn", "-sn", "-af", _MIX_AND_CENTRE.format(sr=sr),
+           "-f", "f32le", "-"]
+    out = subprocess.run(cmd, capture_output=True, creationflags=_creationflags())
+    x = np.frombuffer(out.stdout, dtype=np.float32)
+    return x[:x.size // 2 * 2].reshape(-1, 2)
+
+
 def _band_mags(x, sr):
     """(T, N_BANDS) mean STFT magnitude per band, one row per HOP_S."""
     win = int(round(WIN_S * sr))
@@ -455,6 +514,20 @@ def _score_curve(W, C, w):
 # to listen for ("quiet"); where it has sound, the stream either carries
 # it ("heard", with how early or late) or does not ("missing") - whatever
 # the streamer is saying over it.
+#
+# A film with a centre channel of its own can be heard two ways at once:
+# its mix, and its centre alone (decode_presence), whichever the stream
+# matches better answering. The centre is the dialogue, the part any
+# release of the film shares; the mix covers what the centre leaves out -
+# music, effects, scenes nobody speaks in. On a stream whose copy of the
+# film has its music elsewhere (the 2026-11-12 replay) the centre hears the
+# film where the mix misses it; where the stream's copy matches the file
+# (the 2026-11-08 film class) the mix hears what the centre alone would
+# miss: judged by the centre alone, that night paused 7 times as often by
+# mistake. Whether the film's track is quiet here is the mix's to say, and
+# whether to listen to the centre at all the caller's (controller's
+# WATCH_CENTRE_LOOKS: only once the stream's copy proves to sound
+# different; mix_only gives a look as the mix alone answers it).
 
 PRESENCE_BLOCK_S = 60.0
 PRESENCE_STEP_S = 30.0
@@ -472,8 +545,9 @@ SURVEY_STRETCHES = 6       # survey_typical: stretches heard across the film...
 SURVEY_S = 20.0            # ...this long each,
 SURVEY_PACE = 0.5          # ...this many seconds apart
 
-Presence = collections.namedtuple("Presence", "state shift ncc level_db loud_frac clear",
-                                  defaults=(None,))
+Presence = collections.namedtuple(
+    "Presence", "state shift ncc level_db loud_frac clear by centre mix",
+    defaults=(None, None, None, None))
 Presence.__doc__ = """film_presence's answer.
 
 state      "quiet" (the film's track has nothing to hear here), or how the
@@ -491,24 +565,44 @@ loud_frac  share of the window's film frames within PRESENCE_QUIET_DB of
 clear      how far ncc stands above the best correlation more than
            PRESENCE_CLEAR_S from it. The film makes one sharp peak; a voice
            that happens to correlate makes several of a size. None when
-           quiet or silent."""
+           quiet or silent;
+by         which of the film's sounds answered: "mix", or "centre" where
+           the film has a centre of its own and the stream matched it
+           better. None when quiet or silent;
+centre     the centre's own Look (ncc, shift, clear) whether or not it
+           answered; None without a centre (or when quiet or silent);
+mix        the mix's own Look, likewise (None when quiet or silent)."""
+
+Look = collections.namedtuple("Look", "ncc shift clear")
+Look.__doc__ = "One sound of the film against the stream: best ncc, its shift, clear."
+
+
+def _block_feats(x):
+    """Band magnitudes of x and its features z-scored over the block (as
+    _file_features makes them)."""
+    bm = _band_mags(x, SR)
+    X = _shape(bm)
+    X -= X.mean(axis=0, keepdims=True)
+    X /= (X.std(axis=0, keepdims=True) + 1e-6)
+    return bm, X
 
 
 class _FilmBlock:
-    """One decoded stretch of a film: features z-scored over the block (as
-    _file_features makes them) and each frame's level in dB."""
+    """One decoded stretch of a film: the mix's features z-scored over the
+    block (as _file_features makes them), each frame's level in dB, and the
+    centre's features alone (None where decode_presence found no centre)."""
 
-    __slots__ = ("start", "feats", "level_db", "frames")
+    __slots__ = ("start", "feats", "level_db", "frames", "centre")
 
-    def __init__(self, start, x):
-        bm = _band_mags(x, SR)
-        X = _shape(bm)
-        X -= X.mean(axis=0, keepdims=True)
-        X /= (X.std(axis=0, keepdims=True) + 1e-6)
+    def __init__(self, start, x, centre=None):
+        bm, X = _block_feats(x)
         self.start = start
         self.feats = X
         self.level_db = 10.0 * np.log10((bm.astype(np.float64) ** 2).sum(axis=1) + 1e-20)
         self.frames = len(X)
+        self.centre = None
+        if centre is not None and centre.size == x.size:
+            self.centre = _block_feats(centre)[1]
 
 
 _blocks = collections.OrderedDict()
@@ -538,10 +632,10 @@ def film_block(path, start):
             _blocks.move_to_end(key)
             return _blocks[key]
     try:
-        x = decode_audio(path, start, PRESENCE_BLOCK_S)
+        x, centre = decode_presence(path, start, PRESENCE_BLOCK_S)
     except MatchError:
-        x = np.zeros(0, np.float32)     # past the film's end: no sound to hear
-    block = _FilmBlock(start, x) if x.size >= SR else None
+        x, centre = np.zeros(0, np.float32), None    # past the film's end: no sound to hear
+    block = _FilmBlock(start, x, centre) if x.size >= SR else None
     with _blocks_lock:
         _blocks[key] = block
         while len(_blocks) > PRESENCE_BLOCKS:
@@ -610,7 +704,7 @@ def typical_level(path):
 
 
 def film_presence(path, samples, sr, at, lo=-PRESENCE_SEARCH, hi=PRESENCE_SEARCH,
-                  heard=PRESENCE_HEARD, missing=PRESENCE_MISSING):
+                  heard=PRESENCE_HEARD, missing=PRESENCE_MISSING, centre=True):
     """Is the film's sound in `samples` (a stream recording) where the film
     says it should be? `at` is the film time samples[0] would carry if the
     stream were exactly where the film places it; the stream's sound is
@@ -622,7 +716,14 @@ def film_presence(path, samples, sr, at, lo=-PRESENCE_SEARCH, hi=PRESENCE_SEARCH
     it - paused under a voice, or an ad - under 0.30 in 92%. A streamer
     talking as loud as the film drags 13% of looks under 0.30 even though
     the film plays on: a single look cannot tell those apart, so the
-    caller decides from a run of them."""
+    caller decides from a run of them.
+
+    A film with a centre channel of its own is looked for in its mix and
+    in its centre alone, over the same reach, and the better match answers
+    (Presence.by; the centre's own numbers in Presence.centre) - unless
+    `centre` is False, when the mix alone does, as for a film without one.
+    The look is heard when either sound is; missing only when the mix
+    misses it and the centre doesn't hear it either (_presence_state)."""
     block = film_block(path, presence_block_start(at + lo + PRESENCE_SEARCH))
     if block is None or at + lo < 0:
         return Presence("quiet", None, 0.0, -math.inf, 0.0)
@@ -646,7 +747,46 @@ def film_presence(path, samples, sr, at, lo=-PRESENCE_SEARCH, hi=PRESENCE_SEARCH
         return Presence("quiet", None, 0.0, level, loud)
     if float(np.abs(samples).max(initial=0.0)) <= 1e-5:
         return Presence("missing", None, 0.0, level, loud)   # digital silence
-    ncc = _corr_scores(block.feats[i0 - s_lo:i0 + L + s_hi], C.feats, C.weights)
+    mix = _look(block.feats[i0 - s_lo:i0 + L + s_hi], C, s_lo)
+    cen = None
+    if centre and block.centre is not None:
+        cen = _look(block.centre[i0 - s_lo:i0 + L + s_hi], C, s_lo)
+    best, by = (cen, "centre") if cen is not None and cen.ncc > mix.ncc else (mix, "mix")
+    return Presence(_presence_state(mix, cen, heard, missing), best.shift, best.ncc,
+                    level, loud, best.clear, by, cen, mix)
+
+
+def mix_only(p, heard=PRESENCE_HEARD, missing=PRESENCE_MISSING):
+    """p as the film's mix alone answers it - as a film without a centre
+    would have been heard: the mix's Look and state, no centre."""
+    m = p.mix
+    if m is None:
+        return p
+    return p._replace(state=_presence_state(m, None, heard, missing), shift=m.shift,
+                      ncc=m.ncc, clear=m.clear, by="mix", centre=None)
+
+
+def _presence_state(mix, centre, heard, missing):
+    """A look's state from the mix's Look and the centre's (None without
+    one): heard when either reaches `heard`; missing when the mix is under
+    `missing` and the centre doesn't hear the film either; else unsure.
+    Missing stays the mix's call: a centre that merely half-matches - a
+    voice over a stopped stream is speech, as the centre is - would turn
+    the mix's misses into unsure ones, and the quick pause on a run of
+    misses would wait for the slow one on not hearing it."""
+    if mix.ncc >= heard or (centre is not None and centre.ncc >= heard):
+        return "heard"
+    if mix.ncc < missing:
+        return "missing"
+    return "unsure"
+
+
+def _look(W, C, s_lo):
+    """Capture C at every alignment within W (its first frame s_lo hops
+    before where the film placed it): the best ncc, its shift in seconds
+    (sub-hop, parabolic), and how clear it stands of the best alignment
+    more than PRESENCE_CLEAR_S away."""
+    ncc = _corr_scores(W, C.feats, C.weights)
     k = int(np.argmax(ncc))
     best = float(ncc[k])
     d = 0.0
@@ -655,10 +795,9 @@ def film_presence(path, samples, sr, at, lo=-PRESENCE_SEARCH, hi=PRESENCE_SEARCH
         den = a - 2 * b + c
         if abs(den) > 1e-12:
             d = float(np.clip(0.5 * (a - c) / den, -1.0, 1.0))
-    state = "heard" if best >= heard else ("missing" if best < missing else "unsure")
     far = np.abs(np.arange(len(ncc)) - k) * HOP_S > PRESENCE_CLEAR_S
     clear = best - float(ncc[far].max()) if far.any() else 1.0
-    return Presence(state, (k + d - s_lo) * HOP_S, best, level, loud, clear)
+    return Look(best, (k + d - s_lo) * HOP_S, clear)
 
 
 def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None):

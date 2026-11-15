@@ -88,6 +88,15 @@ class Stream:
         # the film repeats this stretch of its sound (lag, ncc): a look also
         # finds the stream `lag` s further on in the film, at that ncc
         self.repeat = None
+        # a film with a centre channel of its own: (ncc, clear) of a look at
+        # the centre alone, which lines up where the stream is, while the
+        # mix's best alignment sits mix_lag off (the stream's copy has its
+        # music elsewhere). None: no centre
+        self.centre = None
+        self.mix_lag = 0.0
+        self.mix_misses = 0       # every nth look the mix misses the film (ncc 0.2); 0: never
+        self.plays = 0
+        self.wide_centre = []     # the `centre` asked for by each look reaching past 0.4 s
         self.looks = 0
         self.echo = False         # a recording that began before a pause hears the film in it
         self.paused_since = None
@@ -228,13 +237,15 @@ def install_fakes(stream):
     def presence(path, samples, sr, at, lo=-controller.audio_matcher.PRESENCE_SEARCH,
                  hi=controller.audio_matcher.PRESENCE_SEARCH,
                  heard=controller.audio_matcher.PRESENCE_HEARD,
-                 missing=controller.audio_matcher.PRESENCE_MISSING):
+                 missing=controller.audio_matcher.PRESENCE_MISSING, centre=True):
         # a look at the stream against the film where it should be: heard
         # where the stream carries that stretch of film, missing where it
         # carries none (paused, another film), quiet where the film has
         # nothing to hear, and talk_ncc while talk-over hides it
         t0, seconds = samples
         P = controller.audio_matcher.Presence
+        if hi > controller.audio_matcher.PRESENCE_SEARCH + 1e-9:
+            stream.wide_centre.append(centre)    # a paused watcher's look
 
         def scored(ncc, shift, clear):
             state = "heard" if ncc >= heard else ("missing" if ncc < missing else "unsure")
@@ -266,7 +277,17 @@ def install_fakes(stream):
         ncc, best = max(seen)
         rest = [n for n, s in seen if abs(s - best) > 0.1]
         clear = min(stream.film_clear, ncc - max(rest)) if rest else stream.film_clear
-        return scored(ncc, best, clear)
+        stream.plays += 1
+        if stream.mix_misses and stream.plays % stream.mix_misses == 0:
+            ncc = 0.2                 # the mix misses the film here: its music elsewhere
+        Look = controller.audio_matcher.Look
+        mix = Look(ncc, best + stream.mix_lag, clear)
+        if stream.centre is None or not centre:
+            return scored(mix.ncc, mix.shift, mix.clear)._replace(by="mix", mix=mix)
+        cen = Look(stream.centre[0], shift, stream.centre[1])
+        win = cen if cen.ncc > mix.ncc else mix
+        return P(controller.audio_matcher._presence_state(mix, cen, heard, missing), win.shift,
+                 win.ncc, 0.0, 1.0, win.clear, "centre" if win is cen else "mix", cen, mix)
     controller.audio_matcher.prep_capture = prep
     controller.audio_matcher.find_match_audio = find
     controller.audio_matcher.refine_match = refine
@@ -1594,6 +1615,105 @@ def test_watch_corrects_drift():
           "an unclear look reports left alone too")
 
 
+def test_watch_judges_drift_by_the_centre():
+    """A film with a centre channel of its own: drift is judged by the
+    centre, where the dialogue lines up, not by the mix, whose music the
+    stream's copy of the film can place elsewhere (on the 2026-11-12
+    replay, judged by whichever sound answered, the film went onto the
+    music and back again and again)."""
+    ctl, stream, player, clock, q, state = watching()
+    stream.centre, stream.mix_misses = (0.6, 0.5), 4      # a copy that sounds different:
+    watch(ctl, clock, 85.0, state=state)                  # the centre comes to be heard
+    assert ctl._centre_count["on"], ctl._centre_count
+    stream.mix_misses, stream.mix_lag = 0, 0.25           # the mix answers, 0.25 s off
+    n = len(player.seeks)
+    watch(ctl, clock, 1.5, state=state)
+    assert len(player.seeks) == n and in_sync(player, stream), \
+        "the mix's music moved the film off the dialogue"
+    player.anchor = (player.pos() + 0.13, clock())        # real drift: the centre hears it
+    watch(ctl, clock, 1.0, state=state)
+    assert len(player.seeks) == n + 1 and in_sync(player, stream), \
+        "drift the centre heard was not corrected to it"
+    stream.centre = (0.2, 0.5)                            # the centre doesn't hear the film
+    player.anchor = (player.pos() + 0.13, clock())
+    n = len(player.seeks)
+    watch(ctl, clock, 1.0, state=state)
+    assert len(player.seeks) == n, "a look whose centre missed the film moved it"
+    assert state["mode"] == "playing"
+    stream.centre = None                                  # a stretch whose centre is silent
+    watch(ctl, clock, 1.5, state=state)
+    assert len(player.seeks) == n, "with no centre to judge by, the mix's music moved the film"
+    print("watcher: drift judged by the film's centre - the mix's music 0.25 s off moves "
+          "nothing, 0.13 s the centre hears is corrected, a look the centre misses counts "
+          "neither way, nor does one from a stretch with no centre")
+
+
+def test_watch_listens_to_the_centre_once_the_copies_differ():
+    """A film with a centre channel of its own is heard by its mix alone,
+    as a stereo film is, until its centre has matched the stream clearly
+    better than its mix on enough looks - the stream's copy sounds
+    different, its music elsewhere - and from then on by the better of the
+    two, for as long as the film is open. A copy that matches never gets
+    there. Looks for a stopped stream's return hear the mix alone either way,
+    and so does the look that ends a Play by hand."""
+    def stretch_where_the_mix_misses(ctl, stream, player, clock, state):
+        stream.mix_misses = 1             # the mix misses every look, the centre hears it
+        watch(ctl, clock, 3.0, state=state)
+        paused = not player.playing
+        stream.mix_misses = 0
+        watch(ctl, clock, 4.0, state=state)  # (a paused film plays again on the mix)
+        return paused
+
+    ctl, stream, player, clock, q, state = watching()      # a copy that matches
+    stream.centre = (0.6, 0.5)
+    watch(ctl, clock, 100.0, state=state)
+    assert not ctl._centre_count["on"] and player.playing
+    assert stretch_where_the_mix_misses(ctl, stream, player, clock, state), \
+        "a copy that matched was heard by its centre"
+    assert stream.wide_centre and not any(stream.wide_centre), stream.wide_centre
+    stream.mix_lag = 0.25                                  # the mix 0.25 s off, the centre not:
+    n = len(player.seeks)                                  # judged by the mix, as before
+    watch(ctl, clock, 1.5, state=state)
+    assert len(player.seeks) == n + 1 and in_sync(player, stream, 0.25), \
+        "before its centre counts, a film's drift was not judged by its mix"
+
+    ctl, stream, player, clock, q, state = watching()      # a copy that differs
+    stream.centre, stream.mix_misses = (0.6, 0.5), 4
+    watch(ctl, clock, 60.0, state=state)
+    assert not ctl._centre_count["on"], "the centre was listened to before the count was in"
+    watch(ctl, clock, 25.0, state=state)
+    assert ctl._centre_count["on"] and player.playing, ctl._centre_count
+    said = [m for m in controller.diagnostics.lines if "listening to it as well" in m]
+    assert len(said) == 1, controller.diagnostics.lines
+    assert not stretch_where_the_mix_misses(ctl, stream, player, clock, state), \
+        "the centre heard the film, yet it paused"
+    del stream.wide_centre[:]
+    stream.pause()                                         # a stop: looks for its return
+    watch(ctl, clock, 3.0, state=state)
+    assert not player.playing
+    stream.mix_misses = 1                                  # back, but only the centre hears it,
+    stream.play()                                          # as the user plays the film in step
+    player.anchor, player.playing = (stream.pos(), clock()), True
+    watch(ctl, clock, 0.2, state=state)
+    assert state["mode"] == "override", state["mode"]
+    watch(ctl, clock, 2.0, state=state)
+    assert state["mode"] == "override", "a look only the centre heard ended a Play by hand"
+    stream.mix_misses = 0
+    watch(ctl, clock, 1.0, state=state)
+    assert state["mode"] == "playing"
+    assert stream.wide_centre and not any(stream.wide_centre), stream.wide_centre
+    ctl.load_file("film2.mkv")                             # another film (or this one again):
+    assert ctl._centre_count is None                       # counted afresh
+    stream.film = "film2.mkv"
+    run_sync(ctl, ctl.sync, "")
+    watch(ctl, clock, 1.0, state=state)
+    assert ctl._centre_count["path"] == "film2.mkv" and not ctl._centre_count["on"]
+    print("watcher: a film's centre is listened to once it beats the mix on enough looks "
+          "(a copy that sounds different), never for a copy that matches nor before the "
+          "count is in, and afresh for another film; a stopped stream's return and the end "
+          "of a Play by hand are heard by the mix alone")
+
+
 def test_watch_finds_a_far_jump():
     ctl, stream, player, clock, q, state = watching()
     windows = []
@@ -1799,6 +1919,8 @@ def main():
     test_watch_rules_under_talk_over()
     test_watch_obeys_play_by_hand()
     test_watch_corrects_drift()
+    test_watch_judges_drift_by_the_centre()
+    test_watch_listens_to_the_centre_once_the_copies_differ()
     test_watch_finds_a_far_jump()
     test_watch_whole_film_search_leaves_the_near_ones_going()
     test_watch_pause_holds_against_old_sound()
