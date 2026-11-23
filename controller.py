@@ -288,6 +288,12 @@ def _tail_silent(samples, sr):
     return float(np.abs(tail).max(initial=0.0)) < audio_capture.SILENCE
 
 
+def _silent(p):
+    """A look at a stream that is digitally silent where the film has
+    sound (audio_matcher.film_presence: missing, with nothing matched)."""
+    return p.state == "missing" and p.shift is None
+
+
 def _clear(p):
     """A look whose best alignment stands clear of every other: the film's
     own sound, not a voice that happens to correlate with it there
@@ -940,13 +946,27 @@ class SyncController:
 
     def _watch_playing(self, state):
         player = self.player
-        if getattr(player, "settling", lambda: False)():
-            return WATCH_TICK            # a sync's corrections are still moving it
+        # While a sync's or a resume's corrections still move the film (a
+        # seek, then a trim: 2 to 5 s), the stream is still listened to,
+        # against the line the film is heading for - where the stream was
+        # heard, the truer of the two until the film is on it - but only
+        # for silence: a stream gone digitally silent where the film has
+        # sound has stopped, whatever the film is doing. Not listening at
+        # all let the film play through a stop that began just after a
+        # resume (seen live, 2026-11-22: 6 s into it). Any other look
+        # waits for the film to settle: replayed on a copy that sounds
+        # different from the stream's (2026-11-12), counting those too
+        # paused the film 11-15% more often, in stretches the corrections
+        # used to carry it through.
+        settling = getattr(player, "settling", lambda: False)()
         cap = self._watch_capture(state)
         if cap is None:
             return WATCH_TICK
         samples, sr, t0 = cap
-        pos = playing_position_at(player, t0)
+        if settling:
+            pos = getattr(player, "heading", lambda at: None)(t0)
+        else:
+            pos = playing_position_at(player, t0)
         if pos is None:
             return WATCH_TICK            # its clock has not settled since a seek
         at = pos - self.placement_offset()      # where the stream should be at t0
@@ -959,6 +979,8 @@ class SyncController:
             # name, judged as resume looks are, by the mix alone
             p = audio_matcher.mix_only(p, rule["heard"], rule["missing"])
         self._watch_prefetch(at)
+        if settling and not _silent(p):
+            return WATCH_TICK
         if p.state == "quiet":
             state["missing"] = state["not_heard"] = 0
             state["drift"] = []

@@ -125,6 +125,8 @@ class Player:
         self.seeks = []
         self.nudges = []
         self.slow_start = False      # sync_seek reports a slow start
+        self.settle = 0.0            # how long a sync_seek's corrections run
+        self.settle_until = -1.0
 
     def pos(self):
         if self.anchor is None:
@@ -136,7 +138,7 @@ class Player:
         return self.pos()
 
     def clock(self):
-        if not self.playing or self.anchor is None:
+        if not self.playing or self.anchor is None or self.settling():
             return None
         return self.pos(), self.now()
 
@@ -159,6 +161,7 @@ class Player:
         self.seeks.append(target)
         self.anchor = (target, self.now())
         self.playing = True
+        self.settle_until = self.now() + self.settle
 
     def nudge(self, delta):
         self.nudges.append(delta)
@@ -172,7 +175,14 @@ class Player:
         pass
 
     def settling(self):
-        return False
+        return self.playing and self.now() < self.settle_until
+
+    def heading(self, at):
+        """Where the line being corrected toward puts the film at `at`."""
+        if not self.settling():
+            return None
+        p, t = self.anchor
+        return p + (at - t)
 
 
 class Monitor:
@@ -1307,6 +1317,44 @@ def test_watch_pauses_and_resumes():
           f"{came:.1f} s after its return")
 
 
+def test_watch_listens_for_silence_while_the_film_settles():
+    """A resume's seek and trim keep the player correcting for seconds. The
+    stream is listened to throughout for silence, against the line the film
+    is heading for: a stream that stops dead just after a resume pauses the
+    film as fast as at any other time. Nothing else is judged until the
+    film is on its line - not talk hiding the film, not drift."""
+    ctl, stream, player, clock, q, state = watching()
+    player.settle = 5.0                          # every sync_seek: 5 s of corrections
+    watch(ctl, clock, 3.0, [(0.0, stream.pause)], state=state)
+    assert not player.playing
+    watch(ctl, clock, 1.0, [(0.0, stream.play)], state=state)
+    assert in_sync(player, stream) and player.settling(), "the film did not resume"
+    stopped = {}
+
+    def stop_again():
+        stream.pause()
+        stopped["t"] = clock.now
+    watch(ctl, clock, 1.5, [(0.0, stop_again)], state=state)
+    assert not player.playing, \
+        "the film played on through a stop that began while it was still settling"
+    took = player.anchor[1] - stopped["t"]
+    assert took <= 0.35, f"paused {took:.2f} s after a stop that began while settling"
+    # the stream plays on while the film settles, the film hidden under
+    # talk and looking 0.3 s off: no pause and no correction until settled
+    watch(ctl, clock, 1.0, [(0.0, stream.play)], state=state)
+    assert in_sync(player, stream) and player.settling()
+    seeks = len(player.seeks)
+    stream.audible, stream.talk_ncc = False, 0.05
+    watch(ctl, clock, 1.5, state=state)
+    stream.audible = True
+    stream.anchor = (stream.anchor[0] + 0.3, stream.anchor[1])
+    watch(ctl, clock, 1.5, state=state)
+    assert player.playing and player.settling() and len(player.seeks) == seeks \
+        and not player.nudges, "the watcher moved or paused a film that was still settling"
+    print(f"watcher: listens for silence while the film settles - paused {took:.1f} s after "
+          f"a stop that began mid-correction; talk and drift wait until it is on its line")
+
+
 def test_watch_shows_the_stream_only_for_a_pause_that_lasts():
     # a pause over within WATCH_SWAP_HOLD - a voice hiding the film for a
     # second, a stall - leaves the windows as they are: live, each one
@@ -1940,6 +1988,7 @@ def main():
     test_watch_shows_the_stream_only_for_a_pause_that_lasts()
     test_watch_holds_against_a_voice()
     test_watch_notices_a_stop_through_a_voice()
+    test_watch_listens_for_silence_while_the_film_settles()
     test_watch_follows_a_resume_past_the_first_look()
     test_watch_finds_a_return_near_where_it_would_be()
     test_watch_finds_a_return_just_before_the_stop()

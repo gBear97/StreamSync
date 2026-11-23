@@ -216,6 +216,17 @@ class _ClosedLoop:
         way to the line, not on it."""
         return self._working
 
+    def heading(self, at):
+        """Where the line a goto is still working toward puts playback at
+        perf_counter() time `at`, or None when nothing is being corrected.
+        A sync or a resume drew that line from where the stream was heard,
+        so while the corrections run it says where the stream is, which
+        the position on its way there does not."""
+        with self._loop_lock:
+            if not self._working or self._line is None:
+                return None
+            return self._desired(at)
+
     def _current(self, gen):
         return self._gen == gen
 

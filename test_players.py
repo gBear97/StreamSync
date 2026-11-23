@@ -1057,7 +1057,12 @@ def main():
     for target in (300.0, 420.0, 150.0):
         c = time.perf_counter()
         p.sync_seek(target, c, 0.0)
+        # while the corrections run, heading() is the line itself (where
+        # the stream is), whatever the film's own position; none after
+        head = p.heading(c + 2.0)
+        assert p.settling() and head is not None and abs(head - (target + 2.0)) < 1e-6, head
         wait_done(p)
+        assert p.heading(c) is None
         time.sleep(0.3)
         now = time.perf_counter()
         err = mp.truth(now) - (target + now - c)
