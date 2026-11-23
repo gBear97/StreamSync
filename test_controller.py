@@ -52,8 +52,12 @@ import threading
 import time
 import types
 
+import numpy as np
+
 import controller
 import session
+
+REAL_TAIL_SILENT = controller._tail_silent   # the fake matcher replaces it
 
 
 class Clock:
@@ -305,6 +309,36 @@ def install_fakes(stream):
     controller.audio_matcher.film_presence = presence
     controller.audio_matcher.presence_cached = lambda path, start: True
     controller._tail_silent = lambda samples, sr: stream.silent and not stream.playing
+
+
+def test_wide_search_wants_unbroken_sound_at_the_end():
+    """The real _tail_silent, which the fake matcher stands in for. A wide
+    search's recording is matched only if it ends in half a second of
+    unbroken sound: one that ends in silence holds film from before a
+    stop, and one that is silence and then a blip (the stream just back)
+    matched 17.5 s off with a trusted score, live on 2026-11-22."""
+    sr = 48000
+    rng = np.random.default_rng(5)
+    sound = (0.1 * rng.standard_normal(4 * sr)).astype(np.float32)
+
+    def rec(*silent):                    # (from s, to s) stretches blanked
+        x = sound.copy()
+        for a, b in silent:
+            x[int(a * sr):int(b * sr)] = 0.0
+        return x
+    tail_silent = REAL_TAIL_SILENT
+    assert not tail_silent(rec(), sr), "a stream playing throughout"
+    assert tail_silent(rec((3.7, 4.0)), sr), "a stream that stopped inside the recording"
+    assert tail_silent(rec((0.0, 3.94)), sr), "60 ms of sound after silence was searched"
+    assert tail_silent(rec((0.0, 3.7)), sr), "0.3 s of sound after silence was searched"
+    assert not tail_silent(rec((0.0, 3.4)), sr), "0.6 s of sound after silence was not searched"
+    assert tail_silent(rec((3.6, 3.7)), sr), "a gap inside the last half second"
+    blip = rec((0.0, 4.0))
+    blip[-1] = 0.5
+    assert tail_silent(blip, sr), "one loud sample passed for sound"
+    assert tail_silent(sound[:int(0.2 * sr)], sr), "a recording shorter than the stretch"
+    print("watcher: a wide search wants its recording to end in half a second of unbroken "
+          "sound - not silence, and not a blip after it")
 
 
 def failing_matcher(errors):
@@ -2004,6 +2038,7 @@ def main():
     test_watch_whole_film_search_leaves_the_near_ones_going()
     test_watch_pause_holds_against_old_sound()
     test_watch_pause_holds_when_the_stream_stops_inside_it()
+    test_wide_search_wants_unbroken_sound_at_the_end()
     test_watch_keeps_its_pause_across_a_weak_resync()
     test_watch_lets_go_for_another_film()
     test_watch_stands_aside()

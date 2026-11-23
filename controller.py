@@ -149,7 +149,8 @@ WATCH_FAR_BACK = 25.0      # ...from this far behind where it stopped to this fa
 WATCH_FAR_AHEAD = 40.0     # ...where it would be had it played on,
 WATCH_FAR_REACH = 600.0    # ...but no further than this past where it stopped,
 WATCH_FAR_WHOLE = 30.0     # ...and every fourth one after this long paused, the whole film
-WATCH_FAR_TAIL = 0.2       # ...and not at all if its last stretch this long is silent
+WATCH_FAR_TAIL = 0.5       # ...and not at all unless its last stretch this long is all sound
+WATCH_FAR_PIECE = 0.05     # ...judged in pieces this long
 WATCH_FAR_EVERY = ((30.0, 2.0), (120.0, 5.0), (math.inf, 15.0))  # (paused under s, s between)
 # A whole-film search runs apart from the others, one at a time: decoding
 # the whole film can take a minute (60 s on the PC's first sync), and the
@@ -282,10 +283,22 @@ def trusted(score, z):
 
 
 def _tail_silent(samples, sr):
-    """The recording ends in digital silence: the stream stopped inside
-    it, so what it holds is film from before that stop."""
-    tail = samples[-max(1, int(WATCH_FAR_TAIL * sr)):]
-    return float(np.abs(tail).max(initial=0.0)) < audio_capture.SILENCE
+    """The recording does not end in WATCH_FAR_TAIL of unbroken sound:
+    some piece of that stretch is digitally silent. Either the stream
+    stopped inside the recording, and what it holds is film from before
+    that stop, or it has only just come back, and what it holds is too
+    little to place. A recording that is silence and then a blip of sound
+    matches nowhere true, and now and then somewhere false with a score
+    that passes (seen live, 2026-11-22: 60 ms of sound after 3.9 s of
+    silence put the film 17.5 s ahead; of 135 recordings cut that way,
+    none with 0.1 s of sound or less matched right and 8 were trusted,
+    while with 0.5 s every trusted match was right)."""
+    piece = max(1, int(WATCH_FAR_PIECE * sr))
+    n = max(1, int(round(WATCH_FAR_TAIL / WATCH_FAR_PIECE)))
+    tail = np.abs(samples[-n * piece:])
+    if len(tail) < n * piece:
+        return True
+    return bool((tail.reshape(n, piece).max(axis=1) < audio_capture.SILENCE).any())
 
 
 def _silent(p):
@@ -1231,8 +1244,9 @@ class SyncController:
     def _watch_far(self, state, token, path, lo, hi, quiet_from):
         """A wide search, on a thread of its own: the stream's last
         WATCH_FAR_LISTEN seconds matched from lo to hi (None: the whole
-        film), once all of them were heard after quiet_from and unless
-        they end in silence (the stream stopped inside them). A trusted
+        film), once all of them were heard after quiet_from and only if
+        they end in unbroken sound (the stream did not stop inside them,
+        and has not only just come back). A trusted
         match is left in state["far_hit"] for the next look to play the
         film from."""
         try:
@@ -1246,7 +1260,9 @@ class SyncController:
             # holds the film up to that stop, matches it there, and the
             # film would play while the stream stays stopped (seen live,
             # 2026-11-20: played 2.5 s before the stream did). A stream
-            # that still plays does not end in silence.
+            # that still plays does not end in silence - and one just
+            # back from a stop is left for the next search, which will
+            # hold enough of it to place.
             if _tail_silent(samples, sr):
                 return
             feats = audio_matcher.prep_capture(samples, sr)
