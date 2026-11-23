@@ -311,8 +311,9 @@ sounds different from yours - another release, its music laid in a
 little differently - StreamSync notices after two or three minutes of the
 film and from then on also listens to your copy's centre channel on its
 own, where films keep their dialogue: the part two releases usually
-share. The film plays on when either matches the stream, and its drift is
-judged by the dialogue. In a replay of a movie-night VOD whose copy had
+share. The film plays on when either matches the stream, its drift is
+judged by the dialogue, and a stream that has to be found again is looked
+for by the dialogue too. In a replay of a movie-night VOD whose copy had
 its music up to 10 s away from the file's, cue by cue, the film paused
 about a fifth less often: 160-165 times in the hour instead of 202-216,
 every one of them a mistake, as the stream never stopped. About 2 such
@@ -678,7 +679,11 @@ Step by step, with a first sync test: [MAC_FIRST_RUN.md](MAC_FIRST_RUN.md).
   the film for a stream that comes back somewhere else, and after 30 s
   now and then over the whole film. Decoding a whole film can take a
   minute, so that one runs on its own and the nearer matches go on
-  meanwhile.
+  meanwhile. Once the film is heard by its centre as well, a full match
+  looks in the centre alone: in the mix, a stream whose copy has its music
+  elsewhere is found where the file has that music, seconds from where the
+  stream is. Across one such film the centre placed 84% of 4 s recordings
+  right and 2% wrong, the mix 78% and 3%.
 - **Timing**: stream audio is recorded continuously and every sample is
   dated by its position in the recording, not by when a recording was
   asked for - so the matched moment is corrected by exactly how long ago

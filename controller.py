@@ -1266,10 +1266,30 @@ class SyncController:
             if _tail_silent(samples, sr):
                 return
             feats = audio_matcher.prep_capture(samples, sr)
-            t, score, z = audio_matcher.find_match_audio(path, feats, lo, hi)
+            # Once the film is heard by its centre as well (_centre_look:
+            # the stream's copy sounds different), it is looked for in its
+            # centre alone. In the mix, a recording the stream's music or
+            # effects fill is found where the file has that sound - in
+            # such a copy, seconds from where the stream is - and with a
+            # score that passes: the film played from 9.2 s ahead (seen
+            # live, 2026-11-22; the 2026-11-12 replays land there too).
+            #   Of 1237 recordings across that film while its stream
+            # played, searched as here, the mix placed 962 right and 35
+            # wrong, the centre 1042 and 24 - and the centre first, the mix
+            # where it finds nothing, 1067 and 37: no fallback. Replayed,
+            # that hour's wide searches left the film off the stream 3-5
+            # times against 8-11 (the 9.7 s one gone; one of 8.7 s new in
+            # one replay), and it played over 0.5 s off for 103-127 s
+            # against 140-143, with 5-6 more pauses in 160-166. The centre
+            # does not cure it: for a few stretches of that film its own
+            # sound sits 1.5-2 s from the stream's. A voice with no film
+            # under it passed for the film in neither (134 recordings,
+            # 1742 searches each: none by the centre, one by the mix).
+            centre = self._centre_on()
+            t, score, z = audio_matcher.find_match_audio(path, feats, lo, hi, centre=centre)
             if trusted(score, z) and state["token"] == token:
                 self._log("watch", "audio", lo, hi, t, score, z, WATCH_FAR_LISTEN,
-                          applied=True)
+                          applied=True, **({"by": "centre"} if centre else {}))
                 state["far_hit"] = (token, t, t0)
         except RuntimeError:
             pass      # a silent stream or a gap (MatchError too): nothing to find yet

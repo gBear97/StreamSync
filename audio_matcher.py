@@ -376,8 +376,11 @@ _cache = collections.OrderedDict()
 _cache_lock = threading.Lock()
 
 
-def _file_features(path, seg0, seg1):
-    """features() of the file's audio over [seg0, seg1], cached.
+def _file_features(path, seg0, seg1, centre=False):
+    """features() of the file's audio over [seg0, seg1], cached: of its
+    mix, or with `centre` of its centre channel alone (decode_presence) -
+    the mix all the same where the track has no centre of its own or the
+    centre is silent throughout.
 
     A weak match is retried with a longer recording over the same window,
     and decoding is most of a search's cost - a whole film takes tens of
@@ -387,12 +390,16 @@ def _file_features(path, seg0, seg1):
         stamp = os.path.getmtime(path)
     except OSError:
         stamp = None
-    key = (path, stamp, round(seg0, 3), round(seg1, 3))
+    key = (path, stamp, round(seg0, 3), round(seg1, 3)) + (("centre",) if centre else ())
     with _cache_lock:
         if key in _cache:
             _cache.move_to_end(key)
             return _cache[key]
-    W = features(decode_audio(path, seg0, seg1 - seg0), SR)
+    if centre:
+        mix, cen = decode_presence(path, seg0, seg1 - seg0)
+        W = features(mix if cen is None else cen, SR)
+    else:
+        W = features(decode_audio(path, seg0, seg1 - seg0), SR)
     with _cache_lock:
         _cache[key] = W
         while len(_cache) > CACHE_CHUNKS:
@@ -800,7 +807,7 @@ def _look(W, C, s_lo):
     return Look(best, (k + d - s_lo) * HOP_S, clear)
 
 
-def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None):
+def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None, centre=False):
     """Locate the recording inside `path`'s audio track.
 
     `capture_feats` is prep_capture's result (a plain (L, N_BANDS) feature
@@ -809,6 +816,13 @@ def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None):
     stands above the combined score curve, score how far above the best
     competing peak (both in sigmas of that curve). Callers should treat
     the result as unreliable when score < SCORE_OK or peak_z < Z_OK.
+
+    With `centre` the recording is looked for in the track's centre channel
+    alone - the dialogue, which any two copies of a film share (see
+    decode_presence) - wherever the track has one, and in its mix as ever
+    where it has none. For a stream whose copy of the film has its music
+    elsewhere: in the mix, a recording the music fills matches where the
+    file has that music, not where the stream is.
     """
     C = np.asarray(getattr(capture_feats, "feats", capture_feats),
                    dtype=np.float64)
@@ -839,7 +853,7 @@ def find_match_audio(path, capture_feats, t0=None, t1=None, progress=None):
         if seg1 - seg0 >= 4.0:
             progress(f"Listening through {int(seg0) // 60}:{int(seg0) % 60:02d}"
                      f" - {int(seg1) // 60}:{int(seg1) % 60:02d}...")
-            W = _file_features(path, seg0, seg1)
+            W = _file_features(path, seg0, seg1, centre)
             try:
                 scores = _score_curve(W, C, w)
             except MatchError:

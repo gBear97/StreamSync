@@ -101,6 +101,8 @@ class Stream:
         self.mix_misses = 0       # every nth look the mix misses the film (ncc 0.2); 0: never
         self.plays = 0
         self.wide_centre = []     # the `centre` asked for by each look reaching past 0.4 s
+        self.find_centre = []     # ...and by each search (find_match_audio)
+        self.music_lag = 0.0      # a search of the mix finds the stream this far off (its music)
         self.looks = 0
         self.echo = False         # a recording that began before a pause hears the film in it
         self.silent = False       # paused, the stream is digitally silent (a recording ends so)
@@ -224,9 +226,14 @@ def install_fakes(stream):
     # scores relative to the matcher's own gates, whatever scale they use
     S, Z = controller.audio_matcher.SCORE_OK, controller.audio_matcher.Z_OK
 
-    def find(path, feats, lo=None, hi=None, progress=None):
+    def find(path, feats, lo=None, hi=None, progress=None, centre=False):
         t0, seconds = feats
         true = stream.pos(t0)
+        stream.find_centre.append(centre)
+        if stream.music_lag and not centre:
+            # a copy whose music sits elsewhere: its mix finds the stream
+            # where the file has that music; only its centre, where it is
+            true += stream.music_lag
         inside = (lo is None or lo <= true) and (hi is None or true <= hi)
         # with echo on, a recording that began before a pause still holds
         # the film it heard then, and matches it there
@@ -347,11 +354,11 @@ def failing_matcher(errors):
     hear = controller.audio_matcher.find_match_audio
     todo = list(errors)
 
-    def find(path, feats, lo=None, hi=None, progress=None):
+    def find(path, feats, lo=None, hi=None, progress=None, **kw):
         e = todo.pop(0) if todo else None
         if e is not None:
             raise e
-        return hear(path, feats, lo, hi, progress)
+        return hear(path, feats, lo, hi, progress, **kw)
     controller.audio_matcher.find_match_audio = find
     return todo
 
@@ -533,11 +540,11 @@ def test_auto_passes_timed_from_their_start():
     passes = []
     hear = controller.audio_matcher.find_match_audio
 
-    def find(path, feats, lo=None, hi=None, progress=None):
+    def find(path, feats, lo=None, hi=None, progress=None, **kw):
         t0, seconds = feats
         if seconds == controller.AUTO_RECORD_SECONDS:
             passes.append(t0)             # a pass's first look starts it
-        return hear(path, feats, lo, hi, progress)
+        return hear(path, feats, lo, hi, progress, **kw)
     controller.audio_matcher.find_match_audio = find
     start = clock.now
     run_loop(ctl, clock, 200)
@@ -1798,14 +1805,53 @@ def test_watch_listens_to_the_centre_once_the_copies_differ():
           "of a Play by hand are heard by the mix alone")
 
 
+def test_wide_search_looks_in_the_centre_once_the_copies_differ():
+    """A wide search looks for the stream in the film's mix, until the film
+    is heard by its centre as well (the stream's copy has its music
+    elsewhere): from then on in its centre alone. In the mix such a stream
+    is found where the file has the music it carries, seconds from where it
+    is, and the film would play from there (live, 2026-11-22: 9.2 s ahead)."""
+    def lose_and_find(ctl, stream, player, clock, state):
+        del stream.find_centre[:]
+        stream.pause()
+        watch(ctl, clock, 3.0, state=state)
+        assert not player.playing
+        stream.anchor = (stream.pos() + 20.0, clock())     # back 20 s on: past the close looks
+        stream.play()
+        watch(ctl, clock, 12.0, state=state)
+        return list(stream.find_centre)
+
+    ctl, stream, player, clock, q, state = watching()      # a copy that matches
+    stream.centre = (0.6, 0.5)
+    watch(ctl, clock, 100.0, state=state)
+    assert not ctl._centre_count["on"]
+    asked = lose_and_find(ctl, stream, player, clock, state)
+    assert in_sync(player, stream) and asked and not any(asked), \
+        f"a copy that matched was to be searched by its mix: {asked}"
+
+    ctl, stream, player, clock, q, state = watching()      # a copy that differs
+    stream.centre, stream.mix_misses = (0.6, 0.5), 4
+    watch(ctl, clock, 85.0, state=state)
+    assert ctl._centre_count["on"] and player.playing, ctl._centre_count
+    stream.music_lag = 9.2                                 # its mix finds the music, 9.2 s on
+    asked = lose_and_find(ctl, stream, player, clock, state)
+    assert asked and all(asked), f"heard by its centre, yet searched by its mix: {asked}"
+    assert in_sync(player, stream), \
+        f"the film plays {player.pos() - stream.pos():+.1f} s from the stream, on its music"
+    assert "found by a wide search" in controller.diagnostics.lines[-1], \
+        controller.diagnostics.lines[-1]
+    print(f"watcher: a wide search looks in the film's centre once the copies differ "
+          f"({len(asked)} searches, the film back in step), in its mix until then")
+
+
 def test_watch_finds_a_far_jump():
     ctl, stream, player, clock, q, state = watching()
     windows = []
     hear = controller.audio_matcher.find_match_audio
 
-    def find(path, feats, lo=None, hi=None, progress=None):
+    def find(path, feats, lo=None, hi=None, progress=None, **kw):
         windows.append((lo, hi))
-        return hear(path, feats, lo, hi, progress)
+        return hear(path, feats, lo, hi, progress, **kw)
     controller.audio_matcher.find_match_audio = find
     stream.pause()
     watch(ctl, clock, 8.0, state=state)      # a search waits for 4 s heard since the stop
@@ -2034,6 +2080,7 @@ def main():
     test_watch_corrects_drift()
     test_watch_judges_drift_by_the_centre()
     test_watch_listens_to_the_centre_once_the_copies_differ()
+    test_wide_search_looks_in_the_centre_once_the_copies_differ()
     test_watch_finds_a_far_jump()
     test_watch_whole_film_search_leaves_the_near_ones_going()
     test_watch_pause_holds_against_old_sound()
