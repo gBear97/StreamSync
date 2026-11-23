@@ -149,6 +149,7 @@ WATCH_FAR_BACK = 25.0      # ...from this far behind where it stopped to this fa
 WATCH_FAR_AHEAD = 40.0     # ...where it would be had it played on,
 WATCH_FAR_REACH = 600.0    # ...but no further than this past where it stopped,
 WATCH_FAR_WHOLE = 30.0     # ...and every fourth one after this long paused, the whole film
+WATCH_FAR_TAIL = 0.2       # ...and not at all if its last stretch this long is silent
 WATCH_FAR_EVERY = ((30.0, 2.0), (120.0, 5.0), (math.inf, 15.0))  # (paused under s, s between)
 # A whole-film search runs apart from the others, one at a time: decoding
 # the whole film can take a minute (60 s on the PC's first sync), and the
@@ -278,6 +279,13 @@ def parse_time(text):
 
 def trusted(score, z):
     return score >= audio_matcher.SCORE_OK and z >= audio_matcher.Z_OK
+
+
+def _tail_silent(samples, sr):
+    """The recording ends in digital silence: the stream stopped inside
+    it, so what it holds is film from before that stop."""
+    tail = samples[-max(1, int(WATCH_FAR_TAIL * sr)):]
+    return float(np.abs(tail).max(initial=0.0)) < audio_capture.SILENCE
 
 
 def _clear(p):
@@ -1201,13 +1209,24 @@ class SyncController:
     def _watch_far(self, state, token, path, lo, hi, quiet_from):
         """A wide search, on a thread of its own: the stream's last
         WATCH_FAR_LISTEN seconds matched from lo to hi (None: the whole
-        film), once all of them were heard after quiet_from. A trusted
+        film), once all of them were heard after quiet_from and unless
+        they end in silence (the stream stopped inside them). A trusted
         match is left in state["far_hit"] for the next look to play the
         film from."""
         try:
             samples, sr, t0, _ = self._loopback().capture_span(WATCH_FAR_LISTEN, timeout=2.0)
             if t0 < quiet_from:
                 return            # it still holds film from before the stop: not yet
+            # quiet_from only knows the stop the watcher paused for. The
+            # stream can stop (again) while the film is already paused - a
+            # real stop inside a pause it did not cause (the film's sound
+            # missed where the stream's copy differs): the recording then
+            # holds the film up to that stop, matches it there, and the
+            # film would play while the stream stays stopped (seen live,
+            # 2026-11-20: played 2.5 s before the stream did). A stream
+            # that still plays does not end in silence.
+            if _tail_silent(samples, sr):
+                return
             feats = audio_matcher.prep_capture(samples, sr)
             t, score, z = audio_matcher.find_match_audio(path, feats, lo, hi)
             if trusted(score, z) and state["token"] == token:

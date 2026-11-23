@@ -99,6 +99,7 @@ class Stream:
         self.wide_centre = []     # the `centre` asked for by each look reaching past 0.4 s
         self.looks = 0
         self.echo = False         # a recording that began before a pause hears the film in it
+        self.silent = False       # paused, the stream is digitally silent (a recording ends so)
         self.paused_since = None
 
     def pos(self, at=None):
@@ -293,6 +294,7 @@ def install_fakes(stream):
     controller.audio_matcher.refine_match = refine
     controller.audio_matcher.film_presence = presence
     controller.audio_matcher.presence_cached = lambda path, start: True
+    controller._tail_silent = lambda samples, sr: stream.silent and not stream.playing
 
 
 def failing_matcher(errors):
@@ -1792,6 +1794,34 @@ def test_watch_pause_holds_against_old_sound():
           "taken for its return")
 
 
+def test_watch_pause_holds_when_the_stream_stops_inside_it():
+    # the film is paused though the stream plays on (its copy sounds
+    # different here, and neither the looks nor the wide searches hear the
+    # film). Then the stream really stops: the next wide search's recording
+    # holds the film up to that stop - all of it heard after the pause the
+    # watcher knows of - and matched it there, so the film played while the
+    # stream stood still (live on 2026-11-20, 2.5 s before the stream did)
+    ctl, stream, player, clock, q, state = watching()
+    stream.pause()
+    watch(ctl, clock, 1.0, state=state)
+    assert not player.playing
+    stream.audible = False
+    stream.play()
+    watch(ctl, clock, 6.0, state=state)
+    assert not player.playing, "the film's sound was to stay unheard here"
+    n = len(player.seeks)
+    stream.audible, stream.echo, stream.silent = True, True, True
+    stream.pause()
+    watch(ctl, clock, 8.0, state=state)
+    assert not player.playing and len(player.seeks) == n, \
+        f"played the film {len(player.seeks) - n} times on sound from before the stop"
+    stream.play()
+    watch(ctl, clock, 6.0, state=state)
+    assert in_sync(player, stream)
+    print("watcher: a stream that stops while the film is already paused stays paused - "
+          "a recording that ends in silence is not searched")
+
+
 def test_watch_keeps_its_pause_across_a_weak_resync():
     ctl, stream, player, clock, q, state = watching()
     stream.pause()
@@ -1924,6 +1954,7 @@ def main():
     test_watch_finds_a_far_jump()
     test_watch_whole_film_search_leaves_the_near_ones_going()
     test_watch_pause_holds_against_old_sound()
+    test_watch_pause_holds_when_the_stream_stops_inside_it()
     test_watch_keeps_its_pause_across_a_weak_resync()
     test_watch_lets_go_for_another_film()
     test_watch_stands_aside()
