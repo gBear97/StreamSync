@@ -313,7 +313,10 @@ film and from then on also listens to your copy's centre channel on its
 own, where films keep their dialogue: the part two releases usually
 share. The film plays on when either matches the stream, its drift is
 judged by the dialogue, and a stream that has to be found again is looked
-for by the dialogue too. In a replay of a movie-night VOD whose copy had
+for by the dialogue too. Where such a copy has a stretch of the film's
+sound a second or two from where yours has it - narration or music laid
+in at another moment, the picture on time - the film holds its place
+there instead of following the sound. In a replay of a movie-night VOD whose copy had
 its music up to 10 s away from the file's, cue by cue, the film paused
 about a fifth less often: 160-165 times in the hour instead of 202-216,
 every one of them a mistake, as the stream never stopped. About 2 such
@@ -683,7 +686,22 @@ Step by step, with a first sync test: [MAC_FIRST_RUN.md](MAC_FIRST_RUN.md).
   looks in the centre alone: in the mix, a stream whose copy has its music
   elsewhere is found where the file has that music, seconds from where the
   stream is. Across one such film the centre placed 84% of 4 s recordings
-  right and 2% wrong, the mix 78% and 3%.
+  right and 2% wrong, the mix 78% and 3%. What is left wrong there is
+  sound the stream's copy has a second or two from where the file has it,
+  centre and mix alike, with its picture on time. So a film that looks
+  have lately heard at its own place (4 of them in the last minute) holds
+  that place when its sound turns up within 3 s of it but not at it: a
+  match of the stream's last 4 s finds the offset while the film still
+  plays, looks listen there as well, and hearing the film there counts.
+  A return from a pause is placed the same way: a stream that stopped is
+  behind where it would be by as long as it stopped, never ahead, so
+  sound found anywhere else that near is displaced and the film plays
+  from where the stream is by its own time. Auto mode leaves such sound
+  alone too. In replays of that film the returns more than half a second
+  off the stream went from 8-10 to 0-1, and the time the film played that
+  far off from about 2 minutes to a few seconds. A stream that itself
+  jumps a second or two without stopping is followed up to a minute
+  later for it. A copy that sounds like yours is never held.
 - **Timing**: stream audio is recorded continuously and every sample is
   dated by its position in the recording, not by when a recording was
   asked for - so the matched moment is corrected by exactly how long ago
