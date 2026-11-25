@@ -1856,12 +1856,16 @@ def test_wide_search_looks_in_the_centre_once_the_copies_differ():
 
 
 def differing_copy():
-    """A synced film, watched until it is heard by its centre as well: the
-    stream's copy sounds different."""
+    """A synced film, watched until it is heard by its centre as well (the
+    stream's copy sounds different) and is on the stream's time:
+    WATCH_LINE_SINCE after the sync."""
     ctl, stream, player, clock, q, state = watching()
     stream.centre, stream.mix_misses = (0.6, 0.5), 4
     watch(ctl, clock, 85.0, state=state)
     assert ctl._centre_count["on"] and player.playing, ctl._centre_count
+    assert not ctl._on_line(clock.now), "on the stream's time 87 s after a sync"
+    watch(ctl, clock, controller.WATCH_LINE_SINCE - 80.0, state=state)
+    assert ctl._on_line(clock.now) and in_sync(player, stream)
     return ctl, stream, player, clock, q, state
 
 
@@ -1989,6 +1993,149 @@ def test_auto_mode_leaves_displaced_sound_alone():
     assert abs(player.pos() - stream.pos() + 2.0) < 0.01, f"{player.pos() - stream.pos():+.2f} s"
     print("auto mode: displaced sound in a copy that differs is left alone while the watcher "
           "has the film on the stream's time; otherwise corrected as ever")
+
+
+def followed_its_sound(why, since=0):
+    """Whether the log says, from line `since` on, that the film's time on
+    the stream started afresh for `why`."""
+    return any(f"the film follows its sound ({why})" in m
+               for m in controller.diagnostics.lines[since:])
+
+
+def test_watch_does_not_hold_a_film_put_where_its_sound_is():
+    """The hold is for a film that came to its place along the stream's own
+    time. One put where its sound is may stand on displaced sound - and,
+    held, takes the stream itself for the displaced sound once that sound
+    moves on (live, 2026-11-23: back from a 6 s stop at 54:29 of one film,
+    where the stream's copy has its sound 2 s ahead for a few seconds, the
+    film played from that sound and then held the place, 1.9 s ahead and
+    still held 18 s on). After a return that follows its sound the film is
+    not held for WATCH_LINE_SINCE: it is found by its sound, as before the
+    hold."""
+    ctl, stream, player, clock, q, state = differing_copy()
+    log = controller.diagnostics.lines
+    stream.pause()                               # a real stop...
+    watch(ctl, clock, 6.0, state=state)
+    assert not player.playing
+    stream.sound_lag = 2.0                       # ...back with its sound 2 s ahead for a while
+    stream.play()
+    n = len(log)
+    watch(ctl, clock, 6.0, state=state)
+    assert player.playing and abs(player.pos() - stream.pos() - 2.0) < 1e-6, \
+        "back from a real stop only its sound says where the stream is"
+    assert followed_its_sound("a return", n) and not ctl._on_line(clock.now), log[n:]
+    n = len(log)
+    stream.sound_lag = 0.0                       # the sound is where the stream is again
+    watch(ctl, clock, 8.0, state=state)
+    assert in_sync(player, stream), \
+        f"8 s after its sound moved on the film plays {player.pos() - stream.pos():+.2f} s off"
+    assert not any("holding its place" in m or "from the film's here" in m for m in log[n:]), \
+        log[n:]
+    # a displaced stretch met meanwhile is followed, as before the hold...
+    watch(ctl, clock, controller.WATCH_LINE_KEEP, state=state)
+    assert not ctl._on_line(clock.now), "held again a minute after it followed its sound"
+    stream.sound_lag = -1.5
+    watch(ctl, clock, 10.0, state=state)
+    assert player.playing and abs(player.pos() - stream.pos() + 1.5) < 1e-6, \
+        f"{player.pos() - stream.pos():+.2f} s"
+    stream.sound_lag = 0.0
+    watch(ctl, clock, 10.0, state=state)
+    assert in_sync(player, stream)
+    # ...and WATCH_LINE_SINCE after the last such return the film holds its place again
+    watch(ctl, clock, controller.WATCH_LINE_SINCE, state=state)
+    assert ctl._on_line(clock.now)
+    seeks = len(player.seeks)
+    stream.sound_lag = -2.0
+    watch(ctl, clock, 20.0, state=state)
+    assert in_sync(player, stream) and len(player.seeks) == seeks, \
+        f"{player.pos() - stream.pos():+.2f} s"
+    print(f"watcher: a film back from a stop on displaced sound is not held there - in step "
+          f"8 s after the sound moved on; held again {controller.WATCH_LINE_SINCE:.0f} s after "
+          f"it last followed its sound")
+
+
+def test_watch_takes_a_stop_inside_a_wide_search_for_a_stop():
+    """How far behind a stopped stream can be is measured to the end of the
+    recording it is found in: the stop can lie inside a wide search's 4 s.
+    Measured to its start, a 2.6 s stop found so read as sound no stopped
+    stream could make, and the film played from where the stream would be
+    had it never stopped - ahead by the stop (a replay of the 2026-11-23
+    recording, three returns in a row from 38:48)."""
+    ctl, stream, player, clock, q, state = differing_copy()
+    stream.mix_misses = 1                        # the mix hears nothing here: no near look will do
+    watch(ctl, clock, 5.0, state=state)
+    assert player.playing and ctl._on_line(clock.now)
+    stream.silent = True
+    stream.pause()
+    watch(ctl, clock, 2.6, state=state)
+    assert not player.playing
+    stream.play()
+    watch(ctl, clock, 8.0, state=state)
+    last = controller.diagnostics.lines[-1]
+    assert "found by a wide search" in last, last
+    assert in_sync(player, stream), \
+        f"back from a 2.6 s stop the film plays {player.pos() - stream.pos():+.2f} s off: {last}"
+    assert "from the film's here" not in last and ctl._disp is None, (last, ctl._disp)
+    # a look's 0.6 s holds no such stop: sound that far behind is displaced
+    # there, and the film is placed by the stream's own time
+    ctl, stream, player, clock, q, state = differing_copy()
+    now = clock()
+    state["heard"], state["stop_t0"] = (stream.pos(now), now), now + 0.1
+    t0 = now + 0.7
+    where = stream.pos(t0) - 2.6
+    at, note, kept = ctl._watch_place(state, where, t0, controller.WATCH_LOOK)
+    assert abs(at - stream.pos(t0)) < 1e-9 and kept and "-2.60 s" in note, (at - where, note)
+    print("watcher: a stream 2.6 s behind in a wide search's 4 s stopped inside them - the film "
+          "plays from its sound; that far behind in a look's 0.6 s, the sound is displaced")
+
+
+def test_a_move_onto_its_sound_starts_the_films_time_afresh():
+    """Auto mode, a sync and a hand on Play put the film where its sound is
+    (or where the user wants it), as a return that follows its sound does:
+    the film is not held to that place until WATCH_LINE_SINCE on. A trim
+    along its own time - auto mode, within WATCH_DISP_TOL - leaves it on
+    the stream's time."""
+    tol = controller.WATCH_DISP_TOL
+    ctl, stream, player, clock, q, state = differing_copy()
+    player.anchor = (player.pos() + 0.3, clock())             # 0.3 s of drift
+    ctl.auto_step(new_state())
+    assert in_sync(player, stream) and ctl._on_line(clock.now) and not followed_its_sound("auto mode")
+    stream.anchor = (stream.pos() + 5.0, clock())             # the streamer skips 5 s on
+    ctl.auto_step(new_state())
+    assert in_sync(player, stream) and not ctl._on_line(clock.now)
+    assert followed_its_sound("auto mode"), controller.diagnostics.lines[-3:]
+    watch(ctl, clock, controller.WATCH_LINE_KEEP, state=state)
+    stream.sound_lag = -2.0                      # ...so sound 2 s off is drift again: corrected
+    ctl.auto_step(new_state())
+    assert abs(player.pos() - stream.pos() + 2.0) < 0.01 and ctl._disp is None, \
+        f"{player.pos() - stream.pos():+.2f} s"
+
+    # a sync while the watcher has the film paused
+    ctl, stream, player, clock, q, state = differing_copy()
+    stream.pause()
+    watch(ctl, clock, 3.0, state=state)
+    assert not player.playing
+    stream.play()
+    run_sync(ctl, ctl.sync, "")
+    watch(ctl, clock, 1.0, state=state)
+    assert in_sync(player, stream) and state["mode"] == "playing"
+    assert followed_its_sound("a sync") and not ctl._on_line(clock.now)
+    watch(ctl, clock, controller.WATCH_LINE_SINCE - 10.0, state=state)
+    assert not ctl._on_line(clock.now)
+    watch(ctl, clock, 12.0, state=state)
+    assert ctl._on_line(clock.now), "not on the stream's time 3 minutes after a sync"
+
+    # Play pressed while the stream is stopped
+    ctl, stream, player, clock, q, state = differing_copy()
+    stream.pause()
+    watch(ctl, clock, 3.0, state=state)
+    assert not player.playing
+    player.anchor, player.playing = (player.pos(), clock()), True
+    watch(ctl, clock, 1.0, state=state)
+    assert state["mode"] == "override" and followed_its_sound("played by hand")
+    assert not ctl._on_line(clock.now) and ctl._line_since is None
+    print(f"watcher: the film's time on the stream starts afresh at an auto correction over "
+          f"{tol} s, a sync and a hand on Play - not at a trim of 0.3 s")
 
 
 def test_watch_finds_a_far_jump():
@@ -2232,6 +2379,9 @@ def main():
     test_watch_follows_its_sound_once_off_the_streams_time()
     test_watch_places_a_return_no_stopped_stream_could_make()
     test_auto_mode_leaves_displaced_sound_alone()
+    test_watch_does_not_hold_a_film_put_where_its_sound_is()
+    test_watch_takes_a_stop_inside_a_wide_search_for_a_stop()
+    test_a_move_onto_its_sound_starts_the_films_time_afresh()
     test_watch_finds_a_far_jump()
     test_watch_whole_film_search_leaves_the_near_ones_going()
     test_watch_pause_holds_against_old_sound()

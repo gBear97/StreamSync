@@ -184,12 +184,44 @@ WATCH_FAR_EVERY = ((30.0, 2.0), (120.0, 5.0), (math.inf, 15.0))  # (paused under
 # it was followed at once. And with an offset known, the end of the film's
 # sound was noticed 0.9 s later in those replays (a look at the offset
 # half-hearing the talk that follows).
+#   On the stream's time says where the film came from, not only what it
+# hears. A return from a pause that follows the sound - after a real stop
+# only the sound says where the stream is - can put the film on displaced
+# sound, and a film there hears itself at its own place as well as any.
+# Still held to be on the stream's time, it took the stream for the
+# displaced sound once that sound moved on, and held the wrong place: seen
+# live on 2026-11-23 after a 6 s stop at 54:29 of that film (1.9 s ahead
+# and still held 18 s on, where the search alone let go in 4-5 s), and in
+# a replay of that night's other recording for over a minute, every return
+# moved back by it - 4 stray looks a minute at the film's own place keep
+# WATCH_LINE_LOOKS met. So the film's time on the stream starts afresh
+# whenever the film is put where its sound is (_line_break): a return not
+# placed by the stream's time, an auto correction of over WATCH_DISP_TOL,
+# a sync, a play by hand. It is on the stream's time again WATCH_LINE_SINCE
+# later: longer than a displaced stretch lasts (that film's run to 168 s),
+# so a film that landed on one has seen it end, lost its sound and been
+# found again by then. 60 s was not enough: replayed, a film moved onto the
+# 38:15 stretch's sound took the stream for displaced at the stretch's end
+# and played 1.9 s behind from there on (83 s off the stream, against 57 s
+# with no hold at all).
+#   Replayed over the two live recordings of 2026-11-23, stops planted
+# inside the displaced stretches: the film played over 0.5 s off the stream
+# for 82 s and 81 s of the passes with stops, as it does with no hold (85 s
+# and 101 s before this), and for 4 s of the pass that had been 67 s. The
+# 2026-11-12 and 2026-11-08 nights replay as before, line for line; of the
+# 156 and 165 returns in the pass where the stream never stopped, 0 and 1
+# started the film's time afresh. The cost: no hold for WATCH_LINE_SINCE
+# after a real stop, a seek, a sync or such a correction - a displaced
+# stretch met in that time is followed by its sound, as before the hold
+# (that night's pass of ordinary play, found again after a seek a minute
+# before the 38:15 stretch: 57 s off the stream, where the hold had 0).
 WATCH_DISP_MAX = 3.0       # sound found within this of the film's place, yet not at it
 WATCH_DISP_TOL = 0.5       # ...(further than this: looks reach 0.4 s), may be displaced sound;
 WATCH_DISP_EVERY = 2.0     # looked for at most this often, while looks miss the film,
 WATCH_DISP_LAPSE = 45.0    # ...and forgotten once not heard there for this long
 WATCH_LINE_LOOKS = 4       # the film is on the stream's time while this many looks
-WATCH_LINE_KEEP = 60.0     # ...in the last this many seconds heard it at its own place
+WATCH_LINE_KEEP = 60.0     # ...in the last this many seconds heard it at its own place,
+WATCH_LINE_SINCE = 180.0   # ...and it has played this long since it was last put where its sound is
 # A whole-film search runs apart from the others, one at a time: decoding
 # the whole film can take a minute (60 s on the PC's first sync), and the
 # searches near where the stream stopped used to wait for it. They do not
@@ -424,9 +456,11 @@ class SyncController:
         self._centre_count = None    # the film whose centre is weighed, and how (_centre_look)
         # Pause with the stream's hold on the film's place (WATCH_DISP_MAX), which
         # auto mode respects: when looks lately heard the film at its own place
-        # (each one's t0), and the offset its sound sits at meanwhile
-        # ({"d": seconds, "seen": t0}, or None)
+        # (each one's t0), the first of them since the film was last put where
+        # its sound is (None: none yet), and the offset its sound sits at
+        # meanwhile ({"d": seconds, "seen": t0}, or None)
         self._line = collections.deque()
+        self._line_since = None
         self._disp = None
         self._surveyed = None        # the film whose typical level was surveyed
         self._prefetching = False
@@ -492,6 +526,7 @@ class SyncController:
         self._lined_up = None          # a new film waits for its first sync
         self._centre_count = None      # ...and is heard by its mix alone at first
         self._line.clear()
+        self._line_since = None
         self._disp = None
         if self.player is self.embedded:
             self.embedded.load(path)
@@ -829,6 +864,9 @@ class SyncController:
                       applied=drift is not None and abs(drift) > DRIFT_TOLERANCE)
             if drift is not None and abs(drift) > DRIFT_TOLERANCE:
                 player.sync_seek(t, t0, off)
+                if abs(drift) > WATCH_DISP_TOL:
+                    # moved onto its sound, not trimmed along its own time
+                    self._line_break(t0, "auto mode")
                 self._say(f"Auto: corrected {drift:+.2f}s drift "
                           f"(score {score:.1f}, z {z:.0f}).")
             if drift is not None:
@@ -960,6 +998,7 @@ class SyncController:
             self._watch_reset(state, "idle")
             state["heard"] = None
             self._line.clear()           # lined up afresh by whatever comes next
+            self._line_since = None
             self._disp = None
         self._watch_show(state, why)
         return 0.25
@@ -991,8 +1030,12 @@ class SyncController:
                 self._watch_show(state, "paused")
                 return self._watch_paused(state)
             # played meanwhile: a sync lines the film up afresh; anyone
-            # else - the user - is obeyed until the film is heard again
-            if self._gen != state["gen"]:
+            # else - the user - is obeyed until the film is heard again.
+            # Either way the film is where that put it, not where the
+            # stream's own time would have it
+            synced = self._gen != state["gen"]
+            self._line_break(self._now(), "a sync" if synced else "played by hand")
+            if synced:
                 self._watch_reset(state, "playing")
             else:
                 self._watch_reset(state, "override")
@@ -1083,6 +1126,8 @@ class SyncController:
             line.append(t0)                  # heard at its own place (WATCH_LINE_LOOKS)
             while t0 - line[0] > WATCH_LINE_KEEP:
                 line.popleft()
+            if self._line_since is None:
+                self._line_since = t0        # ...for the first time since it was put there
             if state["mode"] == "override":
                 state["mode"] = "playing"
                 diagnostics.log("watch: the film is heard again - following the stream's pauses")
@@ -1109,12 +1154,31 @@ class SyncController:
     def _on_line(self, t):
         """Whether the film was on the stream's time at `t` (a look's t0):
         heard at its own place by WATCH_LINE_LOOKS looks in the
-        WATCH_LINE_KEEP seconds before. Only ever so for a copy that sounds
-        different (the hold is for those), with the watcher on."""
+        WATCH_LINE_KEEP seconds before, and playing on its own time for
+        WATCH_LINE_SINCE since it was last put where its sound is
+        (_line_break). Only ever so for a copy that sounds different (the
+        hold is for those), with the watcher on."""
         if not (self.watch_enabled and self._centre_on()):
+            return False
+        if self._line_since is None or t - self._line_since < WATCH_LINE_SINCE:
             return False
         return (sum(1 for u in list(self._line) if 0.0 <= t - u <= WATCH_LINE_KEEP)
                 >= WATCH_LINE_LOOKS)
+
+    def _line_break(self, t, why):
+        """The film was put where its sound is - by `why`, at `t` - and not
+        where the stream would be by its own time. Whether that is the
+        stream's time is not known: the sound may be displaced, and a film
+        on it would take the stream for the displaced sound (see
+        WATCH_LINE_SINCE). Its time on the stream starts afresh with the
+        next look that hears it; the offset known meanwhile was measured
+        from where it stood, and goes."""
+        if self._on_line(t):
+            diagnostics.log(f"watch: the film follows its sound ({why}) - not held to its "
+                            f"place for the next {WATCH_LINE_SINCE:.0f} s")
+        self._line.clear()
+        self._line_since = None
+        self._disp = None
 
     def _displaced(self, t):
         """The offset the film's sound is known to sit at in the stream
@@ -1193,37 +1257,52 @@ class SyncController:
             diagnostics.log(f"watch: the film's sound is in the stream {off:+.2f} s from the "
                             f"film's place {where} - holding its place")
 
-    def _watch_place(self, state, where, t0):
-        """(the film time to play from, a note for the log) for a stream
-        whose sound was found at `where` at t0. `where` itself - unless the
-        film was on the stream's time when it stopped hearing it and that
-        sound is displaced (see WATCH_DISP_MAX): found at the offset the
-        film's sound is known to sit at here, or where no stream that merely
-        stopped can be - ahead of where it would be had it played on, or
-        further behind it than the time since the film was last heard. Then
-        the stream is where it would be by its own time. Where a stop
-        accounts for the sound's place both ways - the film's own sound
-        after a stop, or displaced sound after a shorter one - it is the
-        film's own, as it was always placed."""
+    def _watch_place(self, state, where, t0, span):
+        """(the film time to play from, a note for the log, whether that is
+        on the stream's own time) for a stream whose sound was found at
+        `where` at t0, in a recording `span` long. `where` itself - unless
+        the film was on the stream's time when it stopped hearing it and
+        that sound is displaced (see WATCH_DISP_MAX): found at the offset
+        the film's sound is known to sit at here, or where no stream that
+        merely stopped can be - ahead of where it would be had it played
+        on, or further behind it than a stop since the film was last heard
+        allows. Then the stream is where it would be by its own time. Where
+        a stop accounts for the sound's place both ways - the film's own
+        sound after a stop, or displaced sound after a shorter one - it is
+        the film's own, as it was always placed.
+          On the stream's own time: the place it would have had it played
+        on, or one of those. Anything else follows the sound, and the film's
+        time on the stream starts afresh (_line_break)."""
         heard = state["heard"]
         stopped = state.get("stop_t0")
-        if heard is None or stopped is None or not self._on_line(stopped):
-            return where, ""
+        if heard is None or stopped is None:
+            return where, "", False
         hf, ht = heard
-        slack = max(0.0, t0 - ht) + WATCH_DISP_TOL   # the furthest behind a stopped stream can be
         off = where - (hf + (t0 - ht))       # from where it would be had it played on
         if abs(off) <= WATCH_DISP_TOL:
-            return where, ""                 # where it would be: it never stopped
+            return where, "", True           # where it would be: it never stopped
+        if not self._on_line(stopped):
+            return where, "", False
+        # The furthest behind a stopped stream can be: it stopped after the
+        # film was last heard, and was back by the end of the recording it
+        # is found in - the stop can lie inside that recording, and a wide
+        # search's is WATCH_FAR_LISTEN long. Measured to the recording's
+        # start, a 3 s stop inside one read as sound no stopped stream could
+        # make, and the film played from where the stream would be had it
+        # never stopped: ahead by the stop (in a replay of the 2026-11-23
+        # recording, at 38:48, and at the two returns after it).
+        slack = max(0.0, t0 + span - ht) + WATCH_DISP_TOL
         disp = self._displaced(stopped)
         if disp is not None:
             back = off - disp["d"]           # the stream itself, were this the displaced sound
             if abs(back) <= WATCH_DISP_TOL or (off < 0 and -off > slack and -slack <= back <= 0):
                 disp["seen"] = max(disp["seen"], t0)
-                return where - disp["d"], f", its sound {disp['d']:+.2f} s from the film's here"
+                return (where - disp["d"],
+                        f", its sound {disp['d']:+.2f} s from the film's here", True)
         if abs(off) <= WATCH_DISP_MAX and (off > 0 or -off > slack):
             self._note_displaced(off, max(t0, stopped), f"near {fmt_time(where - off)} (a return)")
-            return where - off, f", its sound {off:+.2f} s from the film's here"
-        return where, ""
+            return where - off, f", its sound {off:+.2f} s from the film's here", True
+        return where, "", False
 
     def _centre_look(self, p, rule):
         """A playing look as the watcher takes it: the mix's alone
@@ -1330,7 +1409,8 @@ class SyncController:
     def _watch_paused(self, state):
         hit = state["far_hit"]
         if hit is not None and hit[0] == state["token"]:
-            return self._watch_resume(state, hit[1], hit[2], "found by a wide search")
+            return self._watch_resume(state, hit[1], hit[2], "found by a wide search",
+                                      WATCH_FAR_LISTEN)
         cap = self._watch_capture(state)
         if cap is not None and cap[2] < state["quiet_from"]:
             cap = None                   # it still holds sound from before the stop
@@ -1494,11 +1574,15 @@ class SyncController:
         finally:
             state["whole_busy" if lo is None else "far_busy"] = False
 
-    def _watch_resume(self, state, where, t0, why):
+    def _watch_resume(self, state, where, t0, why, span=WATCH_LOOK):
+        """Play the film from `where`, the film time the stream carried at
+        t0 - the start of the recording it was found in, `span` long."""
         player = self.player
         paused = self._now() - state["paused_at"]
-        where, note = self._watch_place(state, where, t0)
+        where, note, kept = self._watch_place(state, where, t0, span)
         why += note
+        if not kept:
+            self._line_break(t0, "a return")
         try:
             player.sync_seek(where, t0, self.placement_offset())
         except VLCError as e:
