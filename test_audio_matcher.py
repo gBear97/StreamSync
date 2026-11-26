@@ -326,6 +326,30 @@ def centre(tmp):
           f"its stereo copy {heard_two} (median ncc {m2:.2f})")
     assert heard_51 >= len(looks) - 1 and got["centre"] >= len(looks) - 2, (heard_51, got)
     assert heard_two < heard_51 and m51 - m2 > 0.15, (heard_two, m51, m2)
+    # a search for that stream (find_match_audio, as a wide search asks): in
+    # the mix its 4 s are found where the file has the music they carry, 7 s
+    # from where the stream is, and trusted there; in the centre, where the
+    # stream is. A stereo copy has no centre to look in: the mix, as ever
+    spots = (30.0, 37.5, 45.0, 52.5)
+
+    def ok(score, z):
+        return score >= audio_matcher.SCORE_OK and z >= audio_matcher.Z_OK
+    for at in spots:
+        feats = audio_matcher.prep_capture(
+            stream_full[int(at * sr):int((at + 4.0) * sr)].astype(np.float32), sr)
+        lo, hi = at - 25.0, at + 33.0
+        t, score, z = audio_matcher.find_match_audio(film, feats, lo, hi)
+        assert abs(t - (at - 7.0)) < 0.05 and ok(score, z), \
+            f"at {at}: the mix was to find the moved music, trusted: {t - at:+.2f} s, {score:.1f}, {z:.1f}"
+        t, score, z = audio_matcher.find_match_audio(film, feats, lo, hi, centre=True)
+        assert abs(t - at) < 0.02 and ok(score, z), \
+            f"at {at}: the centre did not find the stream: {t - at:+.2f} s, {score:.1f}, {z:.1f}"
+        t2, score2, z2 = audio_matcher.find_match_audio(stereo, feats, lo, hi, centre=True)
+        assert (t2, score2, z2) == audio_matcher.find_match_audio(stereo, feats, lo, hi), \
+            "a stereo film searched by its centre was not searched by its mix"
+        assert abs(t2 - (at - 7.0)) < 0.05, t2 - at
+    print(f"centre: a search finds the stream by the film's centre at all {len(spots)} places, "
+          f"where its mix finds the music 7 s away; a stereo copy is searched by its mix")
     # where the stream's copy is the file's own, the mix answers as well as ever
     p = audio_matcher.film_presence(film, same_full[int(looks[0] * sr):int((looks[0] + 0.6) * sr)]
                                     .astype(np.float32), sr, looks[0])

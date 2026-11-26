@@ -311,8 +311,16 @@ sounds different from yours - another release, its music laid in a
 little differently - StreamSync notices after two or three minutes of the
 film and from then on also listens to your copy's centre channel on its
 own, where films keep their dialogue: the part two releases usually
-share. The film plays on when either matches the stream, and its drift is
-judged by the dialogue. In a replay of a movie-night VOD whose copy had
+share. The film plays on when either matches the stream, its drift is
+judged by the dialogue, and a stream that has to be found again is looked
+for by the dialogue too. Where such a copy has a stretch of the film's
+sound a second or two from where yours has it - narration or music laid
+in at another moment, the picture on time - the film holds its place
+there instead of following the sound, once it has played in step for
+three minutes. For that long after the stream really stopped or jumped,
+or after a sync, the film follows its sound: it may have come back on
+such a stretch, and held there it would hold the wrong place. In a
+replay of a movie-night VOD whose copy had
 its music up to 10 s away from the file's, cue by cue, the film paused
 about a fifth less often: 160-165 times in the hour instead of 202-216,
 every one of them a mistake, as the stream never stopped. About 2 such
@@ -678,7 +686,46 @@ Step by step, with a first sync test: [MAC_FIRST_RUN.md](MAC_FIRST_RUN.md).
   the film for a stream that comes back somewhere else, and after 30 s
   now and then over the whole film. Decoding a whole film can take a
   minute, so that one runs on its own and the nearer matches go on
-  meanwhile.
+  meanwhile. Once the film is heard by its centre as well, a full match
+  looks in the centre alone: in the mix, a stream whose copy has its music
+  elsewhere is found where the file has that music, seconds from where the
+  stream is. Across one such film the centre placed 84% of 4 s recordings
+  right and 2% wrong, the mix 78% and 3%. What is left wrong there is
+  sound the stream's copy has a second or two from where the file has it,
+  centre and mix alike, with its picture on time. So a film that looks
+  have lately heard at its own place (4 of them in the last minute) holds
+  that place when its sound turns up within 3 s of it but not at it: a
+  match of the stream's last 4 s finds the offset while the film still
+  plays, looks listen there as well, and hearing the film there counts.
+  A return from a pause is placed the same way: a stream that stopped is
+  behind where it would be by as long as it stopped, never ahead, so
+  sound found anywhere else that near is displaced and the film plays
+  from where the stream is by its own time. (How long it can have stopped
+  runs to the end of the recording it is found in: a stop can lie inside
+  a full match's 4 s.) Auto mode leaves such sound alone too. In replays
+  of that film the returns more than half a second off the stream went
+  from 8-10 to 0-1, and the time the film played that far off from about
+  2 minutes to a few seconds. A stream that itself jumps a second or two
+  without stopping is followed up to a minute later for it. A copy that
+  sounds like yours is never held.
+  The hold is for a film that came to its place along the stream's own
+  time. One put where its sound is - back from a real stop, where only
+  the sound says where the stream is; by an auto correction of over half
+  a second; by a sync; by Play pressed while the stream was stopped - may
+  stand on displaced sound, and a film there hears itself at its own
+  place as well as any. Held, it took the stream itself for the displaced
+  sound once that sound moved on: live, 1.9 s ahead and still held 18 s
+  after a 6 s stop, and in a replay for over a minute. So after any of
+  those the film is not held for 3 minutes, longer than such a stretch
+  lasts in that film (up to 168 s): by then a film that landed on one has
+  seen it end and been found again. With stops planted inside the
+  displaced stretches of two live recordings, the film then played over
+  half a second off the stream for 82 s and 81 s, as with no hold at all
+  (85 s and 101 s with the hold as it was), and for 4 s where it had been
+  67 s. The price: in those 3 minutes a displaced stretch is followed by
+  its sound, as before the hold - and a stop inside such a stretch still
+  brings the film back on the sound, a second or two off until the
+  stretch ends.
 - **Timing**: stream audio is recorded continuously and every sample is
   dated by its position in the recording, not by when a recording was
   asked for - so the matched moment is corrected by exactly how long ago
