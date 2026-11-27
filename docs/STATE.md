@@ -9,7 +9,7 @@ Last rewritten 2026-11-26 from the wrap-ups of the Mac's StreamSync sessions, an
   - #84, the centre channel for 5.1 films (`b9357f0`, merged 2026-11-14);
   - #90 (`e14f53e`, merged 2026-11-26), one squash of the branch `claude/watch-holds-its-place` at `8ed685f`. Its tree equals `8ed685f`, so it carries the code of all five PRs below;
   - the docs commit that added this page and `CLAUDE.md`.
-- **The five stacked PRs are still open on GitHub, and their code is already in `main` through #90.** Closing them is the owner's call. Each was based on the one before.
+- **The five stacked PRs were closed without merging on 2026-11-26,** at the owner's word, because their code is already in `main` through #90. Each carries a comment that says so, and all five branches are kept. Each was based on the one before.
 
   | PR | Branch | What it adds |
   |---|---|---|
@@ -39,7 +39,7 @@ Last rewritten 2026-11-26 from the wrap-ups of the Mac's StreamSync sessions, an
 
 1. **PC:** run `/inbox` to install the `8ed685f` test build.
 2. **Mac:** open StreamSync Test, open the film, sync against the sound in the browser, pause once by hand, and allow the System Events prompt. Then read `~/Library/Logs/StreamSync/streamsync.log` for the sync and `swap:` lines to confirm both permissions.
-3. **After that live run:** score it, fetch the PC's reply handoff, then decide whether to release 2.0.12 from `main`, and close #85–#89.
+3. **After that live run:** score it, fetch the PC's reply handoff, then decide whether to release 2.0.12 from `main`.
 4. **To rerun against the VOD** once it plays: the stop schedule is `~/.cache/streamsync-bench/live-2026-11-25-hold-fix/live/scripted_stops.json`.
 
 ## Known problems, not fixed
