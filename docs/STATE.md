@@ -1,12 +1,15 @@
 # StreamSync: current state
 
-Last rewritten 2026-11-26 from the wrap-ups of the Mac's StreamSync sessions. Replace stale entries; don't append a log. This repository is public: no personal names, hosts, device IDs or machine paths here.
+Last rewritten 2026-11-26 from the wrap-ups of the Mac's StreamSync sessions, and corrected the same day against GitHub. Replace stale entries; don't append a log. This repository is public: no personal names, hosts, device IDs or machine paths here.
 
 ## Releases and branches
 
 - **Released:** 2.0.11 (2026-11-11), on both machines. Nothing has been released since.
-- **`main`:** `b9357f0`, which adds #84 (the centre channel for 5.1 films) on top of 2.0.11. Merged 2026-11-14, unreleased. The Mac's local `main` is one commit behind `origin/main`.
-- **Open stack, "Pause with the stream":** five PRs, each based on the one before. CI is green on all five. Auto-fix is on and auto-merge is off.
+- **`main`:** holds the whole "Pause with the stream" stack, unreleased. On top of 2.0.11 it has:
+  - #84, the centre channel for 5.1 films (`b9357f0`, merged 2026-11-14);
+  - #90 (`e14f53e`, merged 2026-11-26), one squash of the branch `claude/watch-holds-its-place` at `8ed685f`. Its tree equals `8ed685f`, so it carries the code of all five PRs below;
+  - the docs commit that added this page and `CLAUDE.md`.
+- **The five stacked PRs are still open on GitHub, and their code is already in `main` through #90.** Closing them is the owner's call. Each was based on the one before.
 
   | PR | Branch | What it adds |
   |---|---|---|
@@ -14,7 +17,7 @@ Last rewritten 2026-11-26 from the wrap-ups of the Mac's StreamSync sessions. Re
   | #86 | `claude/watch-while-settling` | listen for a silent stream while the film settles |
   | #87 | `claude/wide-search-needs-sound` | a wide search waits for half a second of unbroken sound |
   | #88 | `claude/wide-search-by-centre` | a wide search looks in the film's centre channel once the copies differ |
-  | #89 | `claude/watch-holds-its-place` (`8ed685f`, checked out on the Mac) | the film holds its place through displaced sound, but not for 180 s after a real stop, seek or sync |
+  | #89 | `claude/watch-holds-its-place` (`8ed685f`, still checked out on the Mac) | the film holds its place through displaced sound, but not for 180 s after a real stop, seek or sync |
 
 - **Old work:** ten unmerged branches from the PC are kept as `archive/<branch>` tags. Only `v*` tags start `release.yml`.
 
@@ -36,7 +39,7 @@ Last rewritten 2026-11-26 from the wrap-ups of the Mac's StreamSync sessions. Re
 
 1. **PC:** run `/inbox` to install the `8ed685f` test build.
 2. **Mac:** open StreamSync Test, open the film, sync against the sound in the browser, pause once by hand, and allow the System Events prompt. Then read `~/Library/Logs/StreamSync/streamsync.log` for the sync and `swap:` lines to confirm both permissions.
-3. **After that live run:** score it, fetch the PC's reply handoff, then decide whether to merge #85–#89 and release 2.0.12.
+3. **After that live run:** score it, fetch the PC's reply handoff, then decide whether to release 2.0.12 from `main`, and close #85–#89.
 4. **To rerun against the VOD** once it plays: the stop schedule is `~/.cache/streamsync-bench/live-2026-11-25-hold-fix/live/scripted_stops.json`.
 
 ## Known problems, not fixed
